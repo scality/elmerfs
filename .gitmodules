@@ -1,0 +1,3 @@
+[submodule "antidotec/3rdparty/antidotepb"]
+	path = antidotec/3rdparty/antidotepb
+	url = https://github.com/AntidoteDB/antidote_pb_codec.git
