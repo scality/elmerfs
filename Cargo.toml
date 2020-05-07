@@ -1,0 +1,15 @@
+[package]
+name = "geosng"
+version = "0.1.0"
+authors = ["Romain Vaillant <romain.vaillant@scality.com>"]
+edition = "2018"
+
+[workspace]
+members = [
+    "antidotec/"
+]
+
+[dependencies]
+async-std = { version = "1.0", features = ["unstable"] }
+antidotec = { path = "antidotec" }
+fuse = "0.3"

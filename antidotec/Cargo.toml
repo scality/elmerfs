@@ -1,0 +1,15 @@
+[package]
+name = "antidotec"
+version = "0.1.0"
+authors = ["Romain Vaillant <romain.vaillant@scality.com>"]
+edition = "2018"
+
+build = "build.rs"
+
+[dependencies]
+protobuf = "2.14"
+async-std = "1.0"
+thiserror = "1.0"
+
+[build-dependencies]
+protobuf-codegen-pure = "2.3"
