@@ -79,7 +79,10 @@ impl Connection {
         self.transaction_with_locks(TransactionLocks::new()).await
     }
 
-    pub async fn transaction_with_locks(&mut self, locks: TransactionLocks) -> Result<Transaction<'_>, Error> {
+    pub async fn transaction_with_locks(
+        &mut self,
+        locks: TransactionLocks,
+    ) -> Result<Transaction<'_>, Error> {
         let mut transaction = ApbStartTransaction::new();
 
         let mut properties = ApbTxnProperties::default();
@@ -304,7 +307,17 @@ impl ReadReply {
     pub fn lwwreg(&mut self, index: usize) -> Option<crdts::LwwReg> {
         let reg = self.object(CRDT_type::LWWREG, index).unwrap().into_lwwreg();
 
-        if reg.len() == 0 {
+        if reg.len() != 0 {
+            Some(reg)
+        } else {
+            None
+        }
+    }
+
+    pub fn mvreg(&mut self, index: usize) -> Option<crdts::MvReg> {
+        let reg = self.object(CRDT_type::MVREG, index).unwrap().into_mvreg();
+
+        if reg.len() != 0 {
             Some(reg)
         } else {
             None
@@ -373,9 +386,9 @@ pub mod lwwreg {
         }
     }
 
-    pub fn set(key: impl Into<RawIdent>, reg: LwwReg) -> UpdateQuery {
+    pub fn set(key: impl Into<RawIdent>, value: Vec<u8>) -> UpdateQuery {
         let mut set = ApbRegUpdate::new();
-        set.set_value(reg);
+        set.set_value(value);
 
         let mut update = ApbUpdateOperation::new();
         update.set_regop(set);
@@ -388,6 +401,46 @@ pub mod lwwreg {
     }
 
     pub use crate::encoding::lwwreg::*;
+}
+
+pub mod mvreg {
+    use super::{
+        ApbCrdtReset, ApbRegUpdate, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
+    };
+
+    pub type MvReg = Vec<Vec<u8>>;
+
+    pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
+        ReadQuery {
+            key: key.into(),
+            ty: CRDT_type::MVREG,
+        }
+    }
+
+    pub fn set(key: impl Into<RawIdent>, reg: Vec<u8>) -> UpdateQuery {
+        let mut set = ApbRegUpdate::new();
+        set.set_value(reg);
+
+        let mut update = ApbUpdateOperation::new();
+        update.set_regop(set);
+
+        UpdateQuery {
+            key: key.into(),
+            ty: CRDT_type::MVREG,
+            update,
+        }
+    }
+
+    pub fn reset(key: impl Into<RawIdent>) -> UpdateQuery {
+        let mut update = ApbUpdateOperation::new();
+        update.set_resetop(ApbCrdtReset::new());
+
+        UpdateQuery {
+            key: key.into(),
+            ty: CRDT_type::MVREG,
+            update,
+        }
+    }
 }
 
 pub mod gmap {
@@ -451,7 +504,7 @@ pub mod gmap {
 }
 
 pub mod crdts {
-    pub use super::{counter::Counter, gmap::GMap, lwwreg::LwwReg};
+    pub use super::{counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg};
     use super::{ApbReadObjectResp, CRDT_type};
     use std::collections::HashMap;
 
@@ -459,6 +512,7 @@ pub mod crdts {
     pub enum Crdt {
         Counter(Counter),
         LwwReg(LwwReg),
+        MvReg(MvReg),
         GMap(GMap),
     }
 
@@ -466,22 +520,33 @@ pub mod crdts {
         pub fn into_counter(self) -> Counter {
             match self {
                 Self::Counter(c) => c,
-                _ => panic!("counter"),
+                _ => self.expected("counter"),
             }
         }
 
         pub fn into_lwwreg(self) -> LwwReg {
             match self {
                 Self::LwwReg(r) => r,
-                _ => panic!("lwwreg"),
+                _ => self.expected("lwwreg"),
             }
         }
 
         pub fn into_gmap(self) -> GMap {
             match self {
                 Self::GMap(m) => m,
-                _ => panic!("gmap: {:?}", self),
+                _ => self.expected("gmap"),
             }
+        }
+
+        pub fn into_mvreg(self) -> MvReg {
+            match self {
+                Self::MvReg(m) => m,
+                _ => self.expected("mvreg"),
+            }
+        }
+
+        fn expected(&self, name: &str) -> ! {
+            panic!("expected {}, found: {:#?}", name, self)
         }
 
         pub(super) fn from_read(ty: CRDT_type, mut read: ApbReadObjectResp) -> Self {
@@ -490,6 +555,7 @@ pub mod crdts {
             match ty {
                 CRDT_type::COUNTER => Counter(read.take_counter().get_value()),
                 CRDT_type::LWWREG => LwwReg(read.take_reg().take_value()),
+                CRDT_type::MVREG => MvReg(read.take_mvreg().take_values().into_vec()),
                 CRDT_type::GMAP => {
                     let entries = read.take_map().take_entries();
 
