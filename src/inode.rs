@@ -25,7 +25,7 @@ pub struct Owner {
 
 impl From<u64> for Owner {
     fn from(x: u64) -> Self {
-        let gid = (x >> 4) as u32;
+        let gid = (x >> 32) as u32;
         let uid = (x & 0x00FF) as u32;
 
         Self {
@@ -37,7 +37,7 @@ impl From<u64> for Owner {
 
 impl Into<u64> for Owner {
     fn into(self) -> u64 {
-        let x = (self.gid as u64) << 4;
+        let x = (self.gid as u64) << 32;
         x | (self.uid as u64)
     }
 }
