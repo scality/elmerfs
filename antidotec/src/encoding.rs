@@ -28,6 +28,15 @@ pub mod lwwreg {
         u64::from_le_bytes(bytes)
     }
 
+    pub fn set_u8(key: impl Into<RawIdent>, x: u8) -> UpdateQuery {
+        set(key, vec![x])
+    }
+
+    pub fn read_u8(reg: &[u8]) -> u8 {
+        assert_eq!(reg.len(), 1);
+        reg[0]
+    }
+
     pub fn set_duration(key: impl Into<RawIdent>, duration: Duration) -> UpdateQuery {
         let mut buffer = Vec::with_capacity(mem::size_of::<u64>() 
                                             + mem::size_of::<u32>());

@@ -190,7 +190,7 @@ impl Transaction<'_> {
 
         message.set_boundobjects(protobuf::RepeatedField::from(bound_objects));
 
-        self.connection.send(dbg!(message)).await?;
+        self.connection.send(message).await?;
         let mut response: ApbReadObjectsResp =
             checkr!(self.connection.recv::<ApbReadObjectsResp>().await?);
 
@@ -262,12 +262,24 @@ impl ReadReply {
             .into_counter()
     }
 
-    pub fn lwwreg(&mut self, index: usize) -> crdts::LwwReg {
-        self.object(CRDT_type::LWWREG, index).unwrap().into_lwwreg()
+    pub fn lwwreg(&mut self, index: usize) -> Option<crdts::LwwReg> {
+        let reg = self.object(CRDT_type::LWWREG, index).unwrap().into_lwwreg();
+
+        if reg.len() == 0 {
+            Some(reg)
+        } else {
+            None
+        }
     }
 
-    pub fn gmap(&mut self, index: usize) -> crdts::GMap {
-        self.object(CRDT_type::LWWREG, index).unwrap().into_gmap()
+    pub fn gmap(&mut self, index: usize) -> Option<crdts::GMap> {
+        let gmap = self.object(CRDT_type::GMAP, index).unwrap().into_gmap();
+
+        if gmap.len() == 0 {
+            None
+        } else {
+            Some(gmap)
+        }
     }
 
     fn object(&mut self, ty: CRDT_type, index: usize) -> Option<Crdt> {
@@ -404,6 +416,7 @@ pub mod crdts {
     use super::{ApbReadObjectResp, CRDT_type};
     use std::collections::HashMap;
 
+    #[derive(Debug)]
     pub enum Crdt {
         Counter(Counter),
         LwwReg(LwwReg),
@@ -428,7 +441,7 @@ pub mod crdts {
         pub fn into_gmap(self) -> GMap {
             match self {
                 Self::GMap(m) => m,
-                _ => panic!("gmap"),
+                _ => panic!("gmap: {:?}", self),
             }
         }
 

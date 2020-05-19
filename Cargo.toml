@@ -1,5 +1,5 @@
 [package]
-name = "geosng"
+name = "rebeccapurple"
 version = "0.1.0"
 authors = ["Romain Vaillant <romain.vaillant@scality.com>"]
 edition = "2018"
@@ -16,5 +16,7 @@ fuse = "0.3"
 nix = "0.17"
 clap = "2.33"
 anyhow = "1.0"
+thiserror = "1.0"
 log = "0.4.8"
 env_logger = "0.7.1"
+time = "0.1"
