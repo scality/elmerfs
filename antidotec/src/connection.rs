@@ -126,11 +126,10 @@ impl Connection {
         let message_size = u32::from_be_bytes(size_buffer);
 
         self.scratchpad.clear();
-        self.scratchpad
-            .extend(std::iter::repeat(0).take(message_size as usize));
+        self.scratchpad.resize(message_size as usize, 0);
 
         assert_eq!((&mut self.scratchpad[..]).len(), message_size as usize);
-        self.stream.read(&mut self.scratchpad[..]).await?;
+        self.stream.read_exact(&mut self.scratchpad[..]).await?;
 
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
         if code != R::code() {
