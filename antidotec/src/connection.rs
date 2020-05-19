@@ -75,9 +75,18 @@ impl Connection {
         })
     }
 
-    pub async fn start_transaction(&mut self) -> Result<Transaction<'_>, Error> {
+    pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        self.transaction_with_locks(TransactionLocks::new()).await
+    }
+
+    pub async fn transaction_with_locks(&mut self, locks: TransactionLocks) -> Result<Transaction<'_>, Error> {
         let mut transaction = ApbStartTransaction::new();
-        transaction.set_properties(ApbTxnProperties::default());
+
+        let mut properties = ApbTxnProperties::default();
+        properties.set_exclusive_locks(protobuf::RepeatedField::from_vec(locks.exclusive));
+        properties.set_shared_locks(protobuf::RepeatedField::from_vec(locks.shared));
+
+        transaction.set_properties(properties);
 
         self.send(transaction).await?;
         let response = checkr!(self.recv::<ApbStartTransactionResp>().await?);
@@ -234,6 +243,37 @@ impl Transaction<'_> {
         checkr!(self.connection.recv::<ApbOperationResp>().await?);
 
         Ok(())
+    }
+}
+
+pub struct TransactionLocks {
+    exclusive: Vec<RawIdent>,
+    shared: Vec<RawIdent>,
+}
+
+impl TransactionLocks {
+    pub fn new() -> Self {
+        Self {
+            exclusive: Vec::new(),
+            shared: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(exclusive: usize, shared: usize) -> Self {
+        Self {
+            exclusive: Vec::with_capacity(exclusive),
+            shared: Vec::with_capacity(shared),
+        }
+    }
+
+    pub fn push_exclusive(&mut self, ident: impl Into<RawIdent>) -> &mut Self {
+        self.exclusive.push(ident.into());
+        self
+    }
+
+    pub fn push_shared(&mut self, ident: impl Into<RawIdent>) -> &mut Self {
+        self.shared.push(ident.into());
+        self
     }
 }
 

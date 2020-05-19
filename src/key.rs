@@ -6,6 +6,7 @@ use antidotec::RawIdent;
 pub enum Kind {
     Bucket = 0,
     Inode = 1,
+    InoCounter = 2,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -35,6 +36,27 @@ impl Bucket {
 }
 
 impl Into<RawIdent> for Bucket {
+    fn into(self) -> RawIdent {
+        let mut ident = RawIdent::with_capacity(mem::size_of::<Self>());
+        ident.push(self.0.kind as u8);
+
+        let id = self.0.payload.to_le_bytes();
+        ident.extend_from_slice(&id);
+
+        ident
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct InoCounter(Key<Id>);
+
+impl InoCounter {
+    pub const fn new(id: Id) -> Self {
+        Self(Key::new(Kind::InoCounter, id))
+    }
+}
+
+impl Into<RawIdent> for InoCounter {
     fn into(self) -> RawIdent {
         let mut ident = RawIdent::with_capacity(mem::size_of::<Self>());
         ident.push(self.0.kind as u8);

@@ -1,5 +1,5 @@
 use std::{convert::TryFrom, time::Duration, collections::BTreeMap};
-use fuse::FileType;
+use fuse::{FileType, FileAttr};
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -14,6 +14,31 @@ impl Kind {
             Kind::Regular => FileType::RegularFile,
             Kind::Directory => FileType::Directory,
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Owner {
+    pub gid: u32,
+    pub uid: u32,
+}
+
+impl From<u64> for Owner {
+    fn from(x: u64) -> Self {
+        let gid = (x >> 4) as u32;
+        let uid = (x & 0x00FF) as u32;
+
+        Self {
+            gid,
+            uid,
+        }
+    }
+}
+
+impl Into<u64> for Owner {
+    fn into(self) -> u64 {
+        let x = (self.gid as u64) << 4;
+        x | (self.uid as u64)
     }
 }
 
@@ -40,7 +65,34 @@ pub struct Inode {
     pub atime: Duration,
     pub ctime: Duration,
     pub mtime: Duration,
+    pub owner: Owner,
+    pub mode: u32,
     pub size: u64,
+}
+
+impl Inode {
+    pub fn attr(&self) -> FileAttr {
+        let timespec_from_duration = |duration: Duration| {
+            time::Timespec::new(duration.as_secs() as i64, duration.subsec_nanos() as i32)
+        };
+
+        FileAttr {
+            ino: self.ino,
+            size: self.size,
+            blocks: 0,
+            atime: timespec_from_duration(self.atime),
+            mtime: timespec_from_duration(self.mtime),
+            ctime: timespec_from_duration(self.ctime),
+            crtime: timespec_from_duration(self.atime),
+            kind: self.kind.to_file_type(),
+            perm: self.mode as u16,
+            nlink: 1,
+            uid: self.owner.uid,
+            gid: self.owner.gid,
+            rdev: 0,
+            flags: 0,
+        }
+    }
 }
 
 pub type DirEntries = BTreeMap<String, u64>;
@@ -48,7 +100,7 @@ pub type DirEntries = BTreeMap<String, u64>;
 pub use self::mapping::{decode, read, update, read_dir, update_dir, decode_dir};
 
 mod mapping {
-    use super::{Inode, DirEntries};
+    use super::{Inode, Owner, DirEntries};
     use crate::key::{Key, Kind};
     use antidotec::{crdts, gmap, lwwreg, RawIdent, ReadQuery, UpdateQuery};
     use std::mem;
@@ -63,12 +115,15 @@ mod mapping {
         Atime = 3,
         Ctime = 4,
         Mtime = 5,
-        Size = 6,
-        DirEntries = 7,
+        Owner = 6,
+        Mode = 7,
+        Size = 8,
+        DirEntries = 9,
+        _Count = 10
     }
 
     impl Field {
-        const COUNT: usize = 5;
+        const COUNT: usize = Field::_Count as usize;
     }
 
     #[derive(Debug, Copy, Clone)]
@@ -129,6 +184,8 @@ mod mapping {
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
             .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
             .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
+            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
+            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
             .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
             .build()
     }
@@ -146,10 +203,12 @@ mod mapping {
         let atime = gmap.remove(&key.field(Field::Atime)).unwrap().into_lwwreg();
         let ctime = gmap.remove(&key.field(Field::Ctime)).unwrap().into_lwwreg();
         let mtime = gmap.remove(&key.field(Field::Mtime)).unwrap().into_lwwreg();
+        let owner =gmap.remove(&key.field(Field::Owner)).unwrap().into_lwwreg();
+        let mode = gmap.remove(&key.field(Field::Mode)).unwrap().into_lwwreg();
         let size = gmap.remove(&key.field(Field::Size)).unwrap().into_lwwreg();
 
         let kind = TryFrom::try_from(kind_byte).expect("invalid code byte");
-
+        let owner = Owner::from(lwwreg::read_u64(&owner));
         Inode {
             ino,
             kind,
@@ -157,6 +216,8 @@ mod mapping {
             atime: lwwreg::read_duration(&atime),
             ctime: lwwreg::read_duration(&ctime),
             mtime: lwwreg::read_duration(&mtime),
+            owner,
+            mode: lwwreg::read_u32(&mode),
             size: lwwreg::read_u64(&size),
         }
     }

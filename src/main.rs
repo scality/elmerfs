@@ -2,9 +2,10 @@ mod inode;
 mod key;
 mod op;
 
-use crate::inode::Inode;
-use crate::key::Bucket;
-use crate::op::{GetAttr, Lookup, Op, OpenDir, ReadDir, ReleaseDir};
+use crate::inode::{Inode, Owner};
+use crate::key::{Bucket, InoCounter};
+use crate::op::{GetAttr, Lookup, MkDir, Op, OpenDir, ReadDir, ReleaseDir};
+use antidotec::{counter, crdts, Connection, TransactionLocks};
 use async_std::sync::Arc;
 use async_std::task;
 use clap::{App, Arg};
@@ -14,12 +15,13 @@ use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const ROOT_INO: u64 = 1;
 const OP_BUFFERING_SIZE: usize = 1024;
-const MAIN_BUCKET: Bucket = Bucket::new(10);
+const MAIN_BUCKET: Bucket = Bucket::new(0);
+const INO_COUNTER: InoCounter = InoCounter::new(0);
 
 /// There is two main thread of execution to follow:
 ///
@@ -127,14 +129,39 @@ fn main() {
                     match handle_result(name, driver.readdir(readdir.ino, readdir.offset).await) {
                         Ok(entries) => {
                             for (i, entry) in entries.into_iter().enumerate() {
-                                let offset = readdir.offset + i as i64;
-                                readdir.reply.add(entry.ino, offset, entry.kind, entry.name);
+                                let offset = readdir.offset + i as i64 + 1;
+
+                                let full = readdir.reply.add(entry.ino, offset, entry.kind, entry.name);
+                                if full {
+                                    break;
+                                }
                             }
 
                             readdir.reply.ok();
                         }
                         Err(errno) => {
                             readdir.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::MkDir(mkdir) => {
+                task::spawn(async move {
+                    let owner = Owner {
+                        gid: mkdir.gid,
+                        uid: mkdir.uid,
+                    };
+
+                    let result = driver
+                        .mkdir(owner, mkdir.mode, mkdir.parent_ino, mkdir.name)
+                        .await;
+                    match handle_result(name, result) {
+                        Ok(attr) => {
+                            let generation = 0;
+                            mkdir.reply.entry(&ttl(), &attr, generation);
+                        }
+                        Err(errno) => {
+                            mkdir.reply.error(errno as libc::c_int);
                         }
                     }
                 });
@@ -158,6 +185,8 @@ enum RpfsError {
     Sys(Errno),
     #[error("io error with antidote: {0}")]
     Antidote(#[from] antidotec::Error),
+    #[error("could not allocate a new inode number")]
+    InoAllocFailed,
 }
 
 struct Rpfs {
@@ -203,6 +232,32 @@ impl Filesystem for Rpfs {
             parent_ino: parent,
         }));
     }
+
+    fn mkdir(
+        &mut self,
+        req: &Request,
+        parent_ino: u64,
+        name: &OsStr,
+        mode: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = match name.to_str() {
+            Some(name) => String::from(name),
+            None => {
+                reply.error(Errno::EINVAL as libc::c_int);
+                return;
+            }
+        };
+
+        let _ = self.op_sender.send(Op::MkDir(MkDir {
+            reply,
+            parent_ino,
+            name,
+            mode,
+            uid: req.uid(),
+            gid: req.gid(),
+        }));
+    }
 }
 
 struct Config {
@@ -216,12 +271,37 @@ struct RpDriver {
 
 impl RpDriver {
     async fn configure(&self) -> Result<(), RpfsError> {
-        self.ensure_root_dir().await?;
+        let mut connection = self.connect().await?;
+
+        self.ensure_ino_counter(&mut connection).await?;
+        self.ensure_root_dir(&mut connection).await?;
 
         Ok(())
     }
 
-    async fn ensure_root_dir(&self) -> Result<(), RpfsError> {
+    async fn ensure_ino_counter(&self, connection: &mut Connection) -> Result<(), RpfsError> {
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(INO_COUNTER);
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
+        {
+            let mut reply = tx
+                .read(self.cfg.bucket, vec![counter::get(INO_COUNTER)])
+                .await?;
+            if reply.counter(0) != 0 {
+                return Ok(());
+            }
+
+            let inc = i32::min_value();
+            tx.update(self.cfg.bucket, vec![counter::inc(INO_COUNTER, inc)])
+                .await?;
+        }
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    async fn ensure_root_dir(&self, connection: &mut Connection) -> Result<(), RpfsError> {
         match self.getattr(ROOT_INO).await {
             Ok(_) => return Ok(()),
             Err(RpfsError::Sys(Errno::ENOENT)) => {}
@@ -237,11 +317,12 @@ impl RpDriver {
             atime: t,
             ctime: t,
             mtime: t,
+            owner: Owner { uid: 0, gid: 0 },
+            mode: 0777,
             size: 0,
         };
 
-        let mut connection = self.connect().await?;
-        let mut tx = connection.start_transaction().await?;
+        let mut tx = connection.transaction().await?;
         {
             tx.update(self.cfg.bucket, vec![inode::update(&root_inode)])
                 .await?;
@@ -254,7 +335,7 @@ impl RpDriver {
     async fn getattr(&self, ino: u64) -> Result<FileAttr, RpfsError> {
         let mut connection = self.connect().await?;
 
-        let mut tx = connection.start_transaction().await?;
+        let mut tx = connection.transaction().await?;
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
 
@@ -265,32 +346,13 @@ impl RpDriver {
         };
         tx.commit().await?;
 
-        let timespec_from_duration = |duration: Duration| {
-            time::Timespec::new(duration.as_secs() as i64, duration.subsec_nanos() as i32)
-        };
-
-        Ok(FileAttr {
-            ino,
-            size: inode.size,
-            blocks: 0,
-            atime: timespec_from_duration(inode.atime),
-            mtime: timespec_from_duration(inode.mtime),
-            ctime: timespec_from_duration(inode.ctime),
-            crtime: timespec_from_duration(inode.atime),
-            kind: inode.kind.to_file_type(),
-            perm: 0644,
-            nlink: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            flags: 0,
-        })
+        Ok(inode.attr())
     }
 
     async fn lookup(&self, parent_ino: u64, name: &str) -> Result<FileAttr, RpfsError> {
         let mut connection = self.connect().await?;
 
-        let mut tx = connection.start_transaction().await?;
+        let mut tx = connection.transaction().await?;
         let entries = {
             let mut reply = tx
                 .read(self.cfg.bucket, vec![inode::read_dir(parent_ino)])
@@ -323,7 +385,7 @@ impl RpDriver {
 
     async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<ReadDirEntry>, RpfsError> {
         let mut connection = self.connect().await?;
-        let mut tx = connection.start_transaction().await?;
+        let mut tx = connection.transaction().await?;
         let entries = {
             let entries = {
                 let mut reply = tx.read(self.cfg.bucket, vec![inode::read_dir(ino)]).await?;
@@ -331,7 +393,11 @@ impl RpDriver {
                 match reply.gmap(0) {
                     Some(gmap) => inode::decode_dir(gmap),
                     None => {
-                        return Err(RpfsError::Sys(Errno::ENOENT));
+                        // FIXME: An API that prevents this kind of "I need to
+                        // remember to properly close the transaction" would
+                        // be better.
+                        tx.commit().await?;
+                        return Ok(vec![]);
                     }
                 }
             };
@@ -370,7 +436,103 @@ impl RpDriver {
         Ok(entries)
     }
 
-    async fn connect(&self) -> Result<antidotec::Connection, antidotec::Error> {
+    async fn mkdir(
+        &self,
+        owner: Owner,
+        mode: u32,
+        parent_ino: u64,
+        name: String,
+    ) -> Result<FileAttr, RpfsError> {
+        let mut connection = self.connect().await?;
+        let ino = self.generate_ino(&mut connection).await?;
+
+        let mut tx = connection.transaction().await?;
+        let attr = {
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
+                )
+                .await?;
+
+            let mut parent_inode = match reply.gmap(0) {
+                Some(inode) => inode::decode(parent_ino, inode),
+                None => {
+                    tx.abort().await?;
+                    return Err(RpfsError::Sys(Errno::ENOENT));
+                }
+            };
+
+            let mut entries = inode::decode_dir(reply.gmap(1).unwrap_or(crdts::GMap::new()));
+            entries.insert(name, ino);
+
+            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let inode = Inode {
+                ino,
+                kind: inode::Kind::Directory,
+                parent: parent_ino,
+                atime: t,
+                ctime: t,
+                mtime: t,
+                owner,
+                mode,
+                size: 0,
+            };
+            parent_inode.size = entries.len() as u64;
+
+            let attr = inode.attr();
+
+            tx.update(
+                self.cfg.bucket,
+                vec![
+                    inode::update(&parent_inode),
+                    inode::update_dir(parent_ino, &entries),
+                    inode::update(&inode),
+                ],
+            )
+            .await?;
+
+            attr
+        };
+        tx.commit().await?;
+
+        Ok(attr)
+    }
+
+    async fn generate_ino(&self, connexion: &mut Connection) -> Result<u64, RpfsError> {
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(INO_COUNTER);
+
+        let mut tx = connexion.transaction_with_locks(locks).await?;
+        let ino = {
+            let mut reply = tx
+                .read(self.cfg.bucket, vec![counter::get(INO_COUNTER)])
+                .await?;
+
+            let ino_counter = reply.counter(0) as u64;
+            let (ino, inc) = match ino_counter.checked_add(1) {
+                Some(0) => {
+                    // If we reached 0 we need to skip 0 and 1 (ROOT ino).
+                    (2, 2)
+                }
+                Some(ino) => (ino, 1),
+                None => {
+                    tx.abort().await?;
+                    return Err(RpfsError::InoAllocFailed);
+                }
+            };
+
+            tx.update(self.cfg.bucket, vec![counter::inc(INO_COUNTER, inc)])
+                .await?;
+
+            ino as u64
+        };
+        tx.commit().await?;
+
+        Ok(ino)
+    }
+
+    async fn connect(&self) -> Result<Connection, antidotec::Error> {
         antidotec::Connection::new(&self.cfg.address).await
     }
 }
@@ -397,6 +559,10 @@ fn handle_result<U: Debug + Send>(name: &str, result: Result<U, RpfsError>) -> R
         Err(RpfsError::Sys(errno)) => {
             debug!("({}): system error - {}", name, errno);
             Err(errno)
+        }
+        Err(RpfsError::InoAllocFailed) => {
+            debug!("({}): ino alloc failed - ()", name);
+            Err(Errno::ENOSPC)
         }
     }
 }

@@ -10,7 +10,8 @@ pub enum Op {
     Lookup(Lookup),
     OpenDir(OpenDir),
     ReleaseDir(ReleaseDir),
-    ReadDir(ReadDir)
+    ReadDir(ReadDir),
+    MkDir(MkDir),
 }
 
 impl Op {
@@ -20,7 +21,8 @@ impl Op {
             Self::Lookup(_) => "lookup",
             Self::OpenDir(_) => "opendir",
             Self::ReleaseDir(_) => "releasedir",
-            Self::ReadDir(_) => "readdir"
+            Self::ReadDir(_) => "readdir",
+            Self::MkDir(_) => "mkdir",
         }
     }
 }
@@ -57,6 +59,16 @@ pub struct ReadDir {
     pub ino: u64,
     pub fh: u64,
     pub offset: i64,
+}
+
+#[derive(Debug)]
+pub struct MkDir {
+    pub reply: ReplyEntry,
+    pub parent_ino: u64,
+    pub name: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {
