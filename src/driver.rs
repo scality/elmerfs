@@ -284,6 +284,56 @@ impl Driver {
         Ok(attr)
     }
 
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn rmdir(&self, parent_ino: u64, name: String) -> Result<()> {
+        let mut connection = self.connect().await?;
+
+        let mut locks = TransactionLocks::with_capacity(2, 0);
+        locks.push_exclusive(inode::Key::new(parent_ino));
+        locks.push_exclusive(inode::Key::dir_entries(parent_ino));
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
+        {
+            let mut reply = tx.read(
+                self.cfg.bucket,
+                vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
+            )
+            .await?;
+
+            let mut parent_inode = match reply.gmap(0) {
+                Some(inode) => inode::decode(parent_ino, inode),
+                None => {
+                    tx.abort().await?;
+                    return Err(Error::Sys(Errno::ENOENT));
+                }
+            };
+
+            let mut entries = inode::decode_dir(reply.gmap(1).unwrap_or(crdts::GMap::new()));
+
+            let ino = match entries.remove(&name) {
+                Some(ino) => ino,
+                None => {
+                    tx.abort().await?;
+                    return Err(Error::Sys(Errno::ENOENT));
+                }
+            };
+
+            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            parent_inode.atime = t;
+            parent_inode.mtime = t;
+            parent_inode.size -= 1;
+
+            tx.update(self.cfg.bucket, vec![
+                inode::remove(ino),
+                inode::remove_dir(ino),
+                inode::remove_dir_entry(parent_ino, name)
+            ]).await?;
+        }
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, connexion))]
     pub(crate) async fn generate_ino(&self, connexion: &mut Connection) -> Result<u64> {
         let mut locks = TransactionLocks::with_capacity(1, 0);
@@ -317,6 +367,7 @@ impl Driver {
 
         Ok(ino)
     }
+
 
     async fn connect(&self) -> Result<Connection> {
         Ok(antidotec::Connection::new(&self.cfg.address).await?)

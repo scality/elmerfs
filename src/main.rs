@@ -5,7 +5,7 @@ mod dispatch;
 mod driver;
 
 use crate::key::Bucket;
-use crate::op::{GetAttr, Lookup, MkDir, Op, OpenDir, ReadDir, ReleaseDir};
+use crate::op::*;
 use async_std::sync::Arc;
 use clap::{App, Arg};
 use fuse::{Filesystem, *};
@@ -139,6 +139,22 @@ impl Filesystem for Rpfs {
             mode,
             uid: req.uid(),
             gid: req.gid(),
+        }));
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name = match name.to_str() {
+            Some(name) => String::from(name),
+            None => {
+                reply.error(Errno::EINVAL as libc::c_int);
+                return;
+            }
+        };
+
+        let _ = self.op_sender.send(Op::RmDir(RmDir {
+            reply,
+            parent_ino: parent,
+            name,
         }));
     }
 }

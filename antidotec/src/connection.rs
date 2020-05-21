@@ -449,7 +449,7 @@ pub mod mvreg {
 pub mod gmap {
     use super::crdts::Crdt;
     use super::{
-        ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
+        ApbMapKey, ApbCrdtReset, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
         ReadQuery, UpdateQuery,
     };
     use protobuf;
@@ -506,8 +506,91 @@ pub mod gmap {
     }
 }
 
+pub mod rrmap {
+    use super::crdts::Crdt;
+    use super::{
+        ApbMapKey, ApbCrdtReset, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
+        ReadQuery, UpdateQuery,
+    };
+    use protobuf;
+    use std::collections::HashMap;
+
+    pub type RrMap = HashMap<RawIdent, Crdt>;
+
+    pub struct UpdateBuilder {
+        key: RawIdent,
+        updates: Vec<ApbMapNestedUpdate>,
+        removed: Vec<ApbMapKey>,
+    }
+
+    impl UpdateBuilder {
+        pub fn push(mut self, query: UpdateQuery) -> Self {
+            let mut nested = ApbMapNestedUpdate::new();
+            let mut key = ApbMapKey::new();
+            key.set_field_type(query.ty);
+            key.set_key(query.key);
+
+            nested.set_update(query.update);
+            nested.set_key(key);
+
+            self.updates.push(nested);
+            self
+        }
+
+        pub fn remove_mvreg(mut self, ident: impl Into<RawIdent>) -> Self {
+            let mut key = ApbMapKey::new();
+            key.set_field_type(CRDT_type::MVREG);
+            key.set_key(ident.into());
+
+            self.removed.push(key);
+            self
+        }
+
+        pub fn build(self) -> UpdateQuery {
+            let mut updates = ApbMapUpdate::new();
+            updates.set_updates(protobuf::RepeatedField::from(self.updates));
+            updates.set_removedKeys(protobuf::RepeatedField::from(self.removed));
+
+            let mut update = ApbUpdateOperation::new();
+            update.set_mapop(updates);
+
+            UpdateQuery {
+                key: self.key,
+                update,
+                ty: CRDT_type::RRMAP,
+            }
+        }
+    }
+
+    pub fn reset(key: impl Into<RawIdent>) -> UpdateQuery {
+        let mut update = ApbUpdateOperation::new();
+        update.set_resetop(ApbCrdtReset::new());
+
+        UpdateQuery {
+            key: key.into(),
+            ty: CRDT_type::RRMAP,
+            update,
+        }
+    }
+
+    pub fn update(key: impl Into<RawIdent>, capacity: usize) -> UpdateBuilder {
+        UpdateBuilder {
+            key: key.into(),
+            updates: Vec::with_capacity(capacity),
+            removed: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
+        ReadQuery {
+            key: key.into(),
+            ty: CRDT_type::RRMAP,
+        }
+    }
+}
+
 pub mod crdts {
-    pub use super::{counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg};
+    pub use super::{RawIdent, counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap};
     use super::{ApbReadObjectResp, CRDT_type};
     use std::collections::HashMap;
 
@@ -517,6 +600,7 @@ pub mod crdts {
         LwwReg(LwwReg),
         MvReg(MvReg),
         GMap(GMap),
+        RrMap(RrMap)
     }
 
     impl Crdt {
@@ -559,24 +643,27 @@ pub mod crdts {
                 CRDT_type::COUNTER => Counter(read.take_counter().get_value()),
                 CRDT_type::LWWREG => LwwReg(read.take_reg().take_value()),
                 CRDT_type::MVREG => MvReg(read.take_mvreg().take_values().into_vec()),
-                CRDT_type::GMAP => {
-                    let entries = read.take_map().take_entries();
-
-                    let mut map = HashMap::with_capacity(entries.len());
-                    for mut entry in entries.into_iter() {
-                        let mut entry_key = entry.take_key();
-                        let key = entry_key.take_key();
-
-                        map.insert(
-                            key,
-                            Self::from_read(entry_key.get_field_type(), entry.take_value()),
-                        );
-                    }
-
-                    GMap(map)
-                }
+                CRDT_type::GMAP => GMap(Self::map(read)),
+                CRDT_type::RRMAP => RrMap(Self::map(read)),
                 _ => unimplemented!(),
             }
+        }
+
+        fn map(mut read: ApbReadObjectResp) -> HashMap<RawIdent, Crdt> {
+            let entries = read.take_map().take_entries();
+
+            let mut map = HashMap::with_capacity(entries.len());
+            for mut entry in entries.into_iter() {
+                let mut entry_key = entry.take_key();
+                let key = entry_key.take_key();
+
+                map.insert(
+                    key,
+                    Self::from_read(entry_key.get_field_type(), entry.take_value()),
+                );
+            }
+
+            map
         }
     }
 }

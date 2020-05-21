@@ -117,6 +117,22 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                     }
                 });
             }
+            Op::RmDir(rmdir) => {
+                task::spawn(async move {
+                    let result = driver
+                        .rmdir(rmdir.parent_ino, rmdir.name)
+                        .await;
+
+                    match handle_result(name, result) {
+                        Ok(_) => {
+                            rmdir.reply.ok();
+                        }
+                        Err(errno) => {
+                            rmdir.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
         }
     }
 }

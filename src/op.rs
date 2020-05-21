@@ -12,6 +12,7 @@ pub enum Op {
     ReleaseDir(ReleaseDir),
     ReadDir(ReadDir),
     MkDir(MkDir),
+    RmDir(RmDir),
 }
 
 impl Op {
@@ -23,6 +24,7 @@ impl Op {
             Self::ReleaseDir(_) => "releasedir",
             Self::ReadDir(_) => "readdir",
             Self::MkDir(_) => "mkdir",
+            Self::RmDir(_) => "rmdir",
         }
     }
 }
@@ -69,6 +71,13 @@ pub struct MkDir {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+}
+
+#[derive(Debug)]
+pub struct RmDir {
+    pub reply: ReplyEmpty,
+    pub parent_ino: u64,
+    pub name: String,
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {
