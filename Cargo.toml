@@ -17,6 +17,11 @@ nix = "0.17"
 clap = "2.33"
 anyhow = "1.0"
 thiserror = "1.0"
-log = "0.4.8"
-env_logger = "0.7.1"
 time = "0.1"
+tracing = "0.1"
+tracing-subscriber = "0.2"
+
+[dependencies.tracing-futures]
+version = "0.2"
+default-features = false
+features = ["std", "std-future"]

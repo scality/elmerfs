@@ -57,3 +57,11 @@ pub mod lwwreg {
         Duration::new(secs, nanos)
     }
 }
+
+pub mod mvreg {
+    use crate::connection::{RawIdent, UpdateQuery, mvreg::*};
+
+    pub fn set_u64(key: impl Into<RawIdent>, x: u64) -> UpdateQuery {
+        set(key, (x.to_le_bytes())[..].into())
+    }
+}

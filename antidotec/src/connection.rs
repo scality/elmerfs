@@ -60,6 +60,7 @@ macro_rules! checkr {
     }};
 }
 
+#[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
     scratchpad: Vec<u8>,
@@ -441,6 +442,8 @@ pub mod mvreg {
             update,
         }
     }
+
+    pub use crate::encoding::mvreg::*;
 }
 
 pub mod gmap {

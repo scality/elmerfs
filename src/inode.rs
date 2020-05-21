@@ -26,7 +26,7 @@ pub struct Owner {
 impl From<u64> for Owner {
     fn from(x: u64) -> Self {
         let gid = (x >> 32) as u32;
-        let uid = (x & 0x00FF) as u32;
+        let uid = (x & 0x0000FFFF) as u32;
 
         Self {
             gid,
@@ -97,12 +97,12 @@ impl Inode {
 
 pub type DirEntries = BTreeMap<String, u64>;
 
-pub use self::mapping::{decode, read, update, read_dir, update_dir, decode_dir};
+pub use self::mapping::{InodeKey as Key, decode, read, update, read_dir, update_dir, decode_dir};
 
 mod mapping {
     use super::{Inode, Owner, DirEntries};
     use crate::key::{Key, Kind};
-    use antidotec::{crdts, gmap, lwwreg, RawIdent, ReadQuery, UpdateQuery};
+    use antidotec::{crdts, gmap, lwwreg, mvreg, RawIdent, ReadQuery, UpdateQuery};
     use std::mem;
     use std::convert::TryFrom;
 
@@ -127,13 +127,13 @@ mod mapping {
     }
 
     #[derive(Debug, Copy, Clone)]
-    struct Id {
+    pub struct Id {
         field: Field,
         ino: u64,
     }
 
     #[derive(Debug, Copy, Clone)]
-    struct InodeKey(Key<Id>);
+    pub struct InodeKey(Key<Id>);
 
     impl InodeKey {
         pub fn new(ino: u64) -> Self {
@@ -146,7 +146,11 @@ mod mapping {
             ))
         }
 
-        pub fn field(self, field: Field) -> RawIdent {
+        pub fn dir_entries(ino: u64) -> RawIdent {
+            Self::new(ino).field(Field::DirEntries)
+        }
+
+        fn field(self, field: Field) -> RawIdent {
             InodeKey(Key::new(
                 Kind::Inode,
                 Id {
@@ -234,7 +238,7 @@ mod mapping {
 
         for (name, ino) in entries {
             let name_ident = Vec::from(name.as_bytes());
-            gmap = gmap.push(lwwreg::set_u64(name_ident, *ino));
+            gmap = gmap.push(mvreg::set_u64(name_ident, *ino));
         }
 
         gmap.build()
@@ -244,8 +248,13 @@ mod mapping {
         let mut entries = DirEntries::new();
         for (name_ident, ino_reg) in gmap {
             let name = String::from_utf8(name_ident).unwrap();
+            let values = ino_reg.into_mvreg();
 
-            let ino = lwwreg::read_u64(&ino_reg.into_lwwreg());
+            // NOTE: As of now, there shouldn't be any concurrent
+            // modification to dir entries.
+            assert_eq!(values.len(), 1);
+
+            let ino = lwwreg::read_u64(&values[0]);
             entries.insert(name, ino);
         }
 
