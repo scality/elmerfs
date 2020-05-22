@@ -1,17 +1,17 @@
 use crate::driver::{Driver, Error};
+use crate::inode::Owner;
 use crate::op::{self, *};
 use async_std::task;
-use tracing::{self, debug, warn, error};
+use nix::{errno::Errno, libc};
+use std::fmt::Debug;
 use std::sync::Arc;
 use time;
-use nix::{errno::Errno, libc};
-use crate::inode::Owner;
-use std::fmt::Debug;
+use tracing::{self, debug, error, warn};
 
-#[tracing::instrument]
+#[tracing::instrument(skip(driver, op_receiver))]
 pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
     let ttl = || time::Timespec::new(600, 0);
-   
+
     task::block_on(driver.configure()).unwrap();
 
     while let Ok(op) = op_receiver.recv() {
@@ -19,7 +19,7 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
 
         let driver = driver.clone();
         let name = op.name();
-    
+
         // FIXME: Reply are done in the asynchronous tasks but may be blocking
         // for a significant amount of time. We should ensure that the scheduler
         // is handling this gracefully or that we explicity
@@ -80,14 +80,14 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                         Ok(entries) => {
                             for (i, entry) in entries.into_iter().enumerate() {
                                 let offset = readdir.offset + i as i64 + 1;
-    
+
                                 let full =
                                     readdir.reply.add(entry.ino, offset, entry.kind, entry.name);
                                 if full {
                                     break;
                                 }
                             }
-    
+
                             readdir.reply.ok();
                         }
                         Err(errno) => {
@@ -102,7 +102,7 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                         gid: mkdir.gid,
                         uid: mkdir.uid,
                     };
-    
+
                     let result = driver
                         .mkdir(owner, mkdir.mode, mkdir.parent_ino, mkdir.name)
                         .await;
@@ -119,9 +119,7 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
             }
             Op::RmDir(rmdir) => {
                 task::spawn(async move {
-                    let result = driver
-                        .rmdir(rmdir.parent_ino, rmdir.name)
-                        .await;
+                    let result = driver.rmdir(rmdir.parent_ino, rmdir.name).await;
 
                     match handle_result(name, result) {
                         Ok(_) => {
@@ -129,6 +127,28 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                         }
                         Err(errno) => {
                             rmdir.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::MkNod(mknod) => {
+                let owner = Owner {
+                    gid: mknod.gid,
+                    uid: mknod.uid,
+                };
+
+                task::spawn(async move {
+                    let result = driver
+                        .mknod(owner, mknod.mode, mknod.parent_ino, mknod.name, mknod.rdev)
+                        .await;
+
+                    match handle_result(name, result) {
+                        Ok(attr) => {
+                            let generation = 0;
+                            mknod.reply.entry(&ttl(), &attr, generation);
+                        }
+                        Err(errno) => {
+                            mknod.reply.error(errno as libc::c_int);
                         }
                     }
                 });

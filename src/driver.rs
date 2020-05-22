@@ -23,8 +23,8 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub(crate) struct Config {
-    pub(crate)bucket: Bucket,
-    pub(crate)address: String,
+    pub(crate) bucket: Bucket,
+    pub(crate) address: String,
 }
 
 #[derive(Debug)]
@@ -293,11 +293,12 @@ impl Driver {
 
         let mut tx = connection.transaction_with_locks(locks).await?;
         {
-            let mut reply = tx.read(
-                self.cfg.bucket,
-                vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
-            )
-            .await?;
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
+                )
+                .await?;
 
             let mut parent_inode = match reply.gmap(0) {
                 Some(inode) => inode::decode(parent_ino, inode),
@@ -320,15 +321,88 @@ impl Driver {
             parent_inode.mtime = t;
             parent_inode.size -= 1;
 
-            tx.update(self.cfg.bucket, vec![
-                inode::remove(ino),
-                inode::remove_dir(ino),
-                inode::remove_dir_entry(parent_ino, name)
-            ]).await?;
+            tx.update(
+                self.cfg.bucket,
+                vec![
+                    inode::remove(ino),
+                    inode::remove_dir(ino),
+                    inode::remove_dir_entry(parent_ino, name),
+                ],
+            )
+            .await?;
         }
         tx.commit().await?;
 
         Ok(())
+    }
+
+    pub(crate) async fn mknod(
+        &self,
+        owner: Owner,
+        mode: u32,
+        parent_ino: u64,
+        name: String,
+        _rdev: u32,
+    ) -> Result<FileAttr> {
+        let mut connection = self.connect().await?;
+        let ino = self.generate_ino(&mut connection).await?;
+
+        let mut locks = TransactionLocks::with_capacity(2, 0);
+        locks.push_exclusive(inode::Key::new(parent_ino));
+        locks.push_exclusive(inode::Key::dir_entries(parent_ino));
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
+        let attr = {
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
+                )
+                .await?;
+
+            let mut parent_inode = match reply.gmap(0) {
+                Some(inode) => inode::decode(parent_ino, inode),
+                None => {
+                    return Err(Error::Sys(Errno::ENOENT));
+                }
+            };
+
+            let mut entries = inode::decode_dir(reply.gmap(1).unwrap_or(crdts::GMap::new()));
+            entries.insert(name, ino);
+
+            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let inode = Inode {
+                ino,
+                kind: inode::Kind::Regular,
+                parent: parent_ino,
+                atime: t,
+                ctime: t,
+                mtime: t,
+                owner,
+                mode,
+                size: 0,
+            };
+            parent_inode.size = entries.len() as u64;
+            parent_inode.mtime = t;
+            parent_inode.atime = t;
+
+            let attr = inode.attr();
+
+            tx.update(
+                self.cfg.bucket,
+                vec![
+                    inode::update(&parent_inode),
+                    inode::update_dir(parent_ino, &entries),
+                    inode::update(&inode),
+                ],
+            )
+            .await?;
+
+            attr
+        };
+        tx.commit().await?;
+
+        Ok(attr)
     }
 
     #[tracing::instrument(skip(self, connexion))]
@@ -363,7 +437,6 @@ impl Driver {
 
         Ok(ino)
     }
-
 
     async fn connect(&self) -> Result<Connection> {
         Ok(antidotec::Connection::new(&self.cfg.address).await?)

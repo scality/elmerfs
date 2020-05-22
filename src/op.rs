@@ -13,6 +13,7 @@ pub enum Op {
     ReadDir(ReadDir),
     MkDir(MkDir),
     RmDir(RmDir),
+    MkNod(MkNod),
 }
 
 impl Op {
@@ -25,6 +26,7 @@ impl Op {
             Self::ReadDir(_) => "readdir",
             Self::MkDir(_) => "mkdir",
             Self::RmDir(_) => "rmdir",
+            Self::MkNod(_) => "mknod",
         }
     }
 }
@@ -78,6 +80,18 @@ pub struct RmDir {
     pub reply: ReplyEmpty,
     pub parent_ino: u64,
     pub name: String,
+}
+
+
+#[derive(Debug)]
+pub struct MkNod {
+    pub reply: ReplyEntry,
+    pub parent_ino: u64,
+    pub name: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {

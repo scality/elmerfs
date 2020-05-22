@@ -1,24 +1,23 @@
+mod dispatch;
+mod driver;
 mod inode;
 mod key;
 mod op;
-mod dispatch;
-mod driver;
 
 use crate::key::Bucket;
 use crate::op::*;
 use async_std::sync::Arc;
 use clap::{App, Arg};
+use driver::Driver;
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
 use std::thread;
-use driver::Driver;
-use tracing::{info, Level};
-use tracing_subscriber;
+use tracing::info;
+use tracing_subscriber::{self, filter::EnvFilter};
 
 const MAIN_BUCKET: Bucket = Bucket::new(0);
 const OP_BUFFERING_SIZE: usize = 1024;
-
 
 /// There is two main thread of execution to follow:
 ///
@@ -30,9 +29,12 @@ const OP_BUFFERING_SIZE: usize = 1024;
 /// them into asynchronous tasks calling into the root of the filesystem,
 /// the Rp driver.
 fn main() {
-    let _trace_subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap()
+        .add_directive("async_std::task=warn".parse().unwrap())
+        .add_directive("fuse=error".parse().unwrap());
+
+    let _trace_subscriber = tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args = App::new("rpfs")
         .arg(
@@ -157,6 +159,32 @@ impl Filesystem for Rpfs {
             name,
         }));
     }
+
+    fn mknod(
+        &mut self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = match name.to_str() {
+            Some(name) => String::from(name),
+            None => {
+                reply.error(Errno::EINVAL as libc::c_int);
+                return;
+            }
+        };
+
+        let _ = self.op_sender.send(Op::MkNod(MkNod {
+            reply,
+            parent_ino: parent,
+            name,
+            mode,
+            uid: req.uid(),
+            gid: req.gid(),
+            rdev,
+        }));
+    }
 }
-
-

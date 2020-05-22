@@ -449,7 +449,7 @@ pub mod mvreg {
 pub mod gmap {
     use super::crdts::Crdt;
     use super::{
-        ApbMapKey, ApbCrdtReset, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
+        ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
         ReadQuery, UpdateQuery,
     };
     use protobuf;
