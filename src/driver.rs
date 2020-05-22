@@ -4,7 +4,7 @@ use antidotec::{self, counter, crdts, Connection, TransactionLocks};
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use thiserror::Error;
 
 const ROOT_INO: u64 = 1;
@@ -106,10 +106,54 @@ impl Driver {
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
 
-            match reply.gmap(0) {
-                Some(gmap) => inode::decode(ino, gmap),
+            match reply.rrmap(0) {
+                Some(map) => inode::decode(ino, map),
                 None => return Err(Error::Sys(Errno::ENOENT)),
             }
+        };
+        tx.commit().await?;
+
+        Ok(inode.attr())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn setattr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+    ) -> Result<FileAttr> {
+        macro_rules! update {
+            ($target:expr, $v:ident) => {
+                $target = $v.unwrap_or($target);
+            }
+        }
+
+        let mut connection = self.connect().await?;
+
+        let mut tx = connection.transaction().await?;
+        let inode = {
+            let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
+
+            let mut inode = match reply.rrmap(0) {
+                Some(map) => inode::decode(ino, map),
+                None => return Err(Error::Sys(Errno::ENOENT))
+            };
+
+            update!(inode.mode, mode);
+            update!(inode.owner.uid, uid);
+            update!(inode.owner.gid, gid);
+            update!(inode.size, size);
+            update!(inode.atime, atime);
+            update!(inode.mtime, mtime);
+
+            tx.update(self.cfg.bucket, vec![inode::update(&inode)]).await?;
+
+            inode
         };
         tx.commit().await?;
 
@@ -130,8 +174,8 @@ impl Driver {
                 .await?;
             tx.commit().await?;
 
-            match reply.gmap(0) {
-                Some(gmap) => inode::decode_dir(gmap),
+            match reply.rrmap(0) {
+                Some(map) => inode::decode_dir(map),
                 None => {
                     return Err(Error::Sys(Errno::ENOENT));
                 }
@@ -168,8 +212,8 @@ impl Driver {
             let entries = {
                 let mut reply = tx.read(self.cfg.bucket, vec![inode::read_dir(ino)]).await?;
 
-                match reply.gmap(0) {
-                    Some(gmap) => inode::decode_dir(gmap),
+                match reply.rrmap(0) {
+                    Some(map) => inode::decode_dir(map),
                     None => {
                         // FIXME: An API that prevents this kind of "I need to
                         // remember to properly close the transaction" would
@@ -197,7 +241,7 @@ impl Driver {
                 // We share the same view as when we read the directory entries
                 // as we share the same transaction. An non existing entry at
                 // this step means a bug.
-                let inode = reply.gmap(index).unwrap();
+                let inode = reply.rrmap(index).unwrap();
                 let inode = inode::decode(ino, inode);
 
                 entries.push(ReadDirEntry {
@@ -238,14 +282,14 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = match reply.gmap(0) {
+            let mut parent_inode = match reply.rrmap(0) {
                 Some(inode) => inode::decode(parent_ino, inode),
                 None => {
                     return Err(Error::Sys(Errno::ENOENT));
                 }
             };
 
-            let mut entries = inode::decode_dir(reply.gmap(1).unwrap_or(crdts::GMap::new()));
+            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
             entries.insert(name, ino);
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -300,14 +344,14 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = match reply.gmap(0) {
+            let mut parent_inode = match reply.rrmap(0) {
                 Some(inode) => inode::decode(parent_ino, inode),
                 None => {
                     return Err(Error::Sys(Errno::ENOENT));
                 }
             };
 
-            let mut entries = inode::decode_dir(reply.gmap(1).unwrap_or(crdts::GMap::new()));
+            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
 
             let ino = match entries.remove(&name) {
                 Some(ino) => ino,
@@ -360,14 +404,14 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = match reply.gmap(0) {
+            let mut parent_inode = match reply.rrmap(0) {
                 Some(inode) => inode::decode(parent_ino, inode),
                 None => {
                     return Err(Error::Sys(Errno::ENOENT));
                 }
             };
 
-            let mut entries = inode::decode_dir(reply.gmap(1).unwrap_or(crdts::GMap::new()));
+            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
             entries.insert(name, ino);
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -403,6 +447,58 @@ impl Driver {
         tx.commit().await?;
 
         Ok(attr)
+    }
+
+    pub(crate) async fn unlink(&self, parent_ino: u64, name: String) -> Result<()> {
+        // FIXME: We do not track the link count of file. meaning that an
+        // unlink op is always deleting the inner file.
+        let mut connection = self.connect().await?;
+
+        let mut locks = TransactionLocks::with_capacity(2, 0);
+        locks.push_exclusive(inode::Key::new(parent_ino));
+        locks.push_exclusive(inode::Key::dir_entries(parent_ino));
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
+        {
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
+                )
+                .await?;
+
+            let mut parent_inode = match reply.rrmap(0) {
+                Some(inode) => inode::decode(parent_ino, inode),
+                None => {
+                    return Err(Error::Sys(Errno::ENOENT));
+                }
+            };
+
+            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
+
+            let ino = match entries.remove(&name) {
+                Some(ino) => ino,
+                None => {
+                    return Err(Error::Sys(Errno::ENOENT));
+                }
+            };
+
+            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            parent_inode.atime = t;
+            parent_inode.mtime = t;
+            parent_inode.size -= 1;
+
+            tx.update(
+                self.cfg.bucket,
+                vec![
+                    inode::remove(ino),
+                    inode::remove_dir_entry(parent_ino, name),
+                ],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, connexion))]

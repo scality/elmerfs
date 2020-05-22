@@ -5,6 +5,7 @@ use async_std::task;
 use nix::{errno::Errno, libc};
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 use time;
 use tracing::{self, debug, error, warn};
 
@@ -33,6 +34,31 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                         }
                         Err(errno) => {
                             getattr.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::SetAttr(setattr) => {
+                task::spawn(async move {
+                    match handle_result(
+                        name,
+                        driver
+                            .setattr(
+                                setattr.ino,
+                                setattr.mode,
+                                setattr.uid,
+                                setattr.gid,
+                                setattr.size,
+                                setattr.atime.map(duration_from_timespec),
+                                setattr.mtime.map(duration_from_timespec),
+                            )
+                            .await,
+                    ) {
+                        Ok(attr) => {
+                            setattr.reply.attr(&ttl(), &attr);
+                        }
+                        Err(errno) => {
+                            setattr.reply.error(errno as libc::c_int);
                         }
                     }
                 });
@@ -153,6 +179,18 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                     }
                 });
             }
+            Op::Unlink(unlink) => {
+                task::spawn(async move {
+                    match handle_result(name, driver.unlink(unlink.parent_ino, unlink.name).await) {
+                        Ok(_) => {
+                            unlink.reply.ok();
+                        }
+                        Err(errno) => {
+                            unlink.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -176,4 +214,8 @@ fn handle_result<U: Debug + Send>(name: &str, result: Result<U, Error>) -> Resul
             Err(Errno::ENOSPC)
         }
     }
+}
+
+fn duration_from_timespec(t: time::Timespec) -> std::time::Duration {
+    Duration::new(t.sec as u64, t.nsec as u32)
 }

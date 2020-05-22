@@ -335,6 +335,16 @@ impl ReadReply {
         }
     }
 
+    pub fn rrmap(&mut self, index: usize) -> Option<crdts::RrMap> {
+        let rrmap = self.object(CRDT_type::RRMAP, index).unwrap().into_rrmap();
+
+        if rrmap.len() == 0 {
+            None
+        } else {
+            Some(rrmap)
+        }
+    }
+
     fn object(&mut self, ty: CRDT_type, index: usize) -> Option<Crdt> {
         self.objects[index].take().map(|o| Crdt::from_read(ty, o))
     }
@@ -622,6 +632,13 @@ pub mod crdts {
             match self {
                 Self::GMap(m) => m,
                 _ => self.expected("gmap"),
+            }
+        }
+
+        pub fn into_rrmap(self) -> GMap {
+            match self {
+                Self::RrMap(m) => m,
+                _ => self.expected("rrmap"),
             }
         }
 

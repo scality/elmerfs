@@ -15,6 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::thread;
 use tracing::info;
 use tracing_subscriber::{self, filter::EnvFilter};
+use time::Timespec;
 
 const MAIN_BUCKET: Bucket = Bucket::new(0);
 const OP_BUFFERING_SIZE: usize = 1024;
@@ -185,6 +186,52 @@ impl Filesystem for Rpfs {
             uid: req.uid(),
             gid: req.gid(),
             rdev,
+        }));
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name = match name.to_str() {
+            Some(name) => String::from(name),
+            None => {
+                reply.error(Errno::EINVAL as libc::c_int);
+                return;
+            }
+        };
+
+        let _ = self.op_sender.send(Op::Unlink(Unlink {
+            reply,
+            parent_ino: parent,
+            name,
+        }));
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        fh: Option<u64>,
+        _crtime: Option<Timespec>,
+        _chgtime: Option<Timespec>,
+        _bkuptime: Option<Timespec>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let _ = self.op_sender.send(Op::SetAttr(SetAttr {
+            reply,
+            ino,
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+            fh,
         }));
     }
 }
