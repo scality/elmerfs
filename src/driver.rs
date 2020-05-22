@@ -241,7 +241,6 @@ impl Driver {
             let mut parent_inode = match reply.gmap(0) {
                 Some(inode) => inode::decode(parent_ino, inode),
                 None => {
-                    tx.abort().await?;
                     return Err(Error::Sys(Errno::ENOENT));
                 }
             };
@@ -303,7 +302,6 @@ impl Driver {
             let mut parent_inode = match reply.gmap(0) {
                 Some(inode) => inode::decode(parent_ino, inode),
                 None => {
-                    tx.abort().await?;
                     return Err(Error::Sys(Errno::ENOENT));
                 }
             };
@@ -313,7 +311,6 @@ impl Driver {
             let ino = match entries.remove(&name) {
                 Some(ino) => ino,
                 None => {
-                    tx.abort().await?;
                     return Err(Error::Sys(Errno::ENOENT));
                 }
             };
@@ -353,7 +350,6 @@ impl Driver {
                 }
                 Some(ino) => (ino, 1),
                 None => {
-                    tx.abort().await?;
                     return Err(Error::InoAllocFailed);
                 }
             };
