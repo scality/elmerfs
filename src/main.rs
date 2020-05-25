@@ -3,21 +3,24 @@ mod driver;
 mod inode;
 mod key;
 mod op;
+mod page;
 
+use crate::driver::Driver;
 use crate::key::Bucket;
 use crate::op::*;
+use crate::page::PageDriver;
 use async_std::sync::Arc;
 use clap::{App, Arg};
-use driver::Driver;
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
 use std::thread;
+use time::Timespec;
 use tracing::info;
 use tracing_subscriber::{self, filter::EnvFilter};
-use time::Timespec;
 
 const MAIN_BUCKET: Bucket = Bucket::new(0);
+const PAGE_SIZE: usize = 1024 * 128;
 const OP_BUFFERING_SIZE: usize = 1024;
 
 /// There is two main thread of execution to follow:
@@ -61,7 +64,10 @@ fn main() {
         .spawn(move || fuse(mountpoint, op_sender))
         .unwrap();
 
-    let driver = Arc::new(Driver { cfg });
+    let driver = Arc::new(Driver {
+        cfg,
+        pages: PageDriver::new(MAIN_BUCKET, PAGE_SIZE),
+    });
     dispatch::drive(driver, op_receiver);
 }
 
@@ -232,6 +238,60 @@ impl Filesystem for Rpfs {
             atime,
             mtime,
             fh,
+        }));
+    }
+
+    fn open(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+        let _ = self.op_sender.send(Op::Open(Open { reply, ino }));
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let _ = self.op_sender.send(Op::Release(Release { reply, fh, ino }));
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _flags: u32,
+        reply: ReplyWrite,
+    ) {
+        let _ = self.op_sender.send(Op::Write(Write {
+            reply,
+            ino,
+            fh,
+            offset,
+            data: Vec::from(data),
+        }));
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        reply: ReplyData,
+    ) {
+        let _ = self.op_sender.send(Op::Read(Read {
+            reply,
+            ino,
+            fh,
+            offset,
+            size,
         }));
     }
 }

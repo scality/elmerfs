@@ -191,6 +191,61 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                     }
                 });
             }
+            Op::Open(open) => {
+                task::spawn(async move {
+                    match handle_result(name, driver.open(open.ino).await) {
+                        Ok(_) => {
+                            let flags = 0;
+                            open.reply.opened(open.ino, flags);
+                        }
+                        Err(errno) => {
+                            open.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::Release(release) => {
+                task::spawn(async move {
+                    match handle_result(name, driver.open(release.ino).await) {
+                        Ok(_) => {
+                            release.reply.ok();
+                        }
+                        Err(errno) => {
+                            release.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::Write(write) => {
+                task::spawn(async move {
+                    match handle_result(
+                        name,
+                        driver.write(write.ino, &write.data, write.offset).await,
+                    ) {
+                        Ok(_) => {
+                            write.reply.written(write.data.len() as u32);
+                        }
+                        Err(errno) => {
+                            write.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::Read(read) => {
+                task::spawn(async move {
+                    match handle_result(
+                        name,
+                        driver.read(read.ino, read.offset, read.size).await
+                    ) {
+                        Ok(data) => {
+                            read.reply.data(&data);
+                        },
+                        Err(errno) => {
+                            read.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
         }
     }
 }

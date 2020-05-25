@@ -1,4 +1,4 @@
-use fuse::{ReplyEntry, ReplyAttr, ReplyEmpty, ReplyOpen, ReplyDirectory};
+use fuse::{ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite};
 use std::sync::mpsc;
 use time::Timespec;
 
@@ -17,6 +17,10 @@ pub enum Op {
     RmDir(RmDir),
     MkNod(MkNod),
     Unlink(Unlink),
+    Open(Open),
+    Release(Release),
+    Write(Write),
+    Read(Read),
 }
 
 impl Op {
@@ -32,6 +36,10 @@ impl Op {
             Self::RmDir(_) => "rmdir",
             Self::MkNod(_) => "mknod",
             Self::Unlink(_) => "unlink",
+            Self::Open(_) => "open",
+            Self::Release(_) => "release",
+            Self::Write(_) => "write",
+            Self::Read(_) => "read",
         }
     }
 }
@@ -41,7 +49,6 @@ pub struct GetAttr {
     pub reply: ReplyAttr,
     pub ino: u64,
 }
-
 
 #[derive(Debug)]
 pub struct SetAttr {
@@ -53,7 +60,7 @@ pub struct SetAttr {
     pub atime: Option<Timespec>,
     pub mtime: Option<Timespec>,
     pub fh: Option<u64>,
-    pub reply: ReplyAttr
+    pub reply: ReplyAttr,
 }
 
 #[derive(Debug)]
@@ -101,7 +108,6 @@ pub struct RmDir {
     pub name: String,
 }
 
-
 #[derive(Debug)]
 pub struct MkNod {
     pub reply: ReplyEntry,
@@ -118,6 +124,37 @@ pub struct Unlink {
     pub reply: ReplyEmpty,
     pub parent_ino: u64,
     pub name: String,
+}
+
+#[derive(Debug)]
+pub struct Write {
+    pub reply: ReplyWrite,
+    pub ino: u64,
+    pub fh: u64,
+    pub offset: i64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct Read {
+    pub reply: ReplyData,
+    pub ino: u64,
+    pub fh: u64,
+    pub offset: i64,
+    pub size: u32,
+}
+
+#[derive(Debug)]
+pub struct Open {
+    pub reply: ReplyOpen,
+    pub ino: u64,
+}
+
+#[derive(Debug)]
+pub struct Release {
+    pub reply: ReplyEmpty,
+    pub fh: u64,
+    pub ino: u64,
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {

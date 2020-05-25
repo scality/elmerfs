@@ -1,10 +1,11 @@
 use crate::inode::{self, Inode, Owner};
 use crate::key::{Bucket, InoCounter};
+use crate::page::PageDriver;
 use antidotec::{self, counter, crdts, Connection, TransactionLocks};
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const ROOT_INO: u64 = 1;
@@ -19,7 +20,7 @@ pub(crate) enum Error {
     #[error("could not allocate a new inode number")]
     InoAllocFailed,
 }
-type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -30,6 +31,7 @@ pub(crate) struct Config {
 #[derive(Debug)]
 pub(crate) struct Driver {
     pub(crate) cfg: Config,
+    pub(crate) pages: PageDriver,
 }
 
 impl Driver {
@@ -130,7 +132,7 @@ impl Driver {
         macro_rules! update {
             ($target:expr, $v:ident) => {
                 $target = $v.unwrap_or($target);
-            }
+            };
         }
 
         let mut connection = self.connect().await?;
@@ -141,7 +143,7 @@ impl Driver {
 
             let mut inode = match reply.rrmap(0) {
                 Some(map) => inode::decode(ino, map),
-                None => return Err(Error::Sys(Errno::ENOENT))
+                None => return Err(Error::Sys(Errno::ENOENT)),
             };
 
             update!(inode.mode, mode);
@@ -151,7 +153,8 @@ impl Driver {
             update!(inode.atime, atime);
             update!(inode.mtime, mtime);
 
-            tx.update(self.cfg.bucket, vec![inode::update(&inode)]).await?;
+            tx.update(self.cfg.bucket, vec![inode::update(&inode)])
+                .await?;
 
             inode
         };
@@ -499,6 +502,70 @@ impl Driver {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn open(&self, ino: u64) -> Result<()> {
+        self.getattr(ino).await.map(|_| ())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn release(&self, ino: u64) -> Result<()> {
+        self.getattr(ino).await.map(|_| ())
+    }
+
+    pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: i64) -> Result<()> {
+        let mut connection = self.connect().await?;
+        let mut tx = connection.transaction().await?;
+
+        let new_len = self
+            .pages
+            .write(&mut tx, ino, bytes, offset as usize)
+            .await?;
+
+        let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
+
+        let mut inode = match reply.rrmap(0) {
+            Some(map) => inode::decode(ino, map),
+            None => return Err(Error::Sys(Errno::ENOENT)),
+        };
+
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        inode.atime = t;
+        inode.mtime = t;
+        inode.size = new_len as u64;
+
+        tx.update(self.cfg.bucket, vec![inode::update(&inode)])
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn read(&self, ino: u64, offset: i64, len: u32) -> Result<Vec<u8>> {
+        let mut connection = self.connect().await?;
+        let mut tx = connection.transaction().await?;
+
+        let mut bytes = Vec::with_capacity(len as usize);
+        self.pages
+            .read(&mut tx, ino, &mut bytes, offset as usize, len as usize)
+            .await?;
+
+        let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
+
+        let mut inode = match reply.rrmap(0) {
+            Some(map) => inode::decode(ino, map),
+            None => return Err(Error::Sys(Errno::ENOENT)),
+        };
+
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        inode.atime = t;
+
+        tx.update(self.cfg.bucket, vec![inode::update(&inode)])
+            .await?;
+
+        tx.commit().await?;
+        Ok(bytes)
     }
 
     #[tracing::instrument(skip(self, connexion))]
