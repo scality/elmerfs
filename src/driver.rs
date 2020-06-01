@@ -292,7 +292,7 @@ impl Driver {
                 }
             };
 
-            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
+            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::RrMap::new()));
             entries.insert(name, ino);
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -383,6 +383,7 @@ impl Driver {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn mknod(
         &self,
         owner: Owner,
@@ -452,6 +453,7 @@ impl Driver {
         Ok(attr)
     }
 
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn unlink(&self, parent_ino: u64, name: String) -> Result<()> {
         // FIXME: We do not track the link count of file. meaning that an
         // unlink op is always deleting the inner file.
@@ -514,6 +516,7 @@ impl Driver {
         self.getattr(ino).await.map(|_| ())
     }
 
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: i64) -> Result<()> {
         let mut connection = self.connect().await?;
         let mut tx = connection.transaction().await?;
@@ -542,6 +545,7 @@ impl Driver {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn read(&self, ino: u64, offset: i64, len: u32) -> Result<Vec<u8>> {
         let mut connection = self.connect().await?;
         let mut tx = connection.transaction().await?;

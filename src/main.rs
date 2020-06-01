@@ -49,12 +49,20 @@ fn main() {
                 .takes_value(true)
                 .required(true),
         )
+        .arg(
+            Arg::with_name("antidote_url")
+                .long("antidote_url")
+                .short("s")
+                .value_name("URL")
+                .default_value("127.0.0.1:8101")
+        )
         .get_matches();
 
     let mountpoint: OsString = args.value_of_os("mountpoint").unwrap().into();
+    let address = args.value_of("antidote_url").unwrap();
     let cfg = driver::Config {
         bucket: MAIN_BUCKET,
-        address: String::from("127.0.0.1:8101"),
+        address: String::from(address),
     };
     info!(cfg.mountpoint = ?mountpoint, cfg.address = &cfg.address as &str);
 
