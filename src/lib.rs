@@ -6,21 +6,20 @@ mod op;
 mod page;
 
 use crate::driver::Driver;
-use crate::key::Bucket;
 use crate::op::*;
 use crate::page::PageDriver;
 use async_std::sync::Arc;
-use clap::{App, Arg};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
 use std::thread;
 use time::Timespec;
 use tracing::info;
-use tracing_subscriber::{self, filter::EnvFilter};
 
-const MAIN_BUCKET: Bucket = Bucket::new(0);
-const PAGE_SIZE: usize = 1024 * 128;
+pub use crate::driver::Config;
+pub use crate::key::Bucket;
+
+const PAGE_SIZE: usize = 1024 * 32;
 const OP_BUFFERING_SIZE: usize = 1024;
 
 /// There is two main thread of execution to follow:
@@ -32,49 +31,20 @@ const OP_BUFFERING_SIZE: usize = 1024;
 /// The second one, the dispatcher thread, it takes fuse request and dispatch
 /// them into asynchronous tasks calling into the root of the filesystem,
 /// the Rp driver.
-fn main() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap()
-        .add_directive("async_std::task=warn".parse().unwrap())
-        .add_directive("fuse=error".parse().unwrap());
-
-    let _trace_subscriber = tracing_subscriber::fmt().with_env_filter(filter).init();
-
-    let args = App::new("rpfs")
-        .arg(
-            Arg::with_name("mountpoint")
-                .long("mount")
-                .short("m")
-                .value_name("MOUNTPOINT")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
-            Arg::with_name("antidote_url")
-                .long("antidote_url")
-                .short("s")
-                .value_name("URL")
-                .default_value("127.0.0.1:8101")
-        )
-        .get_matches();
-
-    let mountpoint: OsString = args.value_of_os("mountpoint").unwrap().into();
-    let address = args.value_of("antidote_url").unwrap();
-    let cfg = driver::Config {
-        bucket: MAIN_BUCKET,
-        address: String::from(address),
-    };
+pub fn run(cfg: Config, mountpoint: &OsStr) {
     info!(cfg.mountpoint = ?mountpoint, cfg.address = &cfg.address as &str);
 
+    let mountpoint = OsString::from(mountpoint);
     let (op_sender, op_receiver) = op::sync_channel(OP_BUFFERING_SIZE);
     thread::Builder::new()
         .name("fuse".into())
         .spawn(move || fuse(mountpoint, op_sender))
         .unwrap();
 
+    let bucket = cfg.bucket;
     let driver = Arc::new(Driver {
         cfg,
-        pages: PageDriver::new(MAIN_BUCKET, PAGE_SIZE),
+        pages: PageDriver::new(bucket, PAGE_SIZE),
     });
     dispatch::drive(driver, op_receiver);
 }

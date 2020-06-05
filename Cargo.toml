@@ -1,12 +1,12 @@
 [package]
-name = "rebeccapurple"
+name = "elmerfs"
 version = "0.1.0"
 authors = ["Romain Vaillant <romain.vaillant@scality.com>"]
 edition = "2018"
 
 [workspace]
 members = [
-    "antidotec/"
+    "antidotec/",
 ]
 
 [dependencies]
@@ -14,14 +14,16 @@ async-std = { version = "1.0", features = ["unstable"] }
 antidotec = { path = "antidotec" }
 fuse = "0.3"
 nix = "0.17"
-clap = "2.33"
-anyhow = "1.0"
 thiserror = "1.0"
 time = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.2", features = ["env-filter"] }
+clap = "2.33"
 
 [dependencies.tracing-futures]
 version = "0.2"
 default-features = false
 features = ["std", "std-future"]
+
+[dev-dependencies]
+tempfile = "3.1"

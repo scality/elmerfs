@@ -23,9 +23,9 @@ pub(crate) enum Error {
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
-pub(crate) struct Config {
-    pub(crate) bucket: Bucket,
-    pub(crate) address: String,
+pub struct Config {
+    pub bucket: Bucket,
+    pub address: String,
 }
 
 #[derive(Debug)]
