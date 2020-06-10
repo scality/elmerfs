@@ -131,7 +131,7 @@ pub struct Write {
     pub reply: ReplyWrite,
     pub ino: u64,
     pub fh: u64,
-    pub offset: i64,
+    pub offset: u64,
     pub data: Vec<u8>,
 }
 
@@ -140,7 +140,7 @@ pub struct Read {
     pub reply: ReplyData,
     pub ino: u64,
     pub fh: u64,
-    pub offset: i64,
+    pub offset: u64,
     pub size: u32,
 }
 

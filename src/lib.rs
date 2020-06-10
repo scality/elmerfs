@@ -246,6 +246,12 @@ impl Filesystem for Rpfs {
         _flags: u32,
         reply: ReplyWrite,
     ) {
+        if offset < 0 {
+            reply.error(Errno::EINVAL as libc::c_int);
+            return;
+        }
+        let offset = offset as u64;
+
         let _ = self.op_sender.send(Op::Write(Write {
             reply,
             ino,
@@ -264,6 +270,12 @@ impl Filesystem for Rpfs {
         size: u32,
         reply: ReplyData,
     ) {
+        if offset < 0 {
+            reply.error(Errno::EINVAL as libc::c_int);
+            return;
+        }
+        let offset = offset as u64;
+
         let _ = self.op_sender.send(Op::Read(Read {
             reply,
             ino,

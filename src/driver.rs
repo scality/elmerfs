@@ -1,7 +1,7 @@
 use crate::inode::{self, Inode, Owner};
 use crate::key::{Bucket, InoCounter};
 use crate::page::PageDriver;
-use antidotec::{self, counter, crdts, Connection, TransactionLocks};
+use antidotec::{self, counter, lwwreg, crdts, Connection, TransactionLocks};
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
@@ -77,9 +77,8 @@ impl Driver {
         };
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-
         let root_inode = Inode {
-            ino: 1,
+            ino: ROOT_INO,
             kind: inode::Kind::Directory,
             parent: 1,
             atime: t,
@@ -90,7 +89,10 @@ impl Driver {
             size: 0,
         };
 
-        let mut tx = connection.transaction().await?;
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(inode::Key::new(ROOT_INO));
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
         {
             tx.update(self.cfg.bucket, vec![inode::update(&root_inode)])
                 .await?;
@@ -516,8 +518,8 @@ impl Driver {
         self.getattr(ino).await.map(|_| ())
     }
 
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: i64) -> Result<()> {
+    #[tracing::instrument(skip(self, bytes))]
+    pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
         let mut connection = self.connect().await?;
         let mut tx = connection.transaction().await?;
 
@@ -546,21 +548,22 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn read(&self, ino: u64, offset: i64, len: u32) -> Result<Vec<u8>> {
+    pub(crate) async fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
         let mut connection = self.connect().await?;
         let mut tx = connection.transaction().await?;
 
-        let mut bytes = Vec::with_capacity(len as usize);
-        self.pages
-            .read(&mut tx, ino, &mut bytes, offset as usize, len as usize)
-            .await?;
-
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-
         let mut inode = match reply.rrmap(0) {
             Some(map) => inode::decode(ino, map),
             None => return Err(Error::Sys(Errno::ENOENT)),
         };
+
+        let truncated_len = inode.size.min(offset + len as u64) as usize;
+
+        let mut bytes = Vec::with_capacity(truncated_len as usize);
+        self.pages
+            .read(&mut tx, ino, &mut bytes, offset as usize, truncated_len)
+            .await?;
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;

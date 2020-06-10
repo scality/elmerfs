@@ -16,8 +16,6 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
     task::block_on(driver.configure()).unwrap();
 
     while let Ok(op) = op_receiver.recv() {
-        debug!(?op);
-
         let driver = driver.clone();
         let name = op.name();
 

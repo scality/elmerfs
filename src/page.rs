@@ -2,7 +2,7 @@ use crate::driver::Result;
 use crate::key::{self, Bucket, Key};
 use antidotec::{lwwreg, RawIdent, Transaction};
 use std::mem;
-use tracing;
+use tracing::{self, debug};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct ExtentId {
@@ -45,7 +45,7 @@ impl PageDriver {
         Self { bucket, page_size }
     }
 
-    #[tracing::instrument(skip(self, tx))]
+    #[tracing::instrument(skip(self, tx, bytes))]
     pub(crate) async fn write(
         &self,
         tx: &mut Transaction<'_>,
@@ -53,26 +53,21 @@ impl PageDriver {
         bytes: &[u8],
         byte_offset: usize,
     ) -> Result<usize> {
-        let page_offset = byte_offset / self.page_size as usize;
-        let offset_in_page = byte_offset - page_offset * self.page_size;
+        let mut page_offset = byte_offset / self.page_size as usize;
+        let mut offset_in_page = byte_offset - page_offset * self.page_size;
+        debug!(page_offset, offset_in_page, self.page_size);
 
         let mut remaining = &bytes[..];
-        {
-            let end = self.page_size.min(remaining.len());
-            self.write_page(tx, ino, page_offset, offset_in_page, &remaining[..end])
-                .await?;
-            remaining = &remaining[end..];
-        }
-
-        let mut page_offset = page_offset + 1;
         while remaining.len() > 0 {
-            let offset_in_page = 0;
+            debug!(amount = remaining.len(), page_offset, offset_in_page, "write remains");
+
             let end = self.page_size.min(remaining.len());
 
             self.write_page(tx, ino, page_offset, offset_in_page, &remaining[..end])
-                .await?;
+            .await?;
             remaining = &remaining[end..];
             page_offset += 1;
+            offset_in_page = 0;
         }
 
         let new_len = (page_offset as i32 - 2).max(0) as usize * self.page_size
@@ -114,7 +109,7 @@ impl PageDriver {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, tx))]
+    #[tracing::instrument(skip(self, tx, bytes))]
     async fn write_page(
         &self,
         tx: &mut Transaction<'_>,
@@ -123,7 +118,7 @@ impl PageDriver {
         offset_in_page: usize,
         bytes: &[u8],
     ) -> Result<()> {
-        assert!(bytes.len() <= self.page_size);
+        assert!(offset_in_page + bytes.len() <= self.page_size);
 
         let key = PageKey::with_offset(ino, page_offset as u64);
 
@@ -140,10 +135,12 @@ impl PageDriver {
         let mut reply = tx.read(self.bucket, vec![lwwreg::get(key)]).await?;
         let mut reg = match reply.lwwreg(0) {
             Some(reg) => reg,
-            None => vec![0; self.page_size],
+            None => Vec::new(),
         };
+        reg.resize(self.page_size, 0);
 
-        reg[offset_in_page..offset_in_page + bytes.len()].copy_from_slice(bytes);
+        let end = offset_in_page + bytes.len();
+        reg[offset_in_page..end].copy_from_slice(bytes);
 
         tx.update(self.bucket, vec![lwwreg::set(key, bytes.into())])
             .await?;
@@ -161,7 +158,7 @@ impl PageDriver {
         bytes: &mut Vec<u8>,
         len: usize,
     ) -> Result<()> {
-        assert!(len <= self.page_size);
+        assert!(offset_in_page + len <= self.page_size);
 
         let key = PageKey::with_offset(ino, page_offset as u64);
 
