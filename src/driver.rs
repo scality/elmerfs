@@ -113,6 +113,7 @@ impl Driver {
             owner: Owner { uid: 0, gid: 0 },
             mode: 0777,
             size: 0,
+            nlink: 2,
         };
 
         let mut locks = TransactionLocks::with_capacity(1, 0);
@@ -127,7 +128,7 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::update(&root_inode),
+                    inode::update(&root_inode, inode::NLinkInc(3)),
                     inode::update_dir(ROOT_INO, &entries),
                 ],
             )
@@ -187,7 +188,7 @@ impl Driver {
             update!(inode.atime, atime);
             update!(inode.mtime, mtime);
 
-            tx.update(self.cfg.bucket, vec![inode::update(&inode)])
+            tx.update(self.cfg.bucket, vec![inode::update_stats(&inode)])
                 .await?;
 
             inode
@@ -335,6 +336,7 @@ impl Driver {
                 owner,
                 mode,
                 size: 0,
+                nlink: 2,
             };
             parent_inode.size += created as u64;
             parent_inode.mtime = t;
@@ -349,9 +351,9 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::update(&parent_inode),
+                    inode::update_stats(&parent_inode),
                     inode::update_dir(parent_ino, &entries),
-                    inode::update(&inode),
+                    inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
                     inode::update_dir(ino, &default_entries),
                 ],
             )
@@ -365,7 +367,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn rmdir(&self, parent_ino: u64, name: String) -> Result<()> {
+    pub(crate) async fn rmdir(self: Arc<Driver>, parent_ino: u64, name: String) -> Result<()> {
         let mut connection = self.connect().await?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
@@ -373,7 +375,7 @@ impl Driver {
         locks.push_exclusive(inode::Key::dir_entries(parent_ino));
 
         let mut tx = connection.transaction_with_locks(locks).await?;
-        {
+        let ino = {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
@@ -405,15 +407,17 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::remove(ino),
-                    inode::remove_dir(ino),
+                    inode::decr_link_count(ino, 1),
                     inode::remove_dir_entry(parent_ino, name),
                 ],
             )
             .await?;
-        }
+
+            ino
+        };
         tx.commit().await?;
 
+        self.schedule_delete(ino);
         Ok(())
     }
 
@@ -457,6 +461,7 @@ impl Driver {
                 owner,
                 mode,
                 size: 0,
+                nlink: 1,
             };
             parent_inode.size = entries.len() as u64;
             parent_inode.mtime = t;
@@ -467,9 +472,9 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::update(&parent_inode),
+                    inode::update_stats(&parent_inode),
                     inode::update_dir(parent_ino, &entries),
-                    inode::update(&inode),
+                    inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
                 ],
             )
             .await?;
@@ -482,9 +487,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn unlink(&self, parent_ino: u64, name: String) -> Result<()> {
-        // FIXME: We do not track the link count of file. meaning that an
-        // unlink op is always deleting the inner file.
+    pub(crate) async fn unlink(self: Arc<Driver>, parent_ino: u64, name: String) -> Result<()> {
         let mut connection = self.connect().await?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
@@ -492,7 +495,7 @@ impl Driver {
         locks.push_exclusive(inode::Key::dir_entries(parent_ino));
 
         let mut tx = connection.transaction_with_locks(locks).await?;
-        {
+        let ino = {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
@@ -518,13 +521,17 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::remove(ino),
                     inode::remove_dir_entry(parent_ino, name),
+                    inode::decr_link_count(ino, 1),
                 ],
             )
             .await?;
-        }
+
+            ino
+        };
         tx.commit().await?;
+
+        self.schedule_delete(ino);
         Ok(())
     }
 
@@ -557,7 +564,7 @@ impl Driver {
         inode.size += wrote as u64;
 
         tracing::trace!(?inode);
-        tx.update(self.cfg.bucket, vec![inode::update(&inode)])
+        tx.update(self.cfg.bucket, vec![inode::update_stats(&inode)])
             .await?;
 
         tx.commit().await?;
@@ -709,17 +716,49 @@ impl Driver {
         tx.update(
             self.cfg.bucket,
             vec![
-                inode::update(&parent),
+                inode::update_stats(&parent),
                 inode::remove_dir_entry(parent_ino, name),
-                inode::update(&new_parent),
+                inode::update_stats(&new_parent),
                 inode::update_dir(new_parent_ino, &new_parent_entries),
-                inode::update(&inode),
+                inode::update_stats(&inode),
             ],
         )
         .await?;
 
         tx.commit().await?;
         Ok(())
+    }
+
+    fn schedule_delete(self: Arc<Driver>, ino: u64) {
+        task::spawn(async move {
+            let result = self.delete_later(ino).await;
+            tracing::trace!(?result);
+        });
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_later(&self, ino: u64) -> Result<bool> {
+        let mut connexion = self.connect().await?;
+        let mut tx = connexion.transaction().await?;
+
+        let inode = {
+            let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
+
+            expect_inode!(ino, reply.rrmap(0))
+        };
+
+        let must_be_removed =
+            (inode.kind == inode::Kind::Directory && inode.nlink == 1) || inode.nlink == 0;
+
+        if must_be_removed {
+            tx.update(
+                self.cfg.bucket,
+                vec![inode::remove(ino), inode::remove_dir(ino)],
+            )
+            .await?;
+        }
+
+        Ok(must_be_removed)
     }
 
     #[tracing::instrument(skip(self, connexion))]

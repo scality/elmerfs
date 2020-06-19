@@ -1,6 +1,5 @@
 use fuse::{FileAttr, FileType};
 use std::{collections::BTreeMap, convert::TryFrom, time::Duration};
-
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -65,6 +64,7 @@ pub struct Inode {
     pub owner: Owner,
     pub mode: u32,
     pub size: u64,
+    pub nlink: u64,
 }
 
 impl Inode {
@@ -83,7 +83,7 @@ impl Inode {
             crtime: timespec_from_duration(self.atime),
             kind: self.kind.to_file_type(),
             perm: self.mode as u16,
-            nlink: 1,
+            nlink: self.nlink as u32,
             uid: self.owner.uid,
             gid: self.owner.gid,
             rdev: 0,
@@ -95,13 +95,14 @@ impl Inode {
 pub type DirEntries = BTreeMap<String, u64>;
 
 pub use self::mapping::{
-    decode, decode_dir, read, read_dir, remove, remove_dir, update, update_dir,remove_dir_entry, InodeKey as Key,
+    decode, decode_dir, decr_link_count, inc_link_count, read, read_dir, remove, remove_dir,
+    remove_dir_entry, update, update_dir, update_stats, InodeKey as Key, NLinkInc,
 };
 
 mod mapping {
     use super::{DirEntries, Inode, Owner};
     use crate::key::{Key, Kind};
-    use antidotec::{crdts, rrmap, lwwreg, mvreg, RawIdent, ReadQuery, UpdateQuery};
+    use antidotec::{counter, crdts, lwwreg, mvreg, rrmap, RawIdent, ReadQuery, UpdateQuery};
     use std::convert::TryFrom;
     use std::mem;
 
@@ -118,7 +119,8 @@ mod mapping {
         Mode = 7,
         Size = 8,
         DirEntries = 9,
-        _Count = 10,
+        NLink = 10,
+        _Count = 11,
     }
 
     impl Field {
@@ -178,7 +180,7 @@ mod mapping {
         rrmap::get(InodeKey::new(ino))
     }
 
-    pub fn update(inode: &Inode) -> UpdateQuery {
+    pub fn update_stats(inode: &Inode) -> UpdateQuery {
         let key = InodeKey::new(inode.ino);
 
         rrmap::update(key, Field::COUNT)
@@ -193,6 +195,41 @@ mod mapping {
             .build()
     }
 
+    #[derive(Debug, Copy, Clone)]
+    pub struct NLinkInc(pub i32);
+
+    pub fn update(inode: &Inode, NLinkInc(nlink_inc): NLinkInc) -> UpdateQuery {
+        let key = InodeKey::new(inode.ino);
+
+        rrmap::update(key, Field::COUNT)
+            .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
+            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
+            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
+            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
+            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
+            .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
+            .push(counter::inc(key.field(Field::NLink), nlink_inc))
+            .build()
+    }
+
+    pub fn inc_link_count(ino: u64, amount: u32) -> UpdateQuery {
+        let key = InodeKey::new(ino);
+
+        rrmap::update(key, 1)
+            .push(counter::inc(key.field(Field::NLink), amount as i32))
+            .build()
+    }
+
+    pub fn decr_link_count(ino: u64, amount: u32) -> UpdateQuery {
+        let key = InodeKey::new(ino);
+
+        rrmap::update(key, 1)
+            .push(counter::inc(key.field(Field::NLink), -(amount as i32)))
+            .build()
+    }
+
     pub fn decode(ino: u64, mut map: crdts::RrMap) -> Inode {
         let key = InodeKey::new(ino);
 
@@ -200,16 +237,14 @@ mod mapping {
         // it easier if it become a common pattern.
         let kind_byte =
             lwwreg::read_u8(&map.remove(&key.field(Field::Kind)).unwrap().into_lwwreg());
-        let parent = map
-            .remove(&key.field(Field::Parent))
-            .unwrap()
-            .into_lwwreg();
+        let parent = map.remove(&key.field(Field::Parent)).unwrap().into_lwwreg();
         let atime = map.remove(&key.field(Field::Atime)).unwrap().into_lwwreg();
         let ctime = map.remove(&key.field(Field::Ctime)).unwrap().into_lwwreg();
         let mtime = map.remove(&key.field(Field::Mtime)).unwrap().into_lwwreg();
         let owner = map.remove(&key.field(Field::Owner)).unwrap().into_lwwreg();
         let mode = map.remove(&key.field(Field::Mode)).unwrap().into_lwwreg();
         let size = map.remove(&key.field(Field::Size)).unwrap().into_lwwreg();
+        let nlink = map.remove(&key.field(Field::NLink)).unwrap().into_counter();
 
         let kind = TryFrom::try_from(kind_byte).expect("invalid code byte");
         let owner = Owner::from(lwwreg::read_u64(&owner));
@@ -223,6 +258,7 @@ mod mapping {
             owner,
             mode: lwwreg::read_u32(&mode),
             size: lwwreg::read_u64(&size),
+            nlink: nlink as u64,
         }
     }
 
