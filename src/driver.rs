@@ -1,12 +1,13 @@
 use crate::inode::{self, Inode, Owner};
 use crate::key::{Bucket, InoCounter};
 use crate::page::PageDriver;
-use antidotec::{self, counter, lwwreg, crdts, Connection, TransactionLocks};
+use antidotec::{self, counter, crdts, Connection, TransactionLocks};
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::debug;
 
 const ROOT_INO: u64 = 1;
 const INO_COUNTER: InoCounter = InoCounter::new(0);
@@ -523,9 +524,8 @@ impl Driver {
         let mut connection = self.connect().await?;
         let mut tx = connection.transaction().await?;
 
-        let new_len = self
-            .pages
-            .write(&mut tx, ino, bytes, offset as usize)
+        self.pages
+            .write(&mut tx, ino, offset as usize, bytes)
             .await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
@@ -535,10 +535,11 @@ impl Driver {
             None => return Err(Error::Sys(Errno::ENOENT)),
         };
 
+        let wrote = (offset + bytes.len() as u64) - inode.size;
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
-        inode.size = new_len as u64;
+        inode.size += wrote as u64;
 
         tx.update(self.cfg.bucket, vec![inode::update(&inode)])
             .await?;
@@ -547,8 +548,11 @@ impl Driver {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
     pub(crate) async fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
+        // Manual trace to avoid priting content result.
+        tracing::trace!(ino, offset, len);
+
+        let len = len as usize;
         let mut connection = self.connect().await?;
         let mut tx = connection.transaction().await?;
 
@@ -558,11 +562,9 @@ impl Driver {
             None => return Err(Error::Sys(Errno::ENOENT)),
         };
 
-        let truncated_len = inode.size.min(offset + len as u64) as usize;
-
-        let mut bytes = Vec::with_capacity(truncated_len as usize);
+        let mut bytes = Vec::with_capacity(len as usize);
         self.pages
-            .read(&mut tx, ino, &mut bytes, offset as usize, truncated_len)
+            .read(&mut tx, ino, offset as usize, len as usize, &mut bytes)
             .await?;
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -572,6 +574,8 @@ impl Driver {
             .await?;
 
         tx.commit().await?;
+
+        debug!(len, read_len = bytes.len(), requested_len = len);
         Ok(bytes)
     }
 

@@ -231,7 +231,7 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
             }
             Op::Read(read) => {
                 task::spawn(async move {
-                    match handle_result(
+                    match handle_result_silent(
                         name,
                         driver.read(read.ino, read.offset, read.size).await
                     ) {
@@ -244,6 +244,27 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                     }
                 });
             }
+        }
+    }
+}
+
+fn handle_result_silent<U: Send>(name: &str, result: Result<U, Error>) -> Result<U, Errno> {
+    match result {
+        Ok(result) => {
+            debug!(name, "success");
+            Ok(result)
+        }
+        Err(Error::Antidote(error)) => {
+            error!(name, ?error, "antidote error");
+            Err(Errno::EIO)
+        }
+        Err(Error::Sys(errno)) => {
+            warn!(name, ?errno, "system error");
+            Err(errno)
+        }
+        Err(Error::InoAllocFailed) => {
+            error!(name, "ino alloc error");
+            Err(Errno::ENOSPC)
         }
     }
 }

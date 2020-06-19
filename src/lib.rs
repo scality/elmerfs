@@ -12,14 +12,17 @@ use async_std::sync::Arc;
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
+use std::io;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use time::Timespec;
-use tracing::info;
+use tracing::{error, info};
 
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
 
-const PAGE_SIZE: usize = 1024 * 32;
+const PAGE_SIZE: usize = 64 * 1024 * 1024;
 const OP_BUFFERING_SIZE: usize = 1024;
 
 /// There is two main thread of execution to follow:
@@ -50,13 +53,29 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
 }
 
 fn fuse(mountpoint: OsString, op_sender: op::Sender) {
+    const RETRIES: u32 = 5;
+
     let options = ["-o", "fsname=rpfs"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
 
-    let fs = Rpfs { op_sender };
-    fuse::mount(fs, &mountpoint, &options).unwrap()
+    for _ in 0..RETRIES {
+        let _umount = UmountOnDrop(mountpoint.clone());
+
+        let fs = Rpfs {
+            op_sender: op_sender.clone(),
+        };
+        match fuse::mount(fs, &mountpoint, &options) {
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+                continue;
+            }
+            Err(error) => {
+                error!("{:?}", error);
+            }
+        }
+    }
 }
 
 struct Rpfs {
@@ -283,5 +302,19 @@ impl Filesystem for Rpfs {
             offset,
             size,
         }));
+    }
+}
+
+struct UmountOnDrop(OsString);
+
+impl Drop for UmountOnDrop {
+    fn drop(&mut self) {
+        Command::new("fusermount")
+            .arg("-u")
+            .arg(&self.0)
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .status()
+            .expect("failed to umount test dir");
     }
 }

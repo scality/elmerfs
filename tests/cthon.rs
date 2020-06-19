@@ -13,30 +13,6 @@ const CHTON_PATH: &str = "vendor/cthon04/";
 const CTHON_BASIC_BUCKET: Bucket = Bucket::new(0);
 const ANTIDOTE_URL: &str = "127.0.0.1:8101";
 
-struct UmountOnDrop(OsString);
-
-impl Drop for UmountOnDrop {
-    fn drop(&mut self) {
-        const MAX_RETRIES: usize = 5;
-
-        let path = &Path::new(&self.0);
-        for _ in 0..MAX_RETRIES {
-            std::thread::sleep(Duration::new(1, 0));
-            if path.exists() {
-                break;
-            }
-        }
-
-        Command::new("fusermount")
-            .arg("-u")
-            .arg(&self.0)
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .status()
-            .expect("failed to umount test dir");
-    }
-}
-
 fn setup_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_default()
@@ -61,7 +37,6 @@ fn cthon_basic() {
     info!(workdir = ?tests_dir.path().as_os_str());
 
     let tests_dir_path = OsString::from(tests_dir.path().as_os_str());
-    let umount = UmountOnDrop(tests_dir_path.clone());
     let rpfs_thread = thread::spawn(move || {
         elmerfs::run(cfg, &tests_dir_path)
     });
@@ -78,6 +53,5 @@ fn cthon_basic() {
     assert_eq!(chton_status.code(), Some(0));
 
     tracing::info!("cleanup");
-    drop(umount);
     assert!(rpfs_thread.join().is_ok());
 }
