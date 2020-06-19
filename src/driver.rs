@@ -1,16 +1,30 @@
 use crate::inode::{self, Inode, Owner};
 use crate::key::{Bucket, InoCounter};
 use crate::page::PageDriver;
-use antidotec::{self, counter, crdts, Connection, TransactionLocks};
+use antidotec::{self, counter, crdts, Connection, Transaction, TransactionLocks};
+use async_std::sync::{Arc, Condvar, Mutex};
+use async_std::task;
 use fuse::*;
 use nix::errno::Errno;
+use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::debug;
 
 const ROOT_INO: u64 = 1;
 const INO_COUNTER: InoCounter = InoCounter::new(0);
+const CONNECTION_POOL_SIZE: usize = 32;
+
+macro_rules! expect_inode {
+    ($ino:expr, $map:expr) => {
+        match $map {
+            Some(map) => inode::decode($ino, map),
+            None => return Err(Error::Sys(Errno::ENOENT)),
+        }
+    };
+}
 
 #[derive(Error, Debug)]
 pub(crate) enum Error {
@@ -31,11 +45,22 @@ pub struct Config {
 
 #[derive(Debug)]
 pub(crate) struct Driver {
-    pub(crate) cfg: Config,
-    pub(crate) pages: PageDriver,
+    connection_pool: ConnectionPool,
+    cfg: Config,
+    pages: PageDriver,
 }
 
 impl Driver {
+    pub async fn new(cfg: Config, pages: PageDriver) -> Result<Self> {
+        let pool = ConnectionPool::new(CONNECTION_POOL_SIZE, cfg.address.clone()).await?;
+
+        Ok(Self {
+            connection_pool: pool,
+            cfg,
+            pages,
+        })
+    }
+
     #[tracing::instrument(skip(self))]
     pub(crate) async fn configure(&self) -> Result<()> {
         let mut connection = self.connect().await?;
@@ -93,10 +118,20 @@ impl Driver {
         let mut locks = TransactionLocks::with_capacity(1, 0);
         locks.push_exclusive(inode::Key::new(ROOT_INO));
 
+        let mut entries = inode::DirEntries::new();
+        entries.insert(String::from("."), ROOT_INO);
+        entries.insert(String::from(".."), ROOT_INO);
+
         let mut tx = connection.transaction_with_locks(locks).await?;
         {
-            tx.update(self.cfg.bucket, vec![inode::update(&root_inode)])
-                .await?;
+            tx.update(
+                self.cfg.bucket,
+                vec![
+                    inode::update(&root_inode),
+                    inode::update_dir(ROOT_INO, &entries),
+                ],
+            )
+            .await?;
         }
         tx.commit().await?;
 
@@ -143,11 +178,7 @@ impl Driver {
         let mut tx = connection.transaction().await?;
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-
-            let mut inode = match reply.rrmap(0) {
-                Some(map) => inode::decode(ino, map),
-                None => return Err(Error::Sys(Errno::ENOENT)),
-            };
+            let mut inode = expect_inode!(ino, reply.rrmap(0));
 
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
@@ -288,15 +319,10 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = match reply.rrmap(0) {
-                Some(inode) => inode::decode(parent_ino, inode),
-                None => {
-                    return Err(Error::Sys(Errno::ENOENT));
-                }
-            };
+            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
 
             let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::RrMap::new()));
-            entries.insert(name, ino);
+            let created = entries.insert(name, ino).is_none();
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             let inode = Inode {
@@ -310,11 +336,15 @@ impl Driver {
                 mode,
                 size: 0,
             };
-            parent_inode.size = entries.len() as u64;
+            parent_inode.size += created as u64;
             parent_inode.mtime = t;
             parent_inode.atime = t;
 
             let attr = inode.attr();
+
+            let mut default_entries = inode::DirEntries::new();
+            default_entries.insert(String::from("."), ino);
+            default_entries.insert(String::from(".."), parent_ino);
 
             tx.update(
                 self.cfg.bucket,
@@ -322,6 +352,7 @@ impl Driver {
                     inode::update(&parent_inode),
                     inode::update_dir(parent_ino, &entries),
                     inode::update(&inode),
+                    inode::update_dir(ino, &default_entries),
                 ],
             )
             .await?;
@@ -411,13 +442,7 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = match reply.rrmap(0) {
-                Some(inode) => inode::decode(parent_ino, inode),
-                None => {
-                    return Err(Error::Sys(Errno::ENOENT));
-                }
-            };
-
+            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
             let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
             entries.insert(name, ino);
 
@@ -475,13 +500,7 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = match reply.rrmap(0) {
-                Some(inode) => inode::decode(parent_ino, inode),
-                None => {
-                    return Err(Error::Sys(Errno::ENOENT));
-                }
-            };
-
+            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
             let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
 
             let ino = match entries.remove(&name) {
@@ -530,17 +549,14 @@ impl Driver {
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
 
-        let mut inode = match reply.rrmap(0) {
-            Some(map) => inode::decode(ino, map),
-            None => return Err(Error::Sys(Errno::ENOENT)),
-        };
-
+        let mut inode = expect_inode!(ino, reply.rrmap(0));
         let wrote = (offset + bytes.len() as u64) - inode.size;
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
         inode.size += wrote as u64;
 
+        tracing::trace!(?inode);
         tx.update(self.cfg.bucket, vec![inode::update(&inode)])
             .await?;
 
@@ -557,10 +573,7 @@ impl Driver {
         let mut tx = connection.transaction().await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-        let mut inode = match reply.rrmap(0) {
-            Some(map) => inode::decode(ino, map),
-            None => return Err(Error::Sys(Errno::ENOENT)),
-        };
+        let mut inode = expect_inode!(ino, reply.rrmap(0));
 
         let mut bytes = Vec::with_capacity(len as usize);
         self.pages
@@ -569,14 +582,144 @@ impl Driver {
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
+        tracing::trace!(?inode);
+
+        /* FIXME! Update the inode while reading fast seems to make the transaction
+        fails.
 
         tx.update(self.cfg.bucket, vec![inode::update(&inode)])
-            .await?;
+          .await?; */
 
         tx.commit().await?;
 
         debug!(len, read_len = bytes.len(), requested_len = len);
         Ok(bytes)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn rename(
+        &self,
+        parent_ino: u64,
+        name: String,
+        new_parent_ino: u64,
+        new_name: String,
+    ) -> Result<()> {
+        let mut connection = self.connect().await?;
+
+        let mut locks = TransactionLocks::with_capacity(2, 0);
+        locks.push_exclusive(inode::Key::new(parent_ino));
+        locks.push_exclusive(inode::Key::new(new_parent_ino));
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
+
+        let (mut parent, mut parent_entries, mut new_parent, mut new_parent_entries) = {
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![
+                        inode::read(parent_ino),
+                        inode::read_dir(parent_ino),
+                        inode::read(new_parent_ino),
+                        inode::read_dir(new_parent_ino),
+                    ],
+                )
+                .await?;
+
+            (
+                expect_inode!(parent_ino, reply.rrmap(0)),
+                inode::decode_dir(reply.rrmap(1).unwrap_or_default()),
+                expect_inode!(new_parent_ino, reply.rrmap(2)),
+                inode::decode_dir(reply.rrmap(3).unwrap_or_default()),
+            )
+        };
+        debug!(?parent, ?parent_entries, ?new_parent, ?new_parent_entries);
+
+        let ino = match parent_entries.get(&name) {
+            Some(ino) => *ino,
+            None => return Err(Error::Sys(Errno::ENOENT)),
+        };
+        let target_ino = new_parent_entries.get(&new_name).copied();
+        debug!(?ino, ?target_ino);
+
+        /* If we have to deal with the same link, this rename does nothing */
+        if parent_ino == new_parent_ino && Some(ino) == target_ino && name == new_name {
+            debug!("noop operation");
+            return Ok(());
+        }
+
+        let (mut inode, target) = {
+            let reads = if let Some(target_ino) = target_ino {
+                vec![inode::read(ino), inode::read(target_ino)]
+            } else {
+                vec![inode::read(ino)]
+            };
+            let mut reply = tx.read(self.cfg.bucket, reads).await?;
+
+            let inode = expect_inode!(ino, reply.rrmap(0));
+            let target = if let Some(target_ino) = target_ino {
+                Some(expect_inode!(target_ino, reply.rrmap(1)))
+            } else {
+                None
+            };
+
+            (inode, target)
+        };
+        debug!(?inode, ?target);
+
+        /* Checks if target is a dir and empty. If it is the case, we have
+        to delete it */
+        match &target {
+            Some(target) if target.kind == inode::Kind::Directory && target.size == 0 => {
+                debug!("target is an empty dir, removing");
+                tx.update(
+                    self.cfg.bucket,
+                    vec![
+                        inode::remove(target.ino),
+                        inode::remove_dir(target.ino),
+                        inode::remove_dir_entry(new_parent_ino, new_name.clone()),
+                    ],
+                )
+                .await?;
+            }
+            Some(target) if ino != target.ino => return Err(Error::Sys(Errno::EEXIST)),
+            _ => {}
+        }
+
+        /* At this point we are sure that target does not exists
+        and we are ready to perform the rename */
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        new_parent.size += 1;
+        new_parent.atime = t;
+        new_parent.mtime = t;
+        new_parent_entries.insert(new_name, ino);
+
+        parent.size -= 1;
+        parent.atime = t;
+        parent.mtime = t;
+        parent_entries.remove(&name);
+
+        if parent_ino == new_parent_ino {
+            /* Be sure that we remove the old name when updating entries */
+            new_parent_entries.remove(&name);
+        }
+
+        inode.atime = t;
+        debug!(?parent, ?parent_entries, ?new_parent, ?new_parent_entries);
+
+        tx.update(
+            self.cfg.bucket,
+            vec![
+                inode::update(&parent),
+                inode::remove_dir_entry(parent_ino, name),
+                inode::update(&new_parent),
+                inode::update_dir(new_parent_ino, &new_parent_entries),
+                inode::update(&inode),
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, connexion))]
@@ -613,8 +756,12 @@ impl Driver {
     }
 
     async fn connect(&self) -> Result<Connection> {
-        Ok(antidotec::Connection::new(&self.cfg.address).await?)
+        Ok(Connection::new(&self.cfg.address).await?)
     }
+
+    // async fn connect(&self) -> Result<PooledConnection<'_>> {
+    //     Ok(self.connection_pool.acquire().await)
+    // }
 }
 
 #[derive(Debug)]
@@ -622,4 +769,92 @@ pub(crate) struct ReadDirEntry {
     pub(crate) ino: u64,
     pub(crate) kind: FileType,
     pub(crate) name: String,
+}
+#[derive(Debug)]
+struct InnerPool {
+    connections: Vec<Connection>,
+    wait_list: VecDeque<Arc<Condvar>>,
+}
+
+#[derive(Debug)]
+pub struct ConnectionPool {
+    inner: Mutex<InnerPool>,
+}
+
+impl ConnectionPool {
+    async fn new(size: usize, address: String) -> Result<Self> {
+        let mut connections = Vec::with_capacity(size);
+        let mut tasks = Vec::with_capacity(size);
+        let address = Arc::new(address);
+
+        for _ in 0..size {
+            let address = address.clone();
+            tasks.push(task::spawn(async move { Connection::new(&*address).await }));
+        }
+
+        for task in tasks {
+            connections.push(task.await?);
+        }
+
+        let inner = InnerPool {
+            connections,
+            wait_list: VecDeque::with_capacity(size),
+        };
+
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    async fn acquire(&self) -> PooledConnection<'_> {
+        let mut pool = self.inner.lock().await;
+
+        while pool.connections.len() == 0 {
+            tracing::error!("waiting");
+            let wait_cond = Arc::new(Condvar::new());
+            pool.wait_list.push_back(wait_cond.clone());
+
+            pool = wait_cond.wait(pool).await;
+        }
+
+        let connection = pool.connections.pop().unwrap();
+        PooledConnection {
+            connection: Some(connection),
+            pool: self,
+        }
+    }
+}
+
+pub struct PooledConnection<'a> {
+    connection: Option<Connection>,
+    pool: &'a ConnectionPool,
+}
+
+impl Deref for PooledConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for PooledConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().unwrap()
+    }
+}
+
+impl Drop for PooledConnection<'_> {
+    fn drop(&mut self) {
+        let connection = self.connection.take().unwrap();
+
+        task::block_on(async move {
+            let mut pool = self.pool.inner.lock().await;
+            pool.connections.push(connection);
+
+            if let Some(waiter) = pool.wait_list.pop_front() {
+                waiter.notify_one();
+            }
+        });
+    }
 }

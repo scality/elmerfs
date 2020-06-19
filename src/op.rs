@@ -21,6 +21,7 @@ pub enum Op {
     Release(Release),
     Write(Write),
     Read(Read),
+    Rename(Rename),
 }
 
 impl Op {
@@ -40,6 +41,7 @@ impl Op {
             Self::Release(_) => "release",
             Self::Write(_) => "write",
             Self::Read(_) => "read",
+            Self::Rename(_) => "rename",
         }
     }
 }
@@ -155,6 +157,15 @@ pub struct Release {
     pub reply: ReplyEmpty,
     pub fh: u64,
     pub ino: u64,
+}
+
+#[derive(Debug)]
+pub struct Rename {
+    pub reply: ReplyEmpty,
+    pub name: String,
+    pub new_name: String,
+    pub parent_ino: u64,
+    pub new_parent_ino: u64,
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {

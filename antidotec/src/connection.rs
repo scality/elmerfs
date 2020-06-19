@@ -8,6 +8,7 @@ use async_std::{
 use protobuf::ProtobufError;
 use std::{convert::TryFrom, mem, u32};
 use thiserror::Error;
+use tracing;
 
 #[derive(Debug, Error)]
 pub enum AntidoteError {
@@ -76,10 +77,12 @@ impl Connection {
         })
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.transaction_with_locks(TransactionLocks::new()).await
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn transaction_with_locks(
         &mut self,
         locks: TransactionLocks,
@@ -105,18 +108,18 @@ impl Connection {
     where
         P: ApbMessage,
     {
-        let code = P::code() as u8;
+        let code = P::code();
         let message_size = request.compute_size() + 1 /* code byte */;
+        tracing::trace!(?code, message_size);
 
         let mut header: [u8; 5] = [0; 5];
         header[0..4].copy_from_slice(&message_size.to_be_bytes());
-        header[4] = code;
+        header[4] = code as u8;
 
         self.stream.write_all(&header).await?;
 
         let bytes = request.write_to_bytes()?;
         self.stream.write_all(&bytes).await?;
-
         Ok(())
     }
 
@@ -136,6 +139,8 @@ impl Connection {
         self.stream.read_exact(&mut self.scratchpad[..]).await?;
 
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
+        tracing::trace!(?code, message_size);
+
         if code != R::code() {
             return Err(Error::CodeMismatch {
                 expected: R::code() as u8,
@@ -153,6 +158,7 @@ pub struct Transaction<'a> {
 }
 
 impl Transaction<'_> {
+    #[tracing::instrument(skip(self))]
     pub async fn commit(self) -> Result<(), Error> {
         let mut message = ApbCommitTransaction::new();
         message.set_transaction_descriptor(self.txid.clone());
@@ -163,6 +169,7 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn abort(mut self) -> Result<(), Error> {
         let res = Self::abort_impl(self.connection, mem::replace(&mut self.txid, Vec::new())).await;
         std::mem::forget(self);
@@ -215,6 +222,7 @@ impl Transaction<'_> {
         })
     }
 
+    #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn update(
         &mut self,
         bucket: impl Into<RawIdent>,
@@ -249,6 +257,7 @@ impl Transaction<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct TransactionLocks {
     exclusive: Vec<RawIdent>,
     shared: Vec<RawIdent>,
@@ -346,7 +355,10 @@ impl ReadReply {
     }
 
     fn object(&mut self, ty: CRDT_type, index: usize) -> Option<Crdt> {
-        self.objects[index].take().map(|o| Crdt::from_read(ty, o))
+        match self.objects.get_mut(index) {
+            Some(slot) => slot.take().map(|o| Crdt::from_read(ty, o)),
+            None => None,
+        }
     }
 }
 
@@ -519,8 +531,8 @@ pub mod gmap {
 pub mod rrmap {
     use super::crdts::Crdt;
     use super::{
-        ApbMapKey, ApbCrdtReset, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
-        ReadQuery, UpdateQuery,
+        ApbCrdtReset, ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type,
+        RawIdent, ReadQuery, UpdateQuery,
     };
     use protobuf;
     use std::collections::HashMap;
@@ -600,7 +612,9 @@ pub mod rrmap {
 }
 
 pub mod crdts {
-    pub use super::{RawIdent, counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap};
+    pub use super::{
+        counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap, RawIdent,
+    };
     use super::{ApbReadObjectResp, CRDT_type};
     use std::collections::HashMap;
 
@@ -610,7 +624,7 @@ pub mod crdts {
         LwwReg(LwwReg),
         MvReg(MvReg),
         GMap(GMap),
-        RrMap(RrMap)
+        RrMap(RrMap),
     }
 
     impl Crdt {

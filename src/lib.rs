@@ -8,12 +8,11 @@ mod page;
 use crate::driver::Driver;
 use crate::op::*;
 use crate::page::PageDriver;
-use async_std::sync::Arc;
+use async_std::{task, sync::Arc};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use time::Timespec;
@@ -22,7 +21,7 @@ use tracing::{error, info};
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
 
-const PAGE_SIZE: usize = 64 * 1024 * 1024;
+const PAGE_SIZE: usize = 64 * 1024;
 const OP_BUFFERING_SIZE: usize = 1024;
 
 /// There is two main thread of execution to follow:
@@ -44,12 +43,14 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
         .spawn(move || fuse(mountpoint, op_sender))
         .unwrap();
 
+        
     let bucket = cfg.bucket;
-    let driver = Arc::new(Driver {
+
+    let driver = task::block_on(Driver::new(
         cfg,
-        pages: PageDriver::new(bucket, PAGE_SIZE),
-    });
-    dispatch::drive(driver, op_receiver);
+        PageDriver::new(bucket, PAGE_SIZE),
+    )).expect("initalized driver");
+    dispatch::drive(Arc::new(driver), op_receiver);
 }
 
 fn fuse(mountpoint: OsString, op_sender: op::Sender) {
@@ -76,6 +77,18 @@ fn fuse(mountpoint: OsString, op_sender: op::Sender) {
             }
         }
     }
+}
+
+macro_rules! check_utf8 {
+    ($reply:expr, $arg:ident) => {
+        match $arg.to_str() {
+            Some($arg) => String::from($arg),
+            None => {
+                $reply.error(Errno::EINVAL as libc::c_int);
+                return;
+            }
+        }
+    };
 }
 
 struct Rpfs {
@@ -107,13 +120,7 @@ impl Filesystem for Rpfs {
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name = match name.to_str() {
-            Some(name) => String::from(name),
-            None => {
-                reply.error(Errno::EINVAL as libc::c_int);
-                return;
-            }
-        };
+        let name = check_utf8!(reply, name);
 
         let _ = self.op_sender.send(Op::Lookup(Lookup {
             reply,
@@ -130,13 +137,7 @@ impl Filesystem for Rpfs {
         mode: u32,
         reply: ReplyEntry,
     ) {
-        let name = match name.to_str() {
-            Some(name) => String::from(name),
-            None => {
-                reply.error(Errno::EINVAL as libc::c_int);
-                return;
-            }
-        };
+        let name = check_utf8!(reply, name);
 
         let _ = self.op_sender.send(Op::MkDir(MkDir {
             reply,
@@ -149,13 +150,7 @@ impl Filesystem for Rpfs {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name = match name.to_str() {
-            Some(name) => String::from(name),
-            None => {
-                reply.error(Errno::EINVAL as libc::c_int);
-                return;
-            }
-        };
+        let name = check_utf8!(reply, name);
 
         let _ = self.op_sender.send(Op::RmDir(RmDir {
             reply,
@@ -173,13 +168,7 @@ impl Filesystem for Rpfs {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let name = match name.to_str() {
-            Some(name) => String::from(name),
-            None => {
-                reply.error(Errno::EINVAL as libc::c_int);
-                return;
-            }
-        };
+        let name = check_utf8!(reply, name);
 
         let _ = self.op_sender.send(Op::MkNod(MkNod {
             reply,
@@ -193,13 +182,7 @@ impl Filesystem for Rpfs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name = match name.to_str() {
-            Some(name) => String::from(name),
-            None => {
-                reply.error(Errno::EINVAL as libc::c_int);
-                return;
-            }
-        };
+        let name = check_utf8!(reply, name);
 
         let _ = self.op_sender.send(Op::Unlink(Unlink {
             reply,
@@ -301,6 +284,19 @@ impl Filesystem for Rpfs {
             fh,
             offset,
             size,
+        }));
+    }
+
+    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, reply: ReplyEmpty) {
+        let name = check_utf8!(reply, name);
+        let new_name = check_utf8!(reply, newname);
+        
+        let _ = self.op_sender.send(Op::Rename(Rename {
+            reply,
+            parent_ino: parent,
+            new_parent_ino: newparent,
+            name,
+            new_name,
         }));
     }
 }

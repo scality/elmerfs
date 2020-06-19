@@ -233,14 +233,32 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                 task::spawn(async move {
                     match handle_result_silent(
                         name,
-                        driver.read(read.ino, read.offset, read.size).await
+                        driver.read(read.ino, read.offset, read.size).await,
                     ) {
                         Ok(data) => {
                             read.reply.data(&data);
-                        },
+                        }
                         Err(errno) => {
                             read.reply.error(errno as libc::c_int);
                         }
+                    }
+                });
+            }
+            Op::Rename(rename) => {
+                task::spawn(async move {
+                    match handle_result(
+                        name,
+                        driver
+                            .rename(
+                                rename.parent_ino,
+                                rename.name,
+                                rename.new_parent_ino,
+                                rename.new_name,
+                            )
+                            .await,
+                    ) {
+                        Ok(()) => rename.reply.ok(),
+                        Err(errno) => rename.reply.error(errno as libc::c_int),
                     }
                 });
             }

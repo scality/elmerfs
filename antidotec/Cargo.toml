@@ -10,6 +10,13 @@ build = "build.rs"
 protobuf = "2.14"
 async-std = "1.0"
 thiserror = "1.0"
+tracing = "0.1"
+
 
 [build-dependencies]
 protobuf-codegen-pure = "2.3"
+
+[dependencies.tracing-futures]
+version = "0.2"
+default-features = false
+features = ["std", "std-future"]

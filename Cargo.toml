@@ -10,7 +10,7 @@ members = [
 ]
 
 [dependencies]
-async-std = { version = "1.0", features = ["unstable"] }
+async-std = { version = "1.6", features = ["unstable"] }
 antidotec = { path = "antidotec" }
 fuse = "0.3"
 nix = "0.17"

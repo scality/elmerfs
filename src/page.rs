@@ -15,7 +15,7 @@ impl PageDriver {
         Self { bucket, page_size }
     }
 
-    #[tracing::instrument(skip(tx, content))]
+    #[tracing::instrument(skip(self, tx, content))]
     pub async fn write(
         &self,
         tx: &mut Transaction<'_>,
@@ -100,7 +100,7 @@ impl PageDriver {
         Ok(())
     }
 
-    #[tracing::instrument(skip(tx, output))]
+    #[tracing::instrument(skip(self, tx, output))]
     pub async fn read(
         &self,
         tx: &mut Transaction<'_>,
@@ -151,7 +151,7 @@ impl PageDriver {
             reply.lwwreg(0).unwrap_or_default()
         };
 
-        let end = end.min(page_content.len());
+        let end = end.min(offset_in_page + page_content.len());
         output.extend_from_slice(&page_content[offset_in_page..end]);
 
         Ok(())
