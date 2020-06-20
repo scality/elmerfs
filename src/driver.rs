@@ -41,6 +41,7 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 pub struct Config {
     pub bucket: Bucket,
     pub address: String,
+    pub use_distributed_locks: bool,
 }
 
 #[derive(Debug)]
@@ -323,7 +324,11 @@ impl Driver {
             let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
 
             let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::RrMap::new()));
-            let created = entries.insert(name, ino).is_none();
+
+            if entries.contains_key(&name) {
+                return Err(Error::Sys(Errno::EEXIST));
+            }
+            entries.insert(name, ino);
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             let inode = Inode {
@@ -338,7 +343,7 @@ impl Driver {
                 size: 0,
                 nlink: 2,
             };
-            parent_inode.size += created as u64;
+            parent_inode.size += 1;
             parent_inode.mtime = t;
             parent_inode.atime = t;
 
@@ -390,7 +395,7 @@ impl Driver {
                 }
             };
 
-            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
+            let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or_default());
 
             let ino = match entries.remove(&name) {
                 Some(ino) => ino,
@@ -446,8 +451,13 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
+            let mut parent = expect_inode!(parent_ino, reply.rrmap(0));
             let mut entries = inode::decode_dir(reply.rrmap(1).unwrap_or(crdts::GMap::new()));
+
+            if entries.contains_key(&name) {
+                return Err(Error::Sys(Errno::EEXIST));
+            }
+
             entries.insert(name, ino);
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -463,16 +473,17 @@ impl Driver {
                 size: 0,
                 nlink: 1,
             };
-            parent_inode.size = entries.len() as u64;
-            parent_inode.mtime = t;
-            parent_inode.atime = t;
+            parent.size = entries.len() as u64;
+            parent.mtime = t;
+            parent.atime = t;
+            parent.size += 1;
 
             let attr = inode.attr();
 
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::update_stats(&parent_inode),
+                    inode::update_stats(&parent),
                     inode::update_dir(parent_ino, &entries),
                     inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
                 ],
@@ -729,6 +740,149 @@ impl Driver {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn link(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: String,
+    ) -> Result<FileAttr> {
+        let mut connexion = self.connect().await?;
+
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(inode::Key::new(ino));
+
+        let mut tx = connexion.transaction_with_locks(locks).await?;
+
+        let (mut inode, mut parent, mut entries) = {
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![
+                        inode::read(ino),
+                        inode::read(new_parent_ino),
+                        inode::read_dir(new_parent_ino),
+                    ],
+                )
+                .await?;
+
+            let inode = expect_inode!(ino, reply.rrmap(0));
+            let parent = expect_inode!(new_parent_ino, reply.rrmap(1));
+            let entries = inode::decode_dir(reply.rrmap(2).unwrap_or_default());
+
+            (inode, parent, entries)
+        };
+
+        if entries.contains_key(&new_name) {
+            return Err(Error::Sys(Errno::EEXIST));
+        }
+
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        parent.mtime = t;
+        parent.atime = t;
+
+        entries.insert(new_name, ino);
+
+        tx.update(
+            self.cfg.bucket,
+            vec![
+                inode::update_stats(&parent),
+                inode::update_dir(new_parent_ino, &entries),
+                inode::incr_link_count(ino, 1),
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        inode.nlink += 1;
+        Ok(inode.attr())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn read_link(&self, ino: u64) -> Result<String> {
+        let mut connexion = self.connect().await?;
+        let mut tx = connexion.transaction().await?;
+
+        let mut reply = tx
+            .read(self.cfg.bucket, vec![inode::read_link(ino)])
+            .await?;
+
+        let link = match reply.lwwreg(0) {
+            Some(reg) => inode::decode_link(reg),
+            None => return Err(Error::Sys(Errno::ENOENT)),
+        };
+
+        tx.commit().await?;
+        Ok(link)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn symlink(
+        &self,
+        parent_ino: u64,
+        owner: Owner,
+        name: String,
+        link: String,
+    ) -> Result<FileAttr> {
+        let mut connexion = self.connect().await?;
+        let ino = self.generate_ino(&mut connexion).await?;
+
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(inode::Key::new(parent_ino));
+
+        let mut tx = connexion.transaction().await?;
+        let (mut parent, mut entries) = {
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![inode::read(parent_ino), inode::read_dir(parent_ino)],
+                )
+                .await?;
+
+            let parent = expect_inode!(parent_ino, reply.rrmap(0));
+            let entries = inode::decode_dir(reply.rrmap(1).unwrap_or_default());
+
+            (parent, entries)
+        };
+
+        if entries.contains_key(&name) {
+            return Err(Error::Sys(Errno::EEXIST));
+        }
+        entries.insert(name, ino);
+
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let inode = inode::Inode {
+            ino,
+            kind: inode::Kind::Symlink,
+            parent: parent_ino,
+            atime: t,
+            ctime: t,
+            mtime: t,
+            owner,
+            mode: 0644,
+            size: link.len() as u64,
+            nlink: 1,
+        };
+        parent.size += 1;
+        parent.mtime = t;
+        parent.atime = t;
+
+        tx.update(
+            self.cfg.bucket,
+            vec![
+                inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
+                inode::update_stats(&parent),
+                inode::update_dir(parent_ino, &entries),
+                inode::set_link(ino, link),
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(inode.attr())
+    }
+
     fn schedule_delete(self: Arc<Driver>, ino: u64) {
         task::spawn(async move {
             let result = self.delete_later(ino).await;
@@ -739,8 +893,11 @@ impl Driver {
     #[tracing::instrument(skip(self))]
     async fn delete_later(&self, ino: u64) -> Result<bool> {
         let mut connexion = self.connect().await?;
-        let mut tx = connexion.transaction().await?;
 
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(inode::Key::new(ino));
+
+        let mut tx = connexion.transaction_with_locks(locks).await?;
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
 

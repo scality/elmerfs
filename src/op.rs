@@ -22,6 +22,9 @@ pub enum Op {
     Write(Write),
     Read(Read),
     Rename(Rename),
+    Link(Link),
+    Symlink(Symlink),
+    ReadLink(ReadLink),
 }
 
 impl Op {
@@ -42,6 +45,9 @@ impl Op {
             Self::Write(_) => "write",
             Self::Read(_) => "read",
             Self::Rename(_) => "rename",
+            Self::Link(_) => "link",
+            Self::Symlink(_) => "symlink",
+            Self::ReadLink(_) => "readlink",
         }
     }
 }
@@ -166,6 +172,30 @@ pub struct Rename {
     pub new_name: String,
     pub parent_ino: u64,
     pub new_parent_ino: u64,
+}
+
+#[derive(Debug)]
+pub struct Link {
+    pub reply: ReplyEntry,
+    pub ino: u64,
+    pub new_name: String,
+    pub new_parent_ino: u64,
+}
+
+#[derive(Debug)]
+pub struct Symlink {
+    pub reply: ReplyEntry,
+    pub uid: u32,
+    pub gid: u32,
+    pub parent_ino: u64,
+    pub name: String,
+    pub link: String,
+}
+
+#[derive(Debug)]
+pub struct ReadLink {
+    pub reply: ReplyData,
+    pub ino: u64,
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {

@@ -262,6 +262,55 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
                     }
                 });
             }
+            Op::Link(link) => {
+                task::spawn(async move {
+                    match handle_result(
+                        name,
+                        driver
+                            .link(link.ino, link.new_parent_ino, link.new_name)
+                            .await,
+                    ) {
+                        Ok(attr) => {
+                            link.reply.entry(&ttl(), &attr, 0);
+                        }
+                        Err(errno) => {
+                            link.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::Symlink(symlink) => {
+                task::spawn(async move {
+                    let owner = Owner {
+                        gid: symlink.gid,
+                        uid: symlink.uid,
+                    };
+
+                    match handle_result(
+                        name,
+                        driver.symlink(symlink.parent_ino, owner, symlink.name, symlink.link).await,
+                    ) {
+                        Ok(attr) => {
+                            symlink.reply.entry(&ttl(), &attr, 0);
+                        }
+                        Err(errno) => {
+                            symlink.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
+            Op::ReadLink(readlink) => {
+                task::spawn(async move {
+                    match handle_result(name, driver.read_link(readlink.ino).await) {
+                        Ok(path) => {
+                            readlink.reply.data(path.as_bytes());
+                        }
+                        Err(errno) => {
+                            readlink.reply.error(errno as libc::c_int);
+                        }
+                    }
+                });
+            }
         }
     }
 }

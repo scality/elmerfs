@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, convert::TryFrom, time::Duration};
 pub enum Kind {
     Regular = 0,
     Directory = 1,
+    Symlink = 2,
 }
 
 impl Kind {
@@ -12,6 +13,7 @@ impl Kind {
         match self {
             Kind::Regular => FileType::RegularFile,
             Kind::Directory => FileType::Directory,
+            Kind::Symlink => FileType::Symlink,
         }
     }
 }
@@ -48,6 +50,7 @@ impl TryFrom<u8> for Kind {
         match x {
             0 => Ok(Kind::Regular),
             1 => Ok(Kind::Directory),
+            2 => Ok(Kind::Symlink),
             _ => Err(InvalidKindByte),
         }
     }
@@ -95,8 +98,9 @@ impl Inode {
 pub type DirEntries = BTreeMap<String, u64>;
 
 pub use self::mapping::{
-    decode, decode_dir, decr_link_count, inc_link_count, read, read_dir, remove, remove_dir,
-    remove_dir_entry, update, update_dir, update_stats, InodeKey as Key, NLinkInc,
+    decode, decode_dir, decode_link, decr_link_count, incr_link_count, read, read_dir, read_link,
+    remove, remove_dir, remove_dir_entry, set_link, update, update_dir, update_stats,
+    InodeKey as Key, NLinkInc,
 };
 
 mod mapping {
@@ -120,7 +124,8 @@ mod mapping {
         Size = 8,
         DirEntries = 9,
         NLink = 10,
-        _Count = 11,
+        SymlinkPath = 11,
+        _Count = 12,
     }
 
     impl Field {
@@ -214,7 +219,7 @@ mod mapping {
             .build()
     }
 
-    pub fn inc_link_count(ino: u64, amount: u32) -> UpdateQuery {
+    pub fn incr_link_count(ino: u64, amount: u32) -> UpdateQuery {
         let key = InodeKey::new(ino);
 
         rrmap::update(key, 1)
@@ -309,5 +314,19 @@ mod mapping {
         }
 
         entries
+    }
+
+    pub fn read_link(ino: u64) -> ReadQuery {
+        let key = InodeKey::new(ino).field(Field::SymlinkPath);
+        lwwreg::get(key)
+    }
+
+    pub fn set_link(ino: u64, path: String) -> UpdateQuery {
+        let key = InodeKey::new(ino).field(Field::SymlinkPath);
+        lwwreg::set(key, path.into_bytes())
+    }
+
+    pub fn decode_link(reg: crdts::LwwReg) -> String {
+        String::from_utf8(reg).unwrap()
     }
 }

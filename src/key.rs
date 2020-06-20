@@ -1,5 +1,5 @@
-use std::mem;
 use antidotec::RawIdent;
+use std::mem;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -13,15 +13,12 @@ pub enum Kind {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Key<P> {
     pub kind: Kind,
-    pub payload: P
+    pub payload: P,
 }
 
 impl<P> Key<P> {
     pub const fn new(kind: Kind, payload: P) -> Self {
-        Self {
-            kind,
-            payload,
-        }
+        Self { kind, payload }
     }
 }
 

@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use time::Timespec;
 use tracing::{error, info};
+use std::path::Path;
 
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
@@ -297,6 +298,40 @@ impl Filesystem for Rpfs {
             new_parent_ino: newparent,
             name,
             new_name,
+        }));
+    }
+
+    fn link(&mut self, _req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        let new_name = check_utf8!(reply, newname);
+
+        let _ = self.op_sender.send(Op::Link(Link {
+            reply,
+            ino,
+            new_name,
+            new_parent_ino: newparent,
+        }));
+    }
+
+    fn symlink(&mut self, req: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+        let link = link.as_os_str();
+
+        let link = check_utf8!(reply, link);
+        let name = check_utf8!(reply, name);
+
+        let _ = self.op_sender.send(Op::Symlink(Symlink {
+            reply,
+            parent_ino: parent,
+            name,
+            link,
+            uid: req.uid(),
+            gid: req.gid(),
+        }));
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        let _ = self.op_sender.send(Op::ReadLink(ReadLink {
+            reply,
+            ino,
         }));
     }
 }

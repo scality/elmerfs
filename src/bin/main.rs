@@ -28,13 +28,22 @@ fn main() {
                 .value_name("URL")
                 .default_value("127.0.0.1:8101"),
         )
+        .arg(
+            Arg::with_name("no_distributed_locks")
+                .long("no-distributed-locks")
+                .short("nl")
+                .takes_value(false),
+        )
         .get_matches();
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
     let address = args.value_of("antidote_url").unwrap();
+    let use_disitributed_locks = !args.is_present("no_distributed_locks");
+
     let cfg = Config {
         bucket: MAIN_BUCKET,
         address: String::from(address),
+        use_distributed_locks,
     };
 
     elmerfs::run(cfg, mountpoint);
