@@ -38,7 +38,7 @@ fn main() {
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
     let address = args.value_of("antidote_url").unwrap();
-    let use_disitributed_locks = !args.is_present("no_distributed_locks");
+    let use_distributed_locks = !args.is_present("no_distributed_locks");
 
     let cfg = Config {
         bucket: MAIN_BUCKET,
