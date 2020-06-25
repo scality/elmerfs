@@ -99,7 +99,7 @@ pub type DirEntries = BTreeMap<String, u64>;
 
 pub use self::mapping::{
     decode, decode_dir, decode_link, decr_link_count, incr_link_count, read, read_dir, read_link,
-    remove, remove_dir, remove_dir_entry, set_link, update, update_dir, update_stats,
+    remove, remove_dir, remove_dir_entry, set_link, update, update_dir, update_stats, remove_link,
     InodeKey as Key, NLinkInc,
 };
 
@@ -314,6 +314,11 @@ mod mapping {
         }
 
         entries
+    }
+
+    pub fn remove_link(ino: u64) -> UpdateQuery {
+        let key = InodeKey::new(ino).field(Field::SymlinkPath);
+        lwwreg::set(key, vec![])
     }
 
     pub fn read_link(ino: u64) -> ReadQuery {

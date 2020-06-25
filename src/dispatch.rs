@@ -348,6 +348,10 @@ fn handle_result<U: Debug + Send>(name: &str, result: Result<U, Error>) -> Resul
             error!(name, ?error, "antidote error");
             Err(Errno::EIO)
         }
+        Err(Error::Sys(Errno::ENOENT)) => {
+            debug!(name, "enoent");
+            Err(Errno::ENOENT)
+        }
         Err(Error::Sys(errno)) => {
             warn!(name, ?errno, "system error");
             Err(errno)

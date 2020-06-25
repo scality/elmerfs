@@ -22,7 +22,7 @@ use std::path::Path;
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
 
-const PAGE_SIZE: usize = 4 * 1024 * 1024;
+const PAGE_SIZE: usize = 4 * 1024;
 const OP_BUFFERING_SIZE: usize = 1024;
 
 /// There is two main thread of execution to follow:

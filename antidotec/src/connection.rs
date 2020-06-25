@@ -131,8 +131,6 @@ impl Connection {
         self.stream.read_exact(&mut size_buffer).await?;
 
         let message_size = u32::from_be_bytes(size_buffer);
-
-        self.scratchpad.clear();
         self.scratchpad.resize(message_size as usize, 0);
 
         assert_eq!((&mut self.scratchpad[..]).len(), message_size as usize);

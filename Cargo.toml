@@ -18,6 +18,7 @@ thiserror = "1.0"
 time = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.2", features = ["env-filter"] }
+tracing-appender = { version = "0.1" }
 clap = "2.33"
 
 [dependencies.tracing-futures]

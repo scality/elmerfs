@@ -701,7 +701,14 @@ impl Driver {
                 )
                 .await?;
             }
-            Some(target) if ino != target.ino => return Err(Error::Sys(Errno::EEXIST)),
+            Some(target) if target.nlink == 1 => {
+                debug!("target is an existing link");
+
+                tx.update(
+                    self.cfg.bucket,
+                    vec![inode::remove(target.ino), inode::remove_link(target.ino)],
+                ).await?;
+            }
             _ => {}
         }
 

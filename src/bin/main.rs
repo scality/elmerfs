@@ -10,7 +10,11 @@ fn main() {
         .add_directive("async_std::task=warn".parse().unwrap())
         .add_directive("fuse=error".parse().unwrap());
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let (non_blocking_appender, _guard) = tracing_appender::non_blocking(std::io::stdout());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(non_blocking_appender)
+        .init();
 
     let args = App::new("elmerfs")
         .arg(
