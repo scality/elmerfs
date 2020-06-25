@@ -2,6 +2,7 @@ use crate::driver::Result;
 use crate::key::{self, Bucket, Key};
 use antidotec::{lwwreg, RawIdent, Transaction};
 use std::mem;
+use std::ops::Range;
 use tracing::{self, debug};
 
 #[derive(Debug)]
@@ -57,15 +58,12 @@ impl PageDriver {
             let mut reply = tx.read(self.bucket, vec![lwwreg::get(page)]).await?;
             reply.lwwreg(0).unwrap_or_default()
         };
-        page_content.reserve_exact(end);
 
-        let overlaping = offset_in_page..(end.min(page_content.len()));
-        let (content, remaining) = content.split_at(overlaping.len());
-        page_content[overlaping].copy_from_slice(content);
+        if end > page_content.len() {
+            page_content.resize(end, 0);
+        }
+        page_content[offset_in_page..end].copy_from_slice(content);
 
-        page_content.extend_from_slice(&remaining);
-
-        assert!(page_content.len() <= self.page_size);
         tx.update(self.bucket, vec![lwwreg::set(page, page_content)])
             .await?;
 
@@ -151,8 +149,9 @@ impl PageDriver {
             reply.lwwreg(0).unwrap_or_default()
         };
 
-        let end = end.min(offset_in_page + page_content.len());
-        output.extend_from_slice(&page_content[offset_in_page..end]);
+        let overlapping =
+            intersect_range(0..page_content.len(), offset_in_page..end);
+        output.extend_from_slice(&page_content[overlapping]);
 
         Ok(())
     }
@@ -218,4 +217,12 @@ impl Into<RawIdent> for PageKey {
 
         ident
     }
+}
+
+fn intersect_range(lhs: Range<usize>, rhs: Range<usize>) -> Range<usize> {
+    if lhs.end < rhs.start || rhs.end < lhs.start {
+        return 0..0;
+    }
+
+    lhs.start.max(rhs.start)..lhs.end.min(rhs.end)
 }

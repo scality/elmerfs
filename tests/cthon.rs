@@ -31,6 +31,7 @@ fn cthon_basic() {
     let cfg = Config {
         bucket: CTHON_BASIC_BUCKET,
         address: String::from(ANTIDOTE_URL),
+        use_distributed_locks: true,
     };
 
     fs::create_dir_all(&tests_dir.path()).expect("failed ot create test mountpoint");

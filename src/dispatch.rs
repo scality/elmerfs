@@ -288,7 +288,9 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
 
                     match handle_result(
                         name,
-                        driver.symlink(symlink.parent_ino, owner, symlink.name, symlink.link).await,
+                        driver
+                            .symlink(symlink.parent_ino, owner, symlink.name, symlink.link)
+                            .await,
                     ) {
                         Ok(attr) => {
                             symlink.reply.entry(&ttl(), &attr, 0);
@@ -332,7 +334,7 @@ fn handle_result_silent<U: Send>(name: &str, result: Result<U, Error>) -> Result
         Err(Error::InoAllocFailed) => {
             error!(name, "ino alloc error");
             Err(Errno::ENOSPC)
-        }
+        },
     }
 }
 

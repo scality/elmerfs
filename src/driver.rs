@@ -1,21 +1,18 @@
 use crate::inode::{self, Inode, Owner};
 use crate::key::{Bucket, InoCounter};
 use crate::page::PageDriver;
-use antidotec::{self, counter, crdts, Connection, Transaction, TransactionLocks};
-use async_std::sync::{Arc, Condvar, Mutex};
+use antidotec::{self, counter, crdts, Connection, TransactionLocks};
+use async_std::sync::Arc;
 use async_std::task;
 use fuse::*;
 use nix::errno::Errno;
-use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::{Deref, DerefMut};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::debug;
 
 const ROOT_INO: u64 = 1;
 const INO_COUNTER: InoCounter = InoCounter::new(0);
-const CONNECTION_POOL_SIZE: usize = 32;
 
 macro_rules! expect_inode {
     ($ino:expr, $map:expr) => {
@@ -30,8 +27,10 @@ macro_rules! expect_inode {
 pub(crate) enum Error {
     #[error("driver replied with: {0}")]
     Sys(Errno),
+
     #[error("io error with antidote: {0}")]
     Antidote(#[from] antidotec::Error),
+
     #[error("could not allocate a new inode number")]
     InoAllocFailed,
 }
@@ -46,20 +45,13 @@ pub struct Config {
 
 #[derive(Debug)]
 pub(crate) struct Driver {
-    connection_pool: ConnectionPool,
     cfg: Config,
     pages: PageDriver,
 }
 
 impl Driver {
     pub async fn new(cfg: Config, pages: PageDriver) -> Result<Self> {
-        let pool = ConnectionPool::new(CONNECTION_POOL_SIZE, cfg.address.clone()).await?;
-
-        Ok(Self {
-            connection_pool: pool,
-            cfg,
-            pages,
-        })
+        Ok(Self { cfg, pages })
     }
 
     #[tracing::instrument(skip(self))]
@@ -559,7 +551,11 @@ impl Driver {
     #[tracing::instrument(skip(self, bytes))]
     pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
         let mut connection = self.connect().await?;
-        let mut tx = connection.transaction().await?;
+
+        let mut locks = TransactionLocks::with_capacity(1, 0);
+        locks.push_exclusive(inode::Key::new(ino));
+
+        let mut tx = connection.transaction_with_locks(locks).await?;
 
         self.pages
             .write(&mut tx, ino, offset as usize, bytes)
@@ -568,7 +564,9 @@ impl Driver {
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
 
         let mut inode = expect_inode!(ino, reply.rrmap(0));
-        let wrote = (offset + bytes.len() as u64) - inode.size;
+
+        let wrote = (offset + bytes.len() as u64).saturating_sub(inode.size);
+
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
@@ -586,8 +584,12 @@ impl Driver {
         // Manual trace to avoid priting content result.
         tracing::trace!(ino, offset, len);
 
-        let len = len as usize;
         let mut connection = self.connect().await?;
+        let len = len as usize;
+
+        let mut locks = TransactionLocks::with_capacity(0, 1);
+        locks.push_shared(inode::Key::new(ino));
+
         let mut tx = connection.transaction().await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
@@ -954,10 +956,6 @@ impl Driver {
     async fn connect(&self) -> Result<Connection> {
         Ok(Connection::new(&self.cfg.address).await?)
     }
-
-    // async fn connect(&self) -> Result<PooledConnection<'_>> {
-    //     Ok(self.connection_pool.acquire().await)
-    // }
 }
 
 #[derive(Debug)]
@@ -965,92 +963,4 @@ pub(crate) struct ReadDirEntry {
     pub(crate) ino: u64,
     pub(crate) kind: FileType,
     pub(crate) name: String,
-}
-#[derive(Debug)]
-struct InnerPool {
-    connections: Vec<Connection>,
-    wait_list: VecDeque<Arc<Condvar>>,
-}
-
-#[derive(Debug)]
-pub struct ConnectionPool {
-    inner: Mutex<InnerPool>,
-}
-
-impl ConnectionPool {
-    async fn new(size: usize, address: String) -> Result<Self> {
-        let mut connections = Vec::with_capacity(size);
-        let mut tasks = Vec::with_capacity(size);
-        let address = Arc::new(address);
-
-        for _ in 0..size {
-            let address = address.clone();
-            tasks.push(task::spawn(async move { Connection::new(&*address).await }));
-        }
-
-        for task in tasks {
-            connections.push(task.await?);
-        }
-
-        let inner = InnerPool {
-            connections,
-            wait_list: VecDeque::with_capacity(size),
-        };
-
-        Ok(Self {
-            inner: Mutex::new(inner),
-        })
-    }
-
-    async fn acquire(&self) -> PooledConnection<'_> {
-        let mut pool = self.inner.lock().await;
-
-        while pool.connections.len() == 0 {
-            tracing::error!("waiting");
-            let wait_cond = Arc::new(Condvar::new());
-            pool.wait_list.push_back(wait_cond.clone());
-
-            pool = wait_cond.wait(pool).await;
-        }
-
-        let connection = pool.connections.pop().unwrap();
-        PooledConnection {
-            connection: Some(connection),
-            pool: self,
-        }
-    }
-}
-
-pub struct PooledConnection<'a> {
-    connection: Option<Connection>,
-    pool: &'a ConnectionPool,
-}
-
-impl Deref for PooledConnection<'_> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.connection.as_ref().unwrap()
-    }
-}
-
-impl DerefMut for PooledConnection<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.connection.as_mut().unwrap()
-    }
-}
-
-impl Drop for PooledConnection<'_> {
-    fn drop(&mut self) {
-        let connection = self.connection.take().unwrap();
-
-        task::block_on(async move {
-            let mut pool = self.pool.inner.lock().await;
-            pool.connections.push(connection);
-
-            if let Some(waiter) = pool.wait_list.pop_front() {
-                waiter.notify_one();
-            }
-        });
-    }
 }
