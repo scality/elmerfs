@@ -269,8 +269,8 @@ impl Transaction<'_> {
 
 #[derive(Debug)]
 pub struct TransactionLocks {
-    exclusive: Vec<RawIdent>,
-    shared: Vec<RawIdent>,
+    pub exclusive: Vec<RawIdent>,
+    pub shared: Vec<RawIdent>,
 }
 
 impl TransactionLocks {

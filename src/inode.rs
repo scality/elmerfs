@@ -156,6 +156,10 @@ mod mapping {
             Self::new(ino).field(Field::DirEntries)
         }
 
+        pub fn symlink(ino: u64) -> RawIdent {
+            Self::new(ino).field(Field::SymlinkPath)
+        }
+
         fn field(self, field: Field) -> RawIdent {
             InodeKey(Key::new(
                 Kind::Inode,
