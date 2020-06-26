@@ -1,15 +1,16 @@
 use self::crdts::Crdt;
 use crate::protos::{antidote::*, ApbMessage, ApbMessageCode, MessageCodeError};
+use async_std::io::BufReader;
 use async_std::{
     io::{self, prelude::*},
     net::TcpStream,
     task,
 };
 use protobuf::ProtobufError;
+use std::mem;
 use std::{convert::TryFrom, u32};
 use thiserror::Error;
 use tracing;
-use std::mem;
 
 #[derive(Debug, Error)]
 pub enum AntidoteError {
@@ -71,6 +72,7 @@ pub struct Connection {
 impl Connection {
     pub async fn new(address: &str) -> Result<Self, Error> {
         let stream = TcpStream::connect(address).await?;
+        let _ = stream.set_nodelay(true);
 
         Ok(Self {
             stream,
@@ -114,14 +116,16 @@ impl Connection {
         let message_size = request.compute_size() + 1 /* code byte */;
         tracing::trace!(?code, message_size);
 
+        self.scratchpad.clear();
+
         let mut header: [u8; 5] = [0; 5];
         header[0..4].copy_from_slice(&message_size.to_be_bytes());
         header[4] = code as u8;
 
-        self.stream.write_all(&header).await?;
+        self.scratchpad.extend_from_slice(&header[..]);
+        request.write_to_vec(&mut self.scratchpad)?;
+        self.stream.write_all(&self.scratchpad[..]).await?;
 
-        let bytes = request.write_to_bytes()?;
-        self.stream.write_all(&bytes).await?;
         Ok(())
     }
 
@@ -130,14 +134,19 @@ impl Connection {
     where
         R: ApbMessage,
     {
-        let mut size_buffer: [u8; 4] = [0; 4];
-        self.stream.read_exact(&mut size_buffer).await?;
+        /* Unfortunatly we cannot reuse our buffer here (unless implementing
+        a buffered stream ourselves). However since we are acting only on a
+        request/response scheme, we should not drop any data by creating
+        a BufReader each time. */
+        let mut stream = BufReader::new(&mut self.stream);
 
+        let mut size_buffer: [u8; 4] = [0; 4];
+        stream.read_exact(&mut size_buffer).await?;
         let message_size = u32::from_be_bytes(size_buffer);
         self.scratchpad.resize(message_size as usize, 0);
 
         assert_eq!((&mut self.scratchpad[..]).len(), message_size as usize);
-        self.stream.read_exact(&mut self.scratchpad[..]).await?;
+        stream.read_exact(&mut self.scratchpad[..]).await?;
 
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
         tracing::trace!(?code, message_size);
