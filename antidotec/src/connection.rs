@@ -6,9 +6,10 @@ use async_std::{
     task,
 };
 use protobuf::ProtobufError;
-use std::{convert::TryFrom, mem, u32};
+use std::{convert::TryFrom, u32};
 use thiserror::Error;
 use tracing;
+use std::mem;
 
 #[derive(Debug, Error)]
 pub enum AntidoteError {
@@ -104,6 +105,7 @@ impl Connection {
         })
     }
 
+    #[tracing::instrument(skip(self))]
     async fn send<P>(&mut self, request: P) -> Result<(), Error>
     where
         P: ApbMessage,
@@ -123,6 +125,7 @@ impl Connection {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn recv<R>(&mut self) -> Result<R, Error>
     where
         R: ApbMessage,
@@ -157,32 +160,32 @@ pub struct Transaction<'a> {
 
 impl Transaction<'_> {
     #[tracing::instrument(skip(self))]
-    pub async fn commit(self) -> Result<(), Error> {
+    pub async fn commit(mut self) -> Result<(), Error> {
         let mut message = ApbCommitTransaction::new();
         message.set_transaction_descriptor(self.txid.clone());
 
         self.connection.send(message).await?;
         checkr!(self.connection.recv::<ApbCommitResp>().await?);
 
+        /* Don't drop to avoid calling abort */
+        mem::replace(&mut self.txid, Vec::new());
+        mem::forget(self);
+
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn abort(mut self) -> Result<(), Error> {
-        let res = Self::abort_impl(self.connection, mem::replace(&mut self.txid, Vec::new())).await;
-        std::mem::forget(self);
-
-        res
-    }
-
-    async fn abort_impl(connection: &mut Connection, txid: TxId) -> Result<(), Error> {
+    async fn abort(&mut self) -> Result<(), Error> {
         let mut message = ApbAbortTransaction::new();
-        message.set_transaction_descriptor(txid.clone());
+        message.set_transaction_descriptor(self.txid.clone());
 
-        connection.send(message).await?;
+        self.connection.send(message).await?;
+        checkr!(self.connection.recv::<ApbOperationResp>().await?);
+
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn read(
         &mut self,
         bucket: impl Into<RawIdent>,
@@ -289,7 +292,7 @@ impl TransactionLocks {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
-        let _ = task::block_on(async { Self::abort_impl(self.connection, self.txid.clone()) });
+        let _ = task::block_on(self.abort());
     }
 }
 

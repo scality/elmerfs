@@ -3,7 +3,6 @@ use crossbeam::queue::{ArrayQueue, PushError};
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 use tracing::*;
-use async_std::task;
 
 const CONNECTION_TIMEOUT_S: u64 = 180;
 
@@ -30,21 +29,18 @@ impl ConnectionPool {
     }
 
     #[instrument(skip(self))]
-    pub fn acquire(&self) -> Result<PoolGuard<'_>, Error> {
+    pub async fn acquire(&self) -> Result<PoolGuard<'_>, Error> {
         debug!("try to acquire a connection");
 
         if let Ok(available) = self.available.pop() {
             let elasped = available.pushed_at.elapsed();
             if available.pushed_at.elapsed() < self.timeout {
-                debug!(
-                    age = elasped.as_secs(),
-                    "reusing connection pushed at"
-                );
+                debug!(age = elasped.as_secs(), "reusing connection pushed at");
                 return Ok(PoolGuard::new(self, available.connection));
             }
         }
 
-        let connection = task::block_on(Connection::new(&self.address))?;
+        let connection = Connection::new(&self.address).await?;
         Ok(PoolGuard::new(self, connection))
     }
 
