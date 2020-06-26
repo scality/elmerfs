@@ -15,6 +15,8 @@ pub struct AddressBook {
 
 impl AddressBook {
     pub fn with_addresses(addresses: Vec<String>) -> Self {
+        assert_ne!(addresses.len(), 0);
+
         Self {
             addresses,
             next: AtomicUsize::new(0),
@@ -22,8 +24,6 @@ impl AddressBook {
     }
 
     pub fn next(&self) -> &str {
-        assert!(self.addresses.len() != 0);
-
         let next = self.next.fetch_add(1, Ordering::Relaxed);
         &self.addresses[next % self.addresses.len()]
     }
