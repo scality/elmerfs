@@ -1,4 +1,4 @@
-use elmerfs::{Bucket, Config};
+use elmerfs::{Bucket, Config, AddressBook};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -33,7 +33,7 @@ fn cthon_basic() {
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
         bucket: CTHON_BASIC_BUCKET,
-        address: String::from(ANTIDOTE_URL),
+        addresses: AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)]),
         use_distributed_locks: true,
     };
 
@@ -65,7 +65,7 @@ fn cthon_general() {
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
         bucket: CTHON_BASIC_BUCKET,
-        address: String::from(ANTIDOTE_URL),
+        addresses: AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)]),
         use_distributed_locks: true,
     };
 

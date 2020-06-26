@@ -3,8 +3,31 @@ use crossbeam::queue::{ArrayQueue, PushError};
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 use tracing::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CONNECTION_TIMEOUT_S: u64 = 180;
+
+#[derive(Debug)]
+pub struct AddressBook {
+    addresses: Vec<String>,
+    next: AtomicUsize
+}
+
+impl AddressBook {
+    pub fn with_addresses(addresses: Vec<String>) -> Self {
+        Self {
+            addresses,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn next(&self) -> &str {
+        assert!(self.addresses.len() != 0);
+
+        let next = self.next.fetch_add(1, Ordering::Relaxed);
+        &self.addresses[next % self.addresses.len()]
+    }
+}
 
 #[derive(Debug)]
 struct AvailableConnection {
@@ -14,15 +37,15 @@ struct AvailableConnection {
 
 #[derive(Debug)]
 pub struct ConnectionPool {
-    address: String,
+    addresses: AddressBook,
     available: ArrayQueue<AvailableConnection>,
     timeout: Duration,
 }
 
 impl ConnectionPool {
-    pub fn with_capacity(address: String, capacity: usize) -> Self {
+    pub fn with_capacity(addresses: AddressBook, capacity: usize) -> Self {
         ConnectionPool {
-            address,
+            addresses,
             available: ArrayQueue::new(capacity),
             timeout: Duration::from_secs(CONNECTION_TIMEOUT_S),
         }
@@ -40,7 +63,7 @@ impl ConnectionPool {
             }
         }
 
-        let connection = Connection::new(&self.address).await?;
+        let connection = Connection::new(self.addresses.next()).await?;
         Ok(PoolGuard::new(self, connection))
     }
 

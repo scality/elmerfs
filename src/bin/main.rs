@@ -1,5 +1,5 @@
 use clap::{App, Arg};
-use elmerfs::{self, Bucket, Config};
+use elmerfs::{self, AddressBook, Bucket, Config};
 use tracing_subscriber::{self, filter::EnvFilter};
 
 const MAIN_BUCKET: Bucket = Bucket::new(0);
@@ -26,11 +26,12 @@ fn main() {
                 .required(true),
         )
         .arg(
-            Arg::with_name("antidote_url")
-                .long("antidote_url")
+            Arg::with_name("antidote")
+                .long("antidote")
                 .short("s")
                 .value_name("URL")
-                .default_value("127.0.0.1:8101"),
+                .default_value("127.0.0.1:8101")
+                .multiple(true)
         )
         .arg(
             Arg::with_name("no_distributed_locks")
@@ -41,12 +42,12 @@ fn main() {
         .get_matches();
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
-    let address = args.value_of("antidote_url").unwrap();
+    let addresses = args.values_of("antidote").unwrap().map(String::from).collect();
     let use_distributed_locks = !args.is_present("no_distributed_locks");
 
     let cfg = Config {
         bucket: MAIN_BUCKET,
-        address: String::from(address),
+        addresses: AddressBook::with_addresses(addresses),
         use_distributed_locks,
     };
 

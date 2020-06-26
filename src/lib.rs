@@ -9,19 +9,20 @@ mod pool;
 use crate::driver::Driver;
 use crate::op::*;
 use crate::page::PageDriver;
-use async_std::{task, sync::Arc};
+use async_std::{sync::Arc, task};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use time::Timespec;
-use tracing::{error, info};
-use std::path::Path;
+use tracing::*;
 
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
+pub use crate::pool::AddressBook;
 
 const PAGE_SIZE: usize = 4 * 1024;
 const OP_BUFFERING_SIZE: usize = 1024;
@@ -36,8 +37,6 @@ const OP_BUFFERING_SIZE: usize = 1024;
 /// them into asynchronous tasks calling into the root of the filesystem,
 /// the Rp driver.
 pub fn run(cfg: Config, mountpoint: &OsStr) {
-    info!(cfg.mountpoint = ?mountpoint, cfg.address = &cfg.address as &str);
-
     let mountpoint = OsString::from(mountpoint);
     let (op_sender, op_receiver) = op::sync_channel(OP_BUFFERING_SIZE);
     thread::Builder::new()
@@ -45,13 +44,10 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
         .spawn(move || fuse(mountpoint, op_sender))
         .unwrap();
 
-        
     let bucket = cfg.bucket;
 
-    let driver = task::block_on(Driver::new(
-        cfg,
-        PageDriver::new(bucket, PAGE_SIZE),
-    )).expect("initalized driver");
+    let driver = task::block_on(Driver::new(cfg, PageDriver::new(bucket, PAGE_SIZE)))
+        .expect("initalized driver");
     dispatch::drive(Arc::new(driver), op_receiver);
 }
 
@@ -289,10 +285,18 @@ impl Filesystem for Rpfs {
         }));
     }
 
-    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, reply: ReplyEmpty) {
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEmpty,
+    ) {
         let name = check_utf8!(reply, name);
         let new_name = check_utf8!(reply, newname);
-        
+
         let _ = self.op_sender.send(Op::Rename(Rename {
             reply,
             parent_ino: parent,
@@ -302,7 +306,14 @@ impl Filesystem for Rpfs {
         }));
     }
 
-    fn link(&mut self, _req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
         let new_name = check_utf8!(reply, newname);
 
         let _ = self.op_sender.send(Op::Link(Link {
@@ -313,7 +324,14 @@ impl Filesystem for Rpfs {
         }));
     }
 
-    fn symlink(&mut self, req: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+    fn symlink(
+        &mut self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        link: &Path,
+        reply: ReplyEntry,
+    ) {
         let link = link.as_os_str();
 
         let link = check_utf8!(reply, link);
@@ -330,10 +348,7 @@ impl Filesystem for Rpfs {
     }
 
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        let _ = self.op_sender.send(Op::ReadLink(ReadLink {
-            reply,
-            ino,
-        }));
+        let _ = self.op_sender.send(Op::ReadLink(ReadLink { reply, ino }));
     }
 }
 
