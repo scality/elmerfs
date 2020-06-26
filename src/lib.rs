@@ -4,6 +4,7 @@ mod inode;
 mod key;
 mod op;
 mod page;
+mod pool;
 
 use crate::driver::Driver;
 use crate::op::*;

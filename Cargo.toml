@@ -20,6 +20,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.2", features = ["env-filter"] }
 tracing-appender = { version = "0.1" }
 clap = "2.33"
+crossbeam = "0.7"
+
 
 [dependencies.tracing-futures]
 version = "0.2"

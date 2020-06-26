@@ -1,9 +1,9 @@
 use fuse::{ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite};
-use std::sync::mpsc;
 use time::Timespec;
+use crossbeam::channel;
 
-pub type Sender = mpsc::SyncSender<Op>;
-pub type Receiver = mpsc::Receiver<Op>;
+pub type Sender = channel::Sender<Op>;
+pub type Receiver = channel::Receiver<Op>;
 
 #[derive(Debug)]
 pub enum Op {
@@ -199,5 +199,5 @@ pub struct ReadLink {
 }
 
 pub fn sync_channel(size: usize) -> (Sender, Receiver) {
-    mpsc::sync_channel(size)
+    channel::bounded(size)
 }

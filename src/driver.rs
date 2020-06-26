@@ -1,6 +1,7 @@
 use crate::inode::{self, Inode, Owner};
 use crate::key::{Bucket, InoCounter};
 use crate::page::PageDriver;
+use crate::pool::{ConnectionPool, PoolGuard};
 use antidotec::{self, counter, crdts, Connection, TransactionLocks};
 use async_std::sync::Arc;
 use async_std::task;
@@ -13,6 +14,7 @@ use tracing::debug;
 
 const ROOT_INO: u64 = 1;
 const INO_COUNTER: InoCounter = InoCounter::new(0);
+const MAX_CONNECTIONS: usize = 32;
 
 macro_rules! expect_inode {
     ($ino:expr, $map:expr) => {
@@ -47,16 +49,22 @@ pub struct Config {
 pub(crate) struct Driver {
     cfg: Config,
     pages: PageDriver,
+    pool: ConnectionPool,
 }
 
 impl Driver {
     pub async fn new(cfg: Config, pages: PageDriver) -> Result<Self> {
-        Ok(Self { cfg, pages })
+        let address = cfg.address.clone();
+        Ok(Self {
+            cfg,
+            pages,
+            pool: ConnectionPool::with_capacity(address, MAX_CONNECTIONS),
+        })
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn configure(&self) -> Result<()> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         self.ensure_ino_counter(&mut connection).await?;
         self.ensure_root_dir(&mut connection).await?;
@@ -134,7 +142,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn getattr(&self, ino: u64) -> Result<FileAttr> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut tx = connection.transaction().await?;
         let inode = {
@@ -167,7 +175,7 @@ impl Driver {
             };
         }
 
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut tx = connection.transaction().await?;
         let inode = {
@@ -193,7 +201,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn lookup(&self, parent_ino: u64, name: &str) -> Result<FileAttr> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(0, 1);
         locks.push_shared(inode::Key::dir_entries(parent_ino));
@@ -233,7 +241,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<ReadDirEntry>> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(0, 1);
         locks.push_shared(inode::Key::dir_entries(ino));
@@ -297,7 +305,7 @@ impl Driver {
         parent_ino: u64,
         name: String,
     ) -> Result<FileAttr> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
         let ino = self.generate_ino(&mut connection).await?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
@@ -365,7 +373,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn rmdir(self: Arc<Driver>, parent_ino: u64, name: String) -> Result<()> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
         locks.push_exclusive(inode::Key::new(parent_ino));
@@ -414,7 +422,7 @@ impl Driver {
         };
         tx.commit().await?;
 
-        self.schedule_delete(ino);
+        self.clone().schedule_delete(ino);
         Ok(())
     }
 
@@ -427,7 +435,7 @@ impl Driver {
         name: String,
         _rdev: u32,
     ) -> Result<FileAttr> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
         let ino = self.generate_ino(&mut connection).await?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
@@ -491,7 +499,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn unlink(self: Arc<Driver>, parent_ino: u64, name: String) -> Result<()> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
         locks.push_exclusive(inode::Key::new(parent_ino));
@@ -534,7 +542,7 @@ impl Driver {
         };
         tx.commit().await?;
 
-        self.schedule_delete(ino);
+        self.clone().schedule_delete(ino);
         Ok(())
     }
 
@@ -550,7 +558,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self, bytes))]
     pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(1, 0);
         locks.push_exclusive(inode::Key::new(ino));
@@ -584,7 +592,7 @@ impl Driver {
         // Manual trace to avoid priting content result.
         tracing::trace!(ino, offset, len);
 
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
         let len = len as usize;
 
         let mut locks = TransactionLocks::with_capacity(0, 1);
@@ -624,7 +632,7 @@ impl Driver {
         new_parent_ino: u64,
         new_name: String,
     ) -> Result<()> {
-        let mut connection = self.connect().await?;
+        let mut connection = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(2, 0);
         locks.push_exclusive(inode::Key::new(parent_ino));
@@ -707,7 +715,8 @@ impl Driver {
                 tx.update(
                     self.cfg.bucket,
                     vec![inode::remove(target.ino), inode::remove_link(target.ino)],
-                ).await?;
+                )
+                .await?;
             }
             _ => {}
         }
@@ -756,7 +765,7 @@ impl Driver {
         new_parent_ino: u64,
         new_name: String,
     ) -> Result<FileAttr> {
-        let mut connexion = self.connect().await?;
+        let mut connexion = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(1, 0);
         locks.push_exclusive(inode::Key::new(ino));
@@ -810,7 +819,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn read_link(&self, ino: u64) -> Result<String> {
-        let mut connexion = self.connect().await?;
+        let mut connexion = self.connect()?;
         let mut tx = connexion.transaction().await?;
 
         let mut reply = tx
@@ -834,7 +843,7 @@ impl Driver {
         name: String,
         link: String,
     ) -> Result<FileAttr> {
-        let mut connexion = self.connect().await?;
+        let mut connexion = self.connect()?;
         let ino = self.generate_ino(&mut connexion).await?;
 
         let mut locks = TransactionLocks::with_capacity(1, 0);
@@ -901,7 +910,7 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     async fn delete_later(&self, ino: u64) -> Result<bool> {
-        let mut connexion = self.connect().await?;
+        let mut connexion = self.connect()?;
 
         let mut locks = TransactionLocks::with_capacity(1, 0);
         locks.push_exclusive(inode::Key::new(ino));
@@ -960,8 +969,8 @@ impl Driver {
         Ok(ino)
     }
 
-    async fn connect(&self) -> Result<Connection> {
-        Ok(Connection::new(&self.cfg.address).await?)
+    fn connect(&self) -> Result<PoolGuard<'_>> {
+        Ok(self.pool.acquire()?)
     }
 }
 
