@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct InoCounter {
     bucket: Bucket,
     id: InstanceId,
+    counter: AtomicU64,
 }
 
 impl InoCounter {
@@ -25,14 +26,13 @@ impl InoCounter {
         Ok(Self {
             id,
             bucket,
+            counter: AtomicU64::new(next_ino),
         })
     }
 
-    pub async fn next(&self, tx: &mut Transaction<'_>) -> Result<u64, Error> {
+    pub fn next(&self) -> u64 {
         let next_ino = self.counter.fetch_sub(1, Ordering::Relaxed);
         assert!(next_ino > 1 && next_ino < (1 << 48));
-
-        self.
 
         (next_ino << 16) | self.id as u64
     }
