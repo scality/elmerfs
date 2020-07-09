@@ -13,8 +13,6 @@ use tracing::{self, debug, error, warn};
 pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
     let ttl = || time::Timespec::new(600, 0);
 
-    task::block_on(driver.configure()).unwrap();
-
     while let Ok(op) = op_receiver.recv() {
         let driver = driver.clone();
         let name = op.name();
@@ -331,10 +329,6 @@ fn handle_result_silent<U: Send>(name: &str, result: Result<U, Error>) -> Result
             warn!(name, ?errno, "system error");
             Err(errno)
         }
-        Err(Error::InoAllocFailed) => {
-            error!(name, "ino alloc error");
-            Err(Errno::ENOSPC)
-        },
     }
 }
 
@@ -355,10 +349,6 @@ fn handle_result<U: Debug + Send>(name: &str, result: Result<U, Error>) -> Resul
         Err(Error::Sys(errno)) => {
             warn!(name, ?errno, "system error");
             Err(errno)
-        }
-        Err(Error::InoAllocFailed) => {
-            error!(name, "ino alloc error");
-            Err(Errno::ENOSPC)
         }
     }
 }

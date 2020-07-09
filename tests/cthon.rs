@@ -1,4 +1,4 @@
-use elmerfs::{Bucket, Config, AddressBook};
+use elmerfs::{Bucket, Config, InstanceId, AddressBook};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -8,7 +8,9 @@ use std::time::Duration;
 use tempfile;
 use tracing::info;
 use tracing_subscriber::{self, filter::EnvFilter};
+use std::sync::Arc;
 
+const INSTANCE_ID: InstanceId = 0;
 const CHTON_PATH: &str = "vendor/cthon04/";
 const CTHON_BASIC_BUCKET: Bucket = Bucket::new(0);
 const ANTIDOTE_URL: &str = "127.0.0.1:8101";
@@ -32,9 +34,10 @@ fn cthon_basic() {
 
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
+        id: INSTANCE_ID,
         bucket: CTHON_BASIC_BUCKET,
-        addresses: AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)]),
-        use_distributed_locks: true,
+        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)])),
+        locks: true,
     };
 
     fs::create_dir_all(&tests_dir.path()).expect("failed ot create test mountpoint");
@@ -64,9 +67,10 @@ fn cthon_general() {
 
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
+        id: INSTANCE_ID,
         bucket: CTHON_BASIC_BUCKET,
-        addresses: AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)]),
-        use_distributed_locks: true,
+        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)])),
+        locks: true,
     };
 
     fs::create_dir_all(&tests_dir.path()).expect("failed ot create test mountpoint");

@@ -1,6 +1,7 @@
 use clap::{App, Arg};
-use elmerfs::{self, AddressBook, Bucket, Config};
+use elmerfs::{self, InstanceId, AddressBook, Bucket, Config};
 use tracing_subscriber::{self, filter::EnvFilter};
+use std::sync::Arc;
 
 const MAIN_BUCKET: Bucket = Bucket::new(0);
 
@@ -34,21 +35,25 @@ fn main() {
                 .multiple(true)
         )
         .arg(
-            Arg::with_name("no_distributed_locks")
-                .long("no-distributed-locks")
-                .short("nl")
-                .takes_value(false),
+            Arg::with_name("nlocks")
+            .long("no-locks")
+            .takes_value(false),
         )
+        .arg(Arg::with_name("id").long("id").value_name("ID").required(true))
         .get_matches();
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
     let addresses = args.values_of("antidote").unwrap().map(String::from).collect();
-    let use_distributed_locks = !args.is_present("no_distributed_locks");
+    let locks = !args.is_present("nlocks");
+
+    let id = args.value_of("id").unwrap();
+    let id: InstanceId = id.parse().unwrap();
 
     let cfg = Config {
+        id,
         bucket: MAIN_BUCKET,
-        addresses: AddressBook::with_addresses(addresses),
-        use_distributed_locks,
+        addresses: Arc::new(AddressBook::with_addresses(addresses)),
+        locks,
     };
 
     elmerfs::run(cfg, mountpoint);

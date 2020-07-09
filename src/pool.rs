@@ -4,6 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 use tracing::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const CONNECTION_TIMEOUT_S: u64 = 180;
 
@@ -37,13 +38,13 @@ struct AvailableConnection {
 
 #[derive(Debug)]
 pub struct ConnectionPool {
-    addresses: AddressBook,
+    addresses: Arc<AddressBook>,
     available: ArrayQueue<AvailableConnection>,
     timeout: Duration,
 }
 
 impl ConnectionPool {
-    pub fn with_capacity(addresses: AddressBook, capacity: usize) -> Self {
+    pub fn with_capacity(addresses: Arc<AddressBook>, capacity: usize) -> Self {
         ConnectionPool {
             addresses,
             available: ArrayQueue::new(capacity),

@@ -1,5 +1,6 @@
 mod dispatch;
 mod driver;
+mod ino;
 mod inode;
 mod key;
 mod op;
@@ -19,6 +20,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use time::Timespec;
 use tracing::*;
+
+pub type InstanceId = u16;
 
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
@@ -46,8 +49,8 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
 
     let bucket = cfg.bucket;
 
-    let driver = task::block_on(Driver::new(cfg, PageDriver::new(bucket, PAGE_SIZE)))
-        .expect("initalized driver");
+    let driver =
+        task::block_on(Driver::new(cfg, PageDriver::new(bucket, PAGE_SIZE))).expect("driver init");
     dispatch::drive(Arc::new(driver), op_receiver);
 }
 

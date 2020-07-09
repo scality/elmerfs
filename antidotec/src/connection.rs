@@ -47,6 +47,8 @@ pub enum Error {
     UnknownCode(#[from] MessageCodeError),
     #[error("antidote replied with an error")]
     Antidote(#[from] AntidoteError),
+    #[error("antdote replied with an error message: ({0}) {1}")]
+    AntidoteErrResp(AntidoteError, String)
 }
 
 type TxId = Vec<u8>;
@@ -107,7 +109,6 @@ impl Connection {
         })
     }
 
-    #[tracing::instrument(skip(self))]
     async fn send<P>(&mut self, request: P) -> Result<(), Error>
     where
         P: ApbMessage,
@@ -129,7 +130,6 @@ impl Connection {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
     async fn recv<R>(&mut self) -> Result<R, Error>
     where
         R: ApbMessage,
@@ -150,6 +150,15 @@ impl Connection {
 
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
         tracing::trace!(?code, message_size);
+
+        if code == ApbMessageCode::ApbErrorResp {
+            let msg: ApbErrorResp = protobuf::parse_from_bytes(&self.scratchpad[..])?;
+            
+            return Err(Error::AntidoteErrResp(
+                AntidoteError::from(msg.get_errcode()),
+                String::from_utf8_lossy(msg.get_errmsg()).into(),
+            ))
+        }
 
         if code != R::code() {
             return Err(Error::CodeMismatch {

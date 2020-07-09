@@ -193,7 +193,6 @@ mod mapping {
         let key = InodeKey::new(inode.ino);
 
         rrmap::update(key, Field::COUNT)
-            .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
             .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
             .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
