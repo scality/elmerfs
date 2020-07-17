@@ -12,6 +12,18 @@ pub mod lwwreg {
         u32::from_le_bytes(bytes)
     }
 
+    pub fn set_u16(key: impl Into<RawIdent>, x: u16) -> UpdateQuery {
+        set(key, (&x.to_le_bytes()[..]).into())
+    }
+
+    pub fn read_u16(reg: &[u8]) -> u16 {
+        assert_eq!(reg.len(), mem::size_of::<u16>());
+        let mut bytes = [0_u8; 2];
+        bytes.copy_from_slice(&reg);
+
+        u16::from_le_bytes(bytes)
+    }
+
     pub fn set_u32(key: impl Into<RawIdent>, x: u32) -> UpdateQuery {
         set(key, (&x.to_le_bytes()[..]).into())
     }

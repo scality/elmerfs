@@ -48,7 +48,7 @@ pub enum Error {
     #[error("antidote replied with an error")]
     Antidote(#[from] AntidoteError),
     #[error("antdote replied with an error message: ({0}) {1}")]
-    AntidoteErrResp(AntidoteError, String)
+    AntidoteErrResp(AntidoteError, String),
 }
 
 type TxId = Vec<u8>;
@@ -153,11 +153,11 @@ impl Connection {
 
         if code == ApbMessageCode::ApbErrorResp {
             let msg: ApbErrorResp = protobuf::parse_from_bytes(&self.scratchpad[..])?;
-            
+
             return Err(Error::AntidoteErrResp(
                 AntidoteError::from(msg.get_errcode()),
                 String::from_utf8_lossy(msg.get_errmsg()).into(),
-            ))
+            ));
         }
 
         if code != R::code() {
@@ -587,6 +587,15 @@ pub mod rrmap {
             self
         }
 
+        pub fn remove_rwset(mut self, ident: impl Into<RawIdent>) -> Self {
+            let mut key = ApbMapKey::new();
+            key.set_field_type(CRDT_type::RWSET);
+            key.set_key(ident.into());
+
+            self.removed.push(key);
+            self
+        }
+
         pub fn build(self) -> UpdateQuery {
             let mut updates = ApbMapUpdate::new();
             updates.set_updates(protobuf::RepeatedField::from(self.updates));
@@ -614,11 +623,11 @@ pub mod rrmap {
         }
     }
 
-    pub fn update(key: impl Into<RawIdent>, capacity: usize) -> UpdateBuilder {
+    pub fn update(key: impl Into<RawIdent>) -> UpdateBuilder {
         UpdateBuilder {
             key: key.into(),
-            updates: Vec::with_capacity(capacity),
-            removed: Vec::with_capacity(capacity),
+            updates: Vec::new(),
+            removed: Vec::new(),
         }
     }
 
@@ -630,12 +639,79 @@ pub mod rrmap {
     }
 }
 
+pub mod rwset {
+    use super::{
+        ApbCrdtReset, ApbSetUpdate, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
+    };
+    use std::collections::HashSet;
+    pub type RwSet = HashSet<Vec<u8>>;
+
+    pub fn reset(key: impl Into<RawIdent>) -> UpdateQuery {
+        let mut update = ApbUpdateOperation::new();
+        update.set_resetop(ApbCrdtReset::new());
+
+        UpdateQuery {
+            key: key.into(),
+            ty: CRDT_type::RWSET,
+            update,
+        }
+    }
+    pub struct UpdateBuilder {
+        key: RawIdent,
+        adds: Vec<Vec<u8>>,
+        removes: Vec<Vec<u8>>,
+    }
+
+    impl UpdateBuilder {
+        pub fn add(mut self, value: Vec<u8>) -> Self {
+            self.adds.push(value);
+            self
+        }
+
+        pub fn remove(mut self, value: Vec<u8>) -> Self {
+            self.removes.push(value);
+            self
+        }
+
+        pub fn build(self) -> UpdateQuery {
+            let mut updates = ApbSetUpdate::new();
+            updates.set_adds(protobuf::RepeatedField::from(self.adds));
+            updates.set_rems(protobuf::RepeatedField::from(self.removes));
+
+            let mut update = ApbUpdateOperation::new();
+            update.set_setop(updates);
+
+            UpdateQuery {
+                key: self.key,
+                update,
+                ty: CRDT_type::RRMAP,
+            }
+        }
+    }
+
+    pub fn update(key: impl Into<RawIdent>) -> UpdateBuilder {
+        UpdateBuilder {
+            key: key.into(),
+            adds: Vec::new(),
+            removes: Vec::new(),
+        }
+    }
+
+    pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
+        ReadQuery {
+            key: key.into(),
+            ty: CRDT_type::RWSET,
+        }
+    }
+}
+
 pub mod crdts {
     pub use super::{
         counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap, RawIdent,
+        rwset::RwSet,
     };
     use super::{ApbReadObjectResp, CRDT_type};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[derive(Debug)]
     pub enum Crdt {
@@ -643,6 +719,7 @@ pub mod crdts {
         LwwReg(LwwReg),
         MvReg(MvReg),
         GMap(GMap),
+        RwSet(RwSet),
         RrMap(RrMap),
     }
 
@@ -668,10 +745,17 @@ pub mod crdts {
             }
         }
 
-        pub fn into_rrmap(self) -> GMap {
+        pub fn into_rrmap(self) -> RrMap {
             match self {
                 Self::RrMap(m) => m,
                 _ => self.expected("rrmap"),
+            }
+        }
+
+        pub fn into_rwset(self) -> RwSet {
+            match self {
+                Self::RwSet(m) => m,
+                _ => self.expected("rwset"),
             }
         }
 
@@ -695,9 +779,21 @@ pub mod crdts {
                 CRDT_type::MVREG => MvReg(read.take_mvreg().take_values().into_vec()),
                 CRDT_type::GMAP => GMap(Self::map(read)),
                 CRDT_type::RRMAP => RrMap(Self::map(read)),
+                CRDT_type::RWSET => RwSet(Self::set(read)),
                 _ => unimplemented!(),
             }
         }
+
+        fn set(mut read: ApbReadObjectResp) -> HashSet<Vec<u8>> {
+            let entries = read.take_set().take_value();
+            let mut output = HashSet::new();
+
+            for entry in entries.into_vec() {
+                output.insert(entry);
+            }
+
+            output
+        } 
 
         fn map(mut read: ApbReadObjectResp) -> HashMap<RawIdent, Crdt> {
             let entries = read.take_map().take_entries();
