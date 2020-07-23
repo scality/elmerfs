@@ -373,6 +373,16 @@ impl ReadReply {
         }
     }
 
+    pub fn rwset(&mut self, index: usize) -> Option<crdts::RwSet> {
+        let rwset = self.object(CRDT_type::RWSET, index).unwrap().into_rwset();
+
+        if rwset.len() == 0 {
+            None
+        } else {
+            Some(rwset)
+        }
+    }
+
     fn object(&mut self, ty: CRDT_type, index: usize) -> Option<Crdt> {
         match self.objects.get_mut(index) {
             Some(slot) => slot.take().map(|o| Crdt::from_read(ty, o)),
@@ -641,7 +651,7 @@ pub mod rrmap {
 
 pub mod rwset {
     use super::{
-        ApbCrdtReset, ApbSetUpdate, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
+        ApbCrdtReset, ApbSetUpdate, ApbSetUpdate_SetOpType, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
     };
     use std::collections::HashSet;
     pub type RwSet = HashSet<Vec<u8>>;
@@ -656,27 +666,22 @@ pub mod rwset {
             update,
         }
     }
-    pub struct UpdateBuilder {
+    pub struct InsertBuilder {
         key: RawIdent,
-        adds: Vec<Vec<u8>>,
-        removes: Vec<Vec<u8>>,
+        inserts: Vec<Vec<u8>>,
     }
 
-    impl UpdateBuilder {
+    impl InsertBuilder {
         pub fn add(mut self, value: Vec<u8>) -> Self {
-            self.adds.push(value);
+            self.inserts.push(value);
             self
         }
 
-        pub fn remove(mut self, value: Vec<u8>) -> Self {
-            self.removes.push(value);
-            self
-        }
 
         pub fn build(self) -> UpdateQuery {
             let mut updates = ApbSetUpdate::new();
-            updates.set_adds(protobuf::RepeatedField::from(self.adds));
-            updates.set_rems(protobuf::RepeatedField::from(self.removes));
+            updates.set_optype(ApbSetUpdate_SetOpType::ADD);
+            updates.set_adds(protobuf::RepeatedField::from(self.inserts));
 
             let mut update = ApbUpdateOperation::new();
             update.set_setop(updates);
@@ -684,18 +689,53 @@ pub mod rwset {
             UpdateQuery {
                 key: self.key,
                 update,
-                ty: CRDT_type::RRMAP,
+                ty: CRDT_type::RWSET,
             }
         }
     }
 
-    pub fn update(key: impl Into<RawIdent>) -> UpdateBuilder {
-        UpdateBuilder {
+    pub fn insert(key: impl Into<RawIdent>) -> InsertBuilder {
+        InsertBuilder {
             key: key.into(),
-            adds: Vec::new(),
-            removes: Vec::new(),
+            inserts: Vec::new(),
         }
     }
+
+    pub struct RemoveBuilder {
+        key: RawIdent,
+        inserts: Vec<Vec<u8>>,
+    }
+
+    impl RemoveBuilder {
+        pub fn remove(mut self, value: Vec<u8>) -> Self {
+            self.inserts.push(value);
+            self
+        }
+
+
+        pub fn build(self) -> UpdateQuery {
+            let mut updates = ApbSetUpdate::new();
+            updates.set_optype(ApbSetUpdate_SetOpType::REMOVE);
+            updates.set_rems(protobuf::RepeatedField::from(self.inserts));
+
+            let mut update = ApbUpdateOperation::new();
+            update.set_setop(updates);
+
+            UpdateQuery {
+                key: self.key,
+                update,
+                ty: CRDT_type::RWSET,
+            }
+        }
+    }
+
+    pub fn remove(key: impl Into<RawIdent>) -> RemoveBuilder {
+        RemoveBuilder {
+            key: key.into(),
+            inserts: Vec::new(),
+        }
+    }
+
 
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {

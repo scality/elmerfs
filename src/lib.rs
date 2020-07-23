@@ -6,6 +6,8 @@ mod key;
 mod op;
 mod page;
 mod pool;
+mod view;
+mod dir;
 
 use crate::driver::Driver;
 use crate::op::*;
@@ -20,8 +22,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use time::Timespec;
 use tracing::*;
-
-pub type InstanceId = u16;
 
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
@@ -41,10 +41,11 @@ const OP_BUFFERING_SIZE: usize = 1024;
 /// the Rp driver.
 pub fn run(cfg: Config, mountpoint: &OsStr) {
     let mountpoint = OsString::from(mountpoint);
+    let view = cfg.view;
     let (op_sender, op_receiver) = op::sync_channel(OP_BUFFERING_SIZE);
     thread::Builder::new()
         .name("fuse".into())
-        .spawn(move || fuse(mountpoint, op_sender))
+        .spawn(move || fuse(mountpoint, view, op_sender))
         .unwrap();
 
     let bucket = cfg.bucket;
@@ -54,7 +55,7 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
     dispatch::drive(Arc::new(driver), op_receiver);
 }
 
-fn fuse(mountpoint: OsString, op_sender: op::Sender) {
+fn fuse(mountpoint: OsString, view: View, op_sender: op::Sender) {
     const RETRIES: u32 = 5;
 
     let options = ["-o", "fsname=rpfs"]
@@ -65,7 +66,7 @@ fn fuse(mountpoint: OsString, op_sender: op::Sender) {
     for _ in 0..RETRIES {
         let _umount = UmountOnDrop(mountpoint.clone());
 
-        let fs = Rpfs {
+        let fs = Elmerfs {
             op_sender: op_sender.clone(),
         };
         match fuse::mount(fs, &mountpoint, &options) {
@@ -80,6 +81,7 @@ fn fuse(mountpoint: OsString, op_sender: op::Sender) {
     }
 }
 
+
 macro_rules! check_utf8 {
     ($reply:expr, $arg:ident) => {
         match $arg.to_str() {
@@ -92,11 +94,25 @@ macro_rules! check_utf8 {
     };
 }
 
-struct Rpfs {
+macro_rules! check_name {
+    ($reply:expr, $str:ident) => {{
+        let n = check_utf8!($reply, $str);
+
+        match n.parse() {
+            Ok(name) => name,
+            Err(_) => {
+                $reply.error(Errno::EINVAL as libc::c_int);
+                return;
+            } 
+        }
+    }};
+}
+
+struct Elmerfs {
     op_sender: op::Sender,
 }
 
-impl Filesystem for Rpfs {
+impl Filesystem for Elmerfs {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let _ = self.op_sender.send(Op::GetAttr(GetAttr { reply, ino }));
     }
@@ -121,7 +137,7 @@ impl Filesystem for Rpfs {
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name = check_utf8!(reply, name);
+        let name = check_name!(reply, name);
 
         let _ = self.op_sender.send(Op::Lookup(Lookup {
             reply,
@@ -138,7 +154,7 @@ impl Filesystem for Rpfs {
         mode: u32,
         reply: ReplyEntry,
     ) {
-        let name = check_utf8!(reply, name);
+        let name = check_name!(reply, name);
 
         let _ = self.op_sender.send(Op::MkDir(MkDir {
             reply,
@@ -151,7 +167,7 @@ impl Filesystem for Rpfs {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name = check_utf8!(reply, name);
+        let name = check_name!(reply, name);
 
         let _ = self.op_sender.send(Op::RmDir(RmDir {
             reply,
@@ -169,7 +185,7 @@ impl Filesystem for Rpfs {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let name = check_utf8!(reply, name);
+        let name = check_name!(reply, name);
 
         let _ = self.op_sender.send(Op::MkNod(MkNod {
             reply,
@@ -183,7 +199,7 @@ impl Filesystem for Rpfs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name = check_utf8!(reply, name);
+        let name = check_name!(reply, name);
 
         let _ = self.op_sender.send(Op::Unlink(Unlink {
             reply,
@@ -297,8 +313,8 @@ impl Filesystem for Rpfs {
         newname: &OsStr,
         reply: ReplyEmpty,
     ) {
-        let name = check_utf8!(reply, name);
-        let new_name = check_utf8!(reply, newname);
+        let name = check_name!(reply, name);
+        let new_name = check_name!(reply, newname);
 
         let _ = self.op_sender.send(Op::Rename(Rename {
             reply,
@@ -317,7 +333,7 @@ impl Filesystem for Rpfs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let new_name = check_utf8!(reply, newname);
+        let new_name = check_name!(reply, newname);
 
         let _ = self.op_sender.send(Op::Link(Link {
             reply,
@@ -338,7 +354,7 @@ impl Filesystem for Rpfs {
         let link = link.as_os_str();
 
         let link = check_utf8!(reply, link);
-        let name = check_utf8!(reply, name);
+        let name = check_name!(reply, name);
 
         let _ = self.op_sender.send(Op::Symlink(Symlink {
             reply,

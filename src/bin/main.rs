@@ -1,5 +1,5 @@
 use clap::{App, Arg};
-use elmerfs::{self, InstanceId, AddressBook, Bucket, Config};
+use elmerfs::{self, View, AddressBook, Bucket, Config};
 use tracing_subscriber::{self, filter::EnvFilter};
 use std::sync::Arc;
 
@@ -39,18 +39,18 @@ fn main() {
             .long("no-locks")
             .takes_value(false),
         )
-        .arg(Arg::with_name("id").long("id").value_name("ID").required(true))
+        .arg(Arg::with_name("view").long("view").value_name("VIEW").required(true))
         .get_matches();
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
     let addresses = args.values_of("antidote").unwrap().map(String::from).collect();
     let locks = !args.is_present("nlocks");
 
-    let id = args.value_of("id").unwrap();
-    let id: InstanceId = id.parse().unwrap();
+    let view = args.value_of("view").unwrap();
+    let view: View = view.parse().unwrap();
 
     let cfg = Config {
-        id,
+        view,
         bucket: MAIN_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(addresses)),
         locks,

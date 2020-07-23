@@ -1,5 +1,6 @@
 use fuse::{FileAttr, FileType};
-use std::{collections::BTreeMap, convert::TryFrom, time::Duration};
+use std::{convert::TryFrom, time::Duration};
+
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -95,18 +96,16 @@ impl Inode {
     }
 }
 
-pub type DirEntries = BTreeMap<String, u64>;
-
 pub use self::mapping::{
-    decode, decode_dir, decode_link, decr_link_count, incr_link_count, read, read_dir, read_link,
-    remove, remove_dir, remove_dir_entry, set_link, update, update_dir, update_stats, remove_link,
+    decode, decode_link, decr_link_count, incr_link_count, read, read_link,
+    remove, set_link, update, update_stats, remove_link,
     InodeKey as Key, NLinkInc,
 };
 
 mod mapping {
-    use super::{DirEntries, Inode, Owner};
+    use super::{Inode, Owner};
     use crate::key::{Key, Kind};
-    use antidotec::{counter, crdts, lwwreg, mvreg, rrmap, RawIdent, ReadQuery, UpdateQuery};
+    use antidotec::{counter, crdts, lwwreg, rrmap, RawIdent, ReadQuery, UpdateQuery};
     use std::convert::TryFrom;
     use std::mem;
 
@@ -122,14 +121,8 @@ mod mapping {
         Owner = 6,
         Mode = 7,
         Size = 8,
-        DirEntries = 9,
-        NLink = 10,
-        SymlinkPath = 11,
-        _Count = 12,
-    }
-
-    impl Field {
-        const COUNT: usize = Field::_Count as usize;
+        NLink = 9,
+        SymlinkPath = 10,
     }
 
     #[derive(Debug, Copy, Clone)]
@@ -150,10 +143,6 @@ mod mapping {
                     field: Field::Struct,
                 },
             ))
-        }
-
-        pub fn dir_entries(ino: u64) -> RawIdent {
-            Self::new(ino).field(Field::DirEntries)
         }
 
         pub fn symlink(ino: u64) -> RawIdent {
@@ -192,7 +181,7 @@ mod mapping {
     pub fn update_stats(inode: &Inode) -> UpdateQuery {
         let key = InodeKey::new(inode.ino);
 
-        rrmap::update(key, Field::COUNT)
+        rrmap::update(key)
             .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
             .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
@@ -209,7 +198,7 @@ mod mapping {
     pub fn update(inode: &Inode, NLinkInc(nlink_inc): NLinkInc) -> UpdateQuery {
         let key = InodeKey::new(inode.ino);
 
-        rrmap::update(key, Field::COUNT)
+        rrmap::update(key)
             .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
             .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
@@ -225,7 +214,7 @@ mod mapping {
     pub fn incr_link_count(ino: u64, amount: u32) -> UpdateQuery {
         let key = InodeKey::new(ino);
 
-        rrmap::update(key, 1)
+        rrmap::update(key)
             .push(counter::inc(key.field(Field::NLink), amount as i32))
             .build()
     }
@@ -233,7 +222,7 @@ mod mapping {
     pub fn decr_link_count(ino: u64, amount: u32) -> UpdateQuery {
         let key = InodeKey::new(ino);
 
-        rrmap::update(key, 1)
+        rrmap::update(key)
             .push(counter::inc(key.field(Field::NLink), -(amount as i32)))
             .build()
     }
@@ -272,51 +261,6 @@ mod mapping {
 
     pub fn remove(ino: u64) -> UpdateQuery {
         rrmap::reset(InodeKey::new(ino))
-    }
-
-    pub fn read_dir(ino: u64) -> ReadQuery {
-        let key = InodeKey::new(ino).field(Field::DirEntries);
-        rrmap::get(key)
-    }
-
-    pub fn update_dir(ino: u64, entries: &DirEntries) -> UpdateQuery {
-        let key = InodeKey::new(ino);
-
-        let mut map = rrmap::update(key.field(Field::DirEntries), entries.len());
-
-        for (name, ino) in entries {
-            let name_ident = Vec::from(name.as_bytes());
-            map = map.push(mvreg::set_u64(name_ident, *ino));
-        }
-
-        map.build()
-    }
-
-    pub fn remove_dir_entry(ino: u64, name: String) -> UpdateQuery {
-        rrmap::update(InodeKey::new(ino).field(Field::DirEntries), 0)
-            .remove_mvreg(name.into_bytes())
-            .build()
-    }
-
-    pub fn remove_dir(ino: u64) -> UpdateQuery {
-        rrmap::reset(InodeKey::new(ino).field(Field::DirEntries))
-    }
-
-    pub fn decode_dir(map: crdts::RrMap) -> DirEntries {
-        let mut entries = DirEntries::new();
-        for (name_ident, ino_reg) in map {
-            let name = String::from_utf8(name_ident).unwrap();
-            let values = ino_reg.into_mvreg();
-
-            // NOTE: As of now, there shouldn't be any concurrent
-            // modification to dir entries.
-            assert_eq!(values.len(), 1);
-
-            let ino = lwwreg::read_u64(&values[0]);
-            entries.insert(name, ino);
-        }
-
-        entries
     }
 
     pub fn remove_link(ino: u64) -> UpdateQuery {

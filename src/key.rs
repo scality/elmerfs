@@ -8,6 +8,7 @@ pub enum Kind {
     Inode = 1,
     InoCounter = 2,
     Page = 3,
+    Dir = 4,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

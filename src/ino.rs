@@ -1,5 +1,5 @@
 use crate::key::{Bucket, Key, Kind};
-use crate::InstanceId;
+use crate::view::View;
 use antidotec::{counter, Error, RawIdent, Transaction};
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,24 +7,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub struct InoCounter {
     bucket: Bucket,
-    id: InstanceId,
+    view: View,
     counter: AtomicU64,
 }
 
 impl InoCounter {
-    pub fn key(id: InstanceId) -> InoCounterKey {
-        InoCounterKey::new(id)
+    pub fn key(view: View) -> InoCounterKey {
+        InoCounterKey::new(view)
     }
 
     pub async fn load(
         tx: &mut Transaction<'_>,
-        id: InstanceId,
+        view: View,
         bucket: Bucket,
     ) -> Result<Self, Error> {
-        let next_ino = Self::stored_ino(tx, id, bucket).await?;
+        let next_ino = Self::stored_ino(tx, view, bucket).await?;
 
         Ok(Self {
-            id,
+            view,
             bucket,
             counter: AtomicU64::new(next_ino),
         })
@@ -34,13 +34,13 @@ impl InoCounter {
         let next_ino = self.counter.fetch_sub(1, Ordering::Relaxed);
         assert!(next_ino > 1 && next_ino < (1 << 48));
 
-        (next_ino << 16) | self.id as u64
+        (next_ino << 16) | self.view as u64
     }
 
     pub async fn checkpoint(&self, tx: &mut Transaction<'_>) -> Result<(), Error> {
-        let key = InoCounterKey::new(self.id);
+        let key = InoCounterKey::new(self.view);
 
-        let stored = Self::stored_ino(tx, self.id, self.bucket).await?;
+        let stored = Self::stored_ino(tx, self.view, self.bucket).await?;
         let current = self.counter.load(Ordering::Relaxed);
 
         let inc = -1 * (stored.checked_sub(current).unwrap() as i32);
@@ -51,10 +51,10 @@ impl InoCounter {
 
     async fn stored_ino(
         tx: &mut Transaction<'_>,
-        id: InstanceId,
+        view: View,
         bucket: Bucket,
     ) -> Result<u64, Error> {
-        let key = InoCounterKey::new(id);
+        let key = InoCounterKey::new(view);
 
         let mut reply = tx.read(bucket, vec![counter::get(key)]).await?;
 
@@ -76,11 +76,11 @@ impl InoCounter {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct InoCounterKey(Key<InstanceId>);
+pub struct InoCounterKey(Key<View>);
 
 impl InoCounterKey {
-    pub fn new(id: InstanceId) -> Self {
-        Self(Key::new(Kind::InoCounter, id))
+    pub fn new(view: View) -> Self {
+        Self(Key::new(Kind::InoCounter, view))
     }
 }
 

@@ -1,6 +1,7 @@
 use fuse::{ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite};
 use time::Timespec;
 use crossbeam::channel;
+use crate::view::NameRef;
 
 pub type Sender = channel::Sender<Op>;
 pub type Receiver = channel::Receiver<Op>;
@@ -74,7 +75,7 @@ pub struct SetAttr {
 #[derive(Debug)]
 pub struct Lookup {
     pub reply: ReplyEntry,
-    pub name: String,
+    pub name: NameRef,
     pub parent_ino: u64,
 }
 
@@ -103,7 +104,7 @@ pub struct ReadDir {
 pub struct MkDir {
     pub reply: ReplyEntry,
     pub parent_ino: u64,
-    pub name: String,
+    pub name: NameRef,
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -113,14 +114,14 @@ pub struct MkDir {
 pub struct RmDir {
     pub reply: ReplyEmpty,
     pub parent_ino: u64,
-    pub name: String,
+    pub name: NameRef,
 }
 
 #[derive(Debug)]
 pub struct MkNod {
     pub reply: ReplyEntry,
     pub parent_ino: u64,
-    pub name: String,
+    pub name: NameRef,
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -131,7 +132,7 @@ pub struct MkNod {
 pub struct Unlink {
     pub reply: ReplyEmpty,
     pub parent_ino: u64,
-    pub name: String,
+    pub name: NameRef,
 }
 
 #[derive(Debug)]
@@ -168,8 +169,8 @@ pub struct Release {
 #[derive(Debug)]
 pub struct Rename {
     pub reply: ReplyEmpty,
-    pub name: String,
-    pub new_name: String,
+    pub name: NameRef,
+    pub new_name: NameRef,
     pub parent_ino: u64,
     pub new_parent_ino: u64,
 }
@@ -178,7 +179,7 @@ pub struct Rename {
 pub struct Link {
     pub reply: ReplyEntry,
     pub ino: u64,
-    pub new_name: String,
+    pub new_name: NameRef,
     pub new_parent_ino: u64,
 }
 
@@ -188,7 +189,7 @@ pub struct Symlink {
     pub uid: u32,
     pub gid: u32,
     pub parent_ino: u64,
-    pub name: String,
+    pub name: NameRef,
     pub link: String,
 }
 

@@ -61,7 +61,7 @@ pub(super) fn drive(driver: Arc<Driver>, op_receiver: op::Receiver) {
             }
             Op::Lookup(lookup) => {
                 task::spawn(async move {
-                    match handle_result(name, driver.lookup(lookup.parent_ino, &lookup.name).await)
+                    match handle_result(name, driver.lookup(lookup.parent_ino, lookup.name).await)
                     {
                         Ok(attrs) => {
                             let generation = 0;
