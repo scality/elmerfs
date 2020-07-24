@@ -4,6 +4,30 @@ use antidotec::RawIdent;
 use std::fmt::{self, Display};
 use std::mem::size_of;
 
+#[derive(Debug, Copy, Clone)]
+pub struct Key {
+    ino: u64,
+}
+
+impl Key {
+    fn new(ino: u64) -> Self {
+        Self { ino }
+    }
+}
+
+pub fn key(ino: u64) -> Key {
+    Key::new(ino)
+}
+
+
+impl Into<RawIdent> for Key {
+    fn into(self) -> RawIdent {
+        KeyWriter::with_capacity(Ty::Dir, size_of::<u64>())
+            .write_u64(self.ino)
+            .into()
+    }
+}
+
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Entry {
     pub name: Name,
@@ -61,29 +85,6 @@ impl Display for Name {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct Key {
-    ino: u64,
-}
-
-impl Key {
-    fn new(ino: u64) -> Self {
-        Self { ino }
-    }
-}
-
-pub fn key(ino: u64) -> Key {
-    Key::new(ino)
-}
-
-
-impl Into<RawIdent> for Key {
-    fn into(self) -> RawIdent {
-        KeyWriter::with_capacity(Ty::Dir, size_of::<u64>())
-            .write_u64(self.ino)
-            .into()
-    }
-}
 
 pub use ops::*;
 

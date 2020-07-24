@@ -1,5 +1,8 @@
+use crate::key::{Ty, KeyWriter};
 use fuse::{FileAttr, FileType};
 use std::{convert::TryFrom, time::Duration};
+use antidotec::RawIdent;
+use std::mem;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -96,83 +99,86 @@ impl Inode {
     }
 }
 
-pub use self::mapping::{
-    key, decode, decode_link, decr_link_count, incr_link_count, read, read_link, remove, remove_link,
-    set_link, update, update_stats, Key, NLinkInc,
-};
+#[derive(Debug, Copy, Clone)]
+#[repr(u8)]
+enum Field {
+    Struct = 0,
+    Kind = 1,
+    Parent = 2,
+    Atime = 3,
+    Ctime = 4,
+    Mtime = 5,
+    Owner = 6,
+    Mode = 7,
+    Size = 8,
+    NLink = 9,
+}
 
-mod mapping {
-    use super::{Inode, Owner};
-    use crate::key::{KeyWriter, Ty};
-    use antidotec::{counter, crdts, lwwreg, rrmap, RawIdent, ReadQuery, UpdateQuery};
-    use std::convert::TryFrom;
-    use std::mem;
+#[derive(Debug, Copy, Clone)]
+pub struct Key {
+    ino: u64,
+    field: Field,
+}
 
-    #[derive(Debug, Copy, Clone)]
-    #[repr(u8)]
-    enum Field {
-        Struct = 0,
-        Kind = 1,
-        Parent = 2,
-        Atime = 3,
-        Ctime = 4,
-        Mtime = 5,
-        Owner = 6,
-        Mode = 7,
-        Size = 8,
-        NLink = 9,
-        SymlinkPath = 10,
+impl Key {
+    fn new(ino: u64) -> Self {
+        Key {
+            ino,
+            field: Field::Struct,
+        }
     }
 
-    #[derive(Debug, Copy, Clone)]
-    pub struct Id {
-        ino: u64,
-        field: Field,
+    fn field(self, field: Field) -> RawIdent {
+        Key {
+            ino: self.ino,
+            field,
+        }.into()
     }
 
-    #[derive(Debug, Copy, Clone)]
-    pub struct Key(Id);
+    const fn byte_len() -> usize {
+        mem::size_of::<u8>() + mem::size_of::<u64>()
+    }
+}
 
-    impl Key {
-        fn new(ino: u64) -> Self {
-            Key(Id {
-                ino,
-                field: Field::Struct,
-            })
-        }
+pub fn key(ino: u64) -> Key {
+    Key::new(ino)
+}
 
-        pub fn symlink(ino: u64) -> RawIdent {
-            Self::new(ino).field(Field::SymlinkPath)
-        }
-
-        fn field(self, field: Field) -> RawIdent {
-            Key(Id {
-                ino: self.0.ino,
-                field,
-            })
+impl Into<RawIdent> for Key {
+    fn into(self) -> RawIdent {
+        KeyWriter::with_capacity(Ty::Inode, Self::byte_len())
+            .write_u64(self.ino)
+            .write_u8(self.field as u8)
             .into()
-        }
-
-        const fn byte_len() -> usize {
-            mem::size_of::<u8>() + mem::size_of::<u64>()
-        }
     }
+}
 
-    pub fn key(ino: u64) -> Key {
-        Key::new(ino)
-    }
 
-    impl Into<RawIdent> for Key {
-        fn into(self) -> RawIdent {
-            KeyWriter::with_capacity(Ty::Inode, Self::byte_len())
-                .write_u8(self.0.field as u8)
-                .write_u64(self.0.ino)
-                .into()
-        }
-    }
+pub use ops::*;
+
+mod ops {
+    use super::{key, Inode, Owner, Field};
+    use std::convert::TryFrom;
+    use antidotec::{rrmap, lwwreg, counter, ReadQuery, ReadReply, UpdateQuery};
 
     pub fn read(ino: u64) -> ReadQuery {
         rrmap::get(key(ino))
+    }
+    
+    pub fn create(inode: &Inode) -> UpdateQuery {
+        let key = key(inode.ino);
+    
+        rrmap::update(key)
+            .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
+            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
+            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
+            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
+            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
+            .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
+            .push(counter::inc(key.field(Field::NLink), inode.nlink as i32))
+            .build()
     }
 
     pub fn update_stats(inode: &Inode) -> UpdateQuery {
@@ -186,25 +192,6 @@ mod mapping {
             .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
             .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
             .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
-            .build()
-    }
-
-    #[derive(Debug, Copy, Clone)]
-    pub struct NLinkInc(pub i32);
-
-    pub fn update(inode: &Inode, NLinkInc(nlink_inc): NLinkInc) -> UpdateQuery {
-        let key = key(inode.ino);
-
-        rrmap::update(key)
-            .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
-            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
-            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
-            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
-            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
-            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
-            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
-            .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
-            .push(counter::inc(key.field(Field::NLink), nlink_inc))
             .build()
     }
 
@@ -224,11 +211,10 @@ mod mapping {
             .build()
     }
 
-    pub fn decode(ino: u64, mut map: crdts::RrMap) -> Inode {
+    pub fn decode(ino: u64, reply: &mut ReadReply, index: usize) -> Option<Inode> {
+        let mut map = reply.rrmap(index)?;
         let key = key(ino);
 
-        // FIXME: Add helper for decoding from a map or update the API to make
-        // it easier if it become a common pattern.
         let kind_byte =
             lwwreg::read_u8(&map.remove(&key.field(Field::Kind)).unwrap().into_lwwreg());
         let parent = map.remove(&key.field(Field::Parent)).unwrap().into_lwwreg();
@@ -242,7 +228,8 @@ mod mapping {
 
         let kind = TryFrom::try_from(kind_byte).expect("invalid code byte");
         let owner = Owner::from(lwwreg::read_u64(&owner));
-        Inode {
+        
+        Some(Inode {
             ino,
             kind,
             parent: lwwreg::read_u64(&parent),
@@ -253,29 +240,10 @@ mod mapping {
             mode: lwwreg::read_u32(&mode),
             size: lwwreg::read_u64(&size),
             nlink: nlink as u64,
-        }
+        })
     }
 
     pub fn remove(ino: u64) -> UpdateQuery {
         rrmap::reset(key(ino))
-    }
-
-    pub fn remove_link(ino: u64) -> UpdateQuery {
-        let key = key(ino).field(Field::SymlinkPath);
-        lwwreg::set(key, vec![])
-    }
-
-    pub fn read_link(ino: u64) -> ReadQuery {
-        let key = key(ino).field(Field::SymlinkPath);
-        lwwreg::get(key)
-    }
-
-    pub fn set_link(ino: u64, path: String) -> UpdateQuery {
-        let key = key(ino).field(Field::SymlinkPath);
-        lwwreg::set(key, path.into_bytes())
-    }
-
-    pub fn decode_link(reg: crdts::LwwReg) -> String {
-        String::from_utf8(reg).unwrap()
     }
 }

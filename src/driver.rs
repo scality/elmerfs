@@ -9,6 +9,7 @@ use self::page::PageWriter;
 use crate::key::Bucket;
 use crate::model::{
     dir,
+    symlink,
     inode::{self, Inode, Owner},
 };
 use crate::view::{NameRef, View};
@@ -28,15 +29,6 @@ const MAX_CONNECTIONS: usize = 32;
 const PAGE_SIZE: usize = 4 * 1024;
 
 const ENOENT: Error = Error::Sys(Errno::ENOENT);
-
-macro_rules! expect_inode {
-    ($ino:expr, $map:expr) => {
-        match $map {
-            Some(map) => inode::decode($ino, map),
-            None => return Err(Error::Sys(Errno::ENOENT)),
-        }
-    };
-}
 
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
@@ -150,13 +142,13 @@ impl Driver {
             owner: Owner { uid: 0, gid: 0 },
             mode: 0777,
             size: 0,
-            nlink: 2,
+            nlink: 3,
         };
 
         tx.update(
             cfg.bucket,
             vec![
-                inode::update(&root_inode, inode::NLinkInc(3)),
+                inode::create(&root_inode),
                 dir::create(cfg.view, ROOT_INO, ROOT_INO),
             ],
         )
@@ -200,7 +192,7 @@ impl Driver {
 
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-            let mut inode = expect_inode!(ino, reply.rrmap(0));
+            let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
@@ -244,7 +236,8 @@ impl Driver {
 
     async fn attr_of(cfg: &Config, tx: &mut Transaction<'_>, ino: u64) -> Result<FileAttr> {
         let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
-        Ok(expect_inode!(ino, reply.rrmap(0)).attr())
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+        Ok(inode.attr())
     }
 
     #[tracing::instrument(skip(self))]
@@ -298,9 +291,7 @@ impl Driver {
                 // We share the same view as when we read the directory entries
                 // as we share the same transaction. An non existing entry at
                 // this step means a bug.
-                let inode = reply.rrmap(index).unwrap();
-                let inode = inode::decode(ino, inode);
-
+                let inode = inode::decode(ino, &mut reply, index).unwrap();
                 entries.push(ReadDirEntry {
                     ino,
                     kind: inode.kind.to_file_type(),
@@ -342,8 +333,7 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
-
+            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
             let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
             if entries.contains_key(&name) {
                 return Err(Error::Sys(Errno::EEXIST));
@@ -374,7 +364,7 @@ impl Driver {
                 vec![
                     dir::add_entry(parent_ino, &dir::Entry::new(name, ino)),
                     dir::create(self.cfg.view, parent_ino, ino),
-                    inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
+                    inode::create(&inode),
                     inode::update_stats(&parent_inode),
                 ],
             )
@@ -406,7 +396,7 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
+            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
             let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
             let entry = entries.get(&name).ok_or(ENOENT)?;
 
@@ -461,9 +451,8 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent = expect_inode!(parent_ino, reply.rrmap(0));
+            let mut parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
             let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
-
             if entries.contains_key(&name) {
                 return Err(Error::Sys(Errno::EEXIST));
             }
@@ -492,7 +481,7 @@ impl Driver {
                 vec![
                     inode::update_stats(&parent),
                     dir::add_entry(parent_ino, &dir::Entry::new(name, ino)),
-                    inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
+                    inode::create(&inode),
                 ],
             )
             .await?;
@@ -523,7 +512,7 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = expect_inode!(parent_ino, reply.rrmap(0));
+            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
             let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
             let entry = entries.get(&name).ok_or(ENOENT)?;
 
@@ -569,7 +558,7 @@ impl Driver {
             .await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-        let mut inode = expect_inode!(ino, reply.rrmap(0));
+        let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
         let wrote = (offset + bytes.len() as u64).saturating_sub(inode.size);
 
@@ -595,7 +584,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-        let mut inode = expect_inode!(ino, reply.rrmap(0));
+        let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
         let mut bytes = Vec::with_capacity(len as usize);
         self.pages
@@ -633,23 +622,23 @@ impl Driver {
         })
         .await?;
 
-        let (mut parent, parent_entries, mut new_parent, new_parent_entries) = {
+        let (mut parent, mut new_parent, parent_entries, new_parent_entries) = {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
                     vec![
                         inode::read(parent_ino),
-                        dir::read(parent_ino),
                         inode::read(new_parent_ino),
+                        dir::read(parent_ino),
                         dir::read(new_parent_ino),
                     ],
                 )
                 .await?;
 
             (
-                expect_inode!(parent_ino, reply.rrmap(0)),
-                dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?,
-                expect_inode!(new_parent_ino, reply.rrmap(2)),
+                inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?,
+                inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?,
+                dir::decode(self.cfg.view, &mut reply, 2).ok_or(ENOENT)?,
                 dir::decode(self.cfg.view, &mut reply, 3).ok_or(ENOENT)?,
             )
         };
@@ -666,12 +655,9 @@ impl Driver {
             };
             let mut reply = tx.read(self.cfg.bucket, reads).await?;
 
-            let inode = expect_inode!(entry.ino, reply.rrmap(0));
+            let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
+            let target = target_entry.and_then(|e| inode::decode(e.ino, &mut reply, 1));
 
-            let target = match target_entry {
-                Some(target_entry) => Some(expect_inode!(target_entry.ino, reply.rrmap(1))),
-                None => None,
-            };
             (inode, target)
         };
         debug!(?inode, ?target);
@@ -702,7 +688,7 @@ impl Driver {
                     vec![
                         inode::remove(target.ino),
                         dir::remove_entry(new_parent_ino, target_entry),
-                        inode::remove_link(target.ino),
+                        symlink::remove(target.ino),
                     ],
                 )
                 .await?;
@@ -774,8 +760,8 @@ impl Driver {
                 )
                 .await?;
 
-            let inode = expect_inode!(ino, reply.rrmap(0));
-            let parent = expect_inode!(new_parent_ino, reply.rrmap(1));
+            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+            let parent = inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?;
             let entries = dir::decode(self.cfg.view, &mut reply, 2).ok_or(ENOENT)?;
 
             (inode, parent, entries)
@@ -809,15 +795,13 @@ impl Driver {
     pub(crate) async fn read_link(&self, ino: u64) -> Result<String> {
         let mut connection = self.pool.acquire().await?;
         let mut tx =
-            transaction!(self.cfg, connection, { shared: [inode::Key::symlink(ino)] }).await?;
+            transaction!(self.cfg, connection, { shared: [symlink::key(ino)] }).await?;
 
         let mut reply = tx
-            .read(self.cfg.bucket, vec![inode::read_link(ino)])
+            .read(self.cfg.bucket, vec![symlink::read(ino)])
             .await?;
-        let link = match reply.lwwreg(0) {
-            Some(reg) => inode::decode_link(reg),
-            None => return Err(Error::Sys(Errno::ENOENT)),
-        };
+
+        let link = symlink::decode(&mut reply, 0).ok_or(ENOENT)?;
 
         tx.commit().await?;
         Ok(link)
@@ -850,7 +834,7 @@ impl Driver {
                 )
                 .await?;
 
-            let parent = expect_inode!(parent_ino, reply.rrmap(0));
+            let parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
             let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
 
             (parent, entries)
@@ -881,10 +865,10 @@ impl Driver {
         tx.update(
             self.cfg.bucket,
             vec![
-                inode::update(&inode, inode::NLinkInc(inode.nlink as i32)),
+                inode::create(&inode),
                 inode::update_stats(&parent),
                 dir::add_entry(parent_ino, &dir::Entry::new(name, ino)),
-                inode::set_link(ino, link),
+                symlink::create(ino, link),
             ],
         )
         .await?;
@@ -902,7 +886,7 @@ impl Driver {
             let inode = {
                 let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
 
-                expect_inode!(ino, reply.rrmap(0))
+                inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?
             };
 
             let must_be_removed =
@@ -914,7 +898,7 @@ impl Driver {
                     vec![
                         inode::remove(ino),
                         dir::remove(ino),
-                        inode::remove_link(ino),
+                        symlink::remove(ino),
                     ],
                 )
                 .await?;

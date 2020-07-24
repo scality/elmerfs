@@ -9,6 +9,7 @@ pub enum Ty {
     InoCounter = 2,
     Page = 3,
     Dir = 4,
+    Symlink = 5,
 }
 
 pub struct KeyWriter {
