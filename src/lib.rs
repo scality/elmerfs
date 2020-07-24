@@ -1,16 +1,15 @@
-mod dispatch;
+mod dir;
 mod driver;
 mod ino;
 mod inode;
 mod key;
-mod op;
 mod page;
 mod pool;
 mod view;
-mod dir;
 
+use tracing_futures::Instrument;
 use crate::driver::Driver;
-use crate::op::*;
+use crate::inode::Owner;
 use crate::page::PageDriver;
 use async_std::{sync::Arc, task};
 use fuse::{Filesystem, *};
@@ -19,16 +18,15 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::thread;
 use time::Timespec;
 use tracing::*;
 
 pub use crate::driver::Config;
 pub use crate::key::Bucket;
 pub use crate::pool::AddressBook;
+pub use crate::view::View;
 
 const PAGE_SIZE: usize = 4 * 1024;
-const OP_BUFFERING_SIZE: usize = 1024;
 
 /// There is two main thread of execution to follow:
 ///
@@ -40,34 +38,22 @@ const OP_BUFFERING_SIZE: usize = 1024;
 /// them into asynchronous tasks calling into the root of the filesystem,
 /// the Rp driver.
 pub fn run(cfg: Config, mountpoint: &OsStr) {
-    let mountpoint = OsString::from(mountpoint);
-    let view = cfg.view;
-    let (op_sender, op_receiver) = op::sync_channel(OP_BUFFERING_SIZE);
-    thread::Builder::new()
-        .name("fuse".into())
-        .spawn(move || fuse(mountpoint, view, op_sender))
-        .unwrap();
-
-    let bucket = cfg.bucket;
-
-    let driver =
-        task::block_on(Driver::new(cfg, PageDriver::new(bucket, PAGE_SIZE))).expect("driver init");
-    dispatch::drive(Arc::new(driver), op_receiver);
-}
-
-fn fuse(mountpoint: OsString, view: View, op_sender: op::Sender) {
     const RETRIES: u32 = 5;
 
+    let page_driver = PageDriver::new(cfg.bucket, PAGE_SIZE);
+    let driver = task::block_on(Driver::new(cfg, page_driver)).expect("driver init");
+
+    let driver = Arc::new(driver);
     let options = ["-o", "fsname=rpfs"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
 
     for _ in 0..RETRIES {
-        let _umount = UmountOnDrop(mountpoint.clone());
+        let _umount = UmountOnDrop(mountpoint.to_os_string());
 
         let fs = Elmerfs {
-            op_sender: op_sender.clone(),
+            driver: driver.clone(),
         };
         match fuse::mount(fs, &mountpoint, &options) {
             Ok(()) => break,
@@ -80,7 +66,6 @@ fn fuse(mountpoint: OsString, view: View, op_sender: op::Sender) {
         }
     }
 }
-
 
 macro_rules! check_utf8 {
     ($reply:expr, $arg:ident) => {
@@ -103,47 +88,115 @@ macro_rules! check_name {
             Err(_) => {
                 $reply.error(Errno::EINVAL as libc::c_int);
                 return;
-            } 
+            }
         }
     }};
 }
 
+fn ttl() -> time::Timespec {
+    time::Timespec::new(600, 0)
+}
+
+macro_rules! session {
+    ($req:expr, $reply:ident, $op:expr, $ok:ident => $resp:block) => {
+        let unique = $req.unique();
+
+        let task = async move {
+            let result = $op.await;
+
+            match result {
+                Ok($ok) => {
+                    info!("ok");
+                    $resp
+                }
+                Err(error) => {
+                    error!(?error);
+
+                    match error {
+                        crate::driver::Error::Sys(errno) => {
+                            $reply.error(errno as libc::c_int);
+                        },
+                        crate::driver::Error::Antidote(_) => {
+                            $reply.error(Errno::EIO as libc::c_int);
+                        }
+                    }
+                }
+            }
+        };
+        let task = task.instrument(
+            tracing::span!(Level::TRACE, "session", id = unique)
+        );
+
+        task::spawn(task);
+    };
+
+    ($req:expr, $reply:ident, $op:expr, _ => $resp:block) => {
+        session!($req, $reply, $op, _r => $resp);
+    };
+}
+
 struct Elmerfs {
-    op_sender: op::Sender,
+    driver: Arc<Driver>,
 }
 
 impl Filesystem for Elmerfs {
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let _ = self.op_sender.send(Op::GetAttr(GetAttr { reply, ino }));
+    fn getattr(&mut self, req: &Request, ino: u64, reply: ReplyAttr) {
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.getattr(ino), attrs => {
+            reply.attr(&ttl(), &attrs);
+        });
     }
 
-    fn opendir(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
-        let _ = self.op_sender.send(Op::OpenDir(OpenDir { reply, ino }));
+    fn opendir(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.opendir(ino), _ => {
+            let flags = 0;
+            reply.opened(ino, flags);
+        });
     }
 
-    fn releasedir(&mut self, _req: &Request, ino: u64, fh: u64, _flags: u32, reply: ReplyEmpty) {
-        let _ = self
-            .op_sender
-            .send(Op::ReleaseDir(ReleaseDir { reply, fh, ino }));
+    fn releasedir(&mut self, req: &Request, ino: u64, _fh: u64, _flags: u32, reply: ReplyEmpty) {
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.opendir(ino), _ => {
+            reply.ok()
+        });
     }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
-        let _ = self.op_sender.send(Op::ReadDir(ReadDir {
-            reply,
-            fh,
-            ino,
-            offset,
-        }));
+    fn readdir(
+        &mut self,
+        req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.readdir(ino, offset), entries => {
+            for (i, entry) in entries.into_iter().enumerate() {
+                let offset = offset + i as i64 + 1;
+
+                let full = reply.add(entry.ino, offset, entry.kind, entry.name);
+                if full {
+                    break;
+                }
+            }
+
+            reply.ok();
+        });
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name = check_name!(reply, name);
+        let driver = self.driver.clone();
 
-        let _ = self.op_sender.send(Op::Lookup(Lookup {
-            reply,
-            name,
-            parent_ino: parent,
-        }));
+        session!(req, reply, driver.lookup(parent, name), attrs => {
+            let generation = 0;
+            reply.entry(&ttl(), &attrs, generation);
+        });
     }
 
     fn mkdir(
@@ -154,26 +207,26 @@ impl Filesystem for Elmerfs {
         mode: u32,
         reply: ReplyEntry,
     ) {
-        let name = check_name!(reply, name);
-
-        let _ = self.op_sender.send(Op::MkDir(MkDir {
-            reply,
-            parent_ino,
-            name,
-            mode,
-            uid: req.uid(),
+        let owner = Owner {
             gid: req.gid(),
-        }));
+            uid: req.uid(),
+        };
+        let name = check_name!(reply, name);
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.mkdir(owner, mode, parent_ino, name), attrs => {
+            let generation = 0;
+            reply.entry(&ttl(), &attrs, generation);
+        });
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = check_name!(reply, name);
+        let driver = self.driver.clone();
 
-        let _ = self.op_sender.send(Op::RmDir(RmDir {
-            reply,
-            parent_ino: parent,
-            name,
-        }));
+        session!(req, reply, driver.rmdir(parent, name), _ => {
+            reply.ok();
+        });
     }
 
     fn mknod(
@@ -186,31 +239,30 @@ impl Filesystem for Elmerfs {
         reply: ReplyEntry,
     ) {
         let name = check_name!(reply, name);
-
-        let _ = self.op_sender.send(Op::MkNod(MkNod {
-            reply,
-            parent_ino: parent,
-            name,
-            mode,
-            uid: req.uid(),
+        let owner = Owner {
             gid: req.gid(),
-            rdev,
-        }));
+            uid: req.uid(),
+        };
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.mknod(owner, mode, parent, name, rdev), attrs => {
+            let generation = 0;
+            reply.entry(&ttl(), &attrs, generation);
+        });
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = check_name!(reply, name);
+        let driver = self.driver.clone();
 
-        let _ = self.op_sender.send(Op::Unlink(Unlink {
-            reply,
-            parent_ino: parent,
-            name,
-        }));
+        session!(req, reply, driver.unlink(parent, name), _ => {
+            reply.ok();
+        });
     }
 
     fn setattr(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -218,48 +270,59 @@ impl Filesystem for Elmerfs {
         size: Option<u64>,
         atime: Option<Timespec>,
         mtime: Option<Timespec>,
-        fh: Option<u64>,
+        _fh: Option<u64>,
         _crtime: Option<Timespec>,
         _chgtime: Option<Timespec>,
         _bkuptime: Option<Timespec>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let _ = self.op_sender.send(Op::SetAttr(SetAttr {
+        let t2d = |t: time::Timespec| std::time::Duration::new(t.sec as u64, t.nsec as u32);
+        let atime = atime.map(t2d);
+        let mtime = mtime.map(t2d);
+        let driver = self.driver.clone();
+
+        session!(
+            req,
             reply,
-            ino,
-            mode,
-            uid,
-            gid,
-            size,
-            atime,
-            mtime,
-            fh,
-        }));
+            driver.setattr(ino, mode, uid, gid, size, atime, mtime),
+            attrs => {
+                reply.attr(&ttl(), &attrs);
+            }
+        );
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
-        let _ = self.op_sender.send(Op::Open(Open { reply, ino }));
+    fn open(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.open(ino), _ => {
+            let flags = 0;
+            reply.opened(ino, flags);
+        });
     }
 
     fn release(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let _ = self.op_sender.send(Op::Release(Release { reply, fh, ino }));
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.release(ino), _ => {
+            reply.ok();
+        });
     }
 
     fn write(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         data: &[u8],
         _flags: u32,
@@ -270,21 +333,19 @@ impl Filesystem for Elmerfs {
             return;
         }
         let offset = offset as u64;
+        let driver = self.driver.clone();
+        let data = Vec::from(data);
 
-        let _ = self.op_sender.send(Op::Write(Write {
-            reply,
-            ino,
-            fh,
-            offset,
-            data: Vec::from(data),
-        }));
+        session!(req, reply, driver.write(ino, &data, offset), _ => {
+            reply.written(data.len() as u32);
+        });
     }
 
     fn read(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         size: u32,
         reply: ReplyData,
@@ -294,19 +355,16 @@ impl Filesystem for Elmerfs {
             return;
         }
         let offset = offset as u64;
+        let driver = self.driver.clone();
 
-        let _ = self.op_sender.send(Op::Read(Read {
-            reply,
-            ino,
-            fh,
-            offset,
-            size,
-        }));
+        session!(req, reply, driver.read(ino, offset, size), data => {
+            reply.data(&data);
+        });
     }
 
     fn rename(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -314,33 +372,29 @@ impl Filesystem for Elmerfs {
         reply: ReplyEmpty,
     ) {
         let name = check_name!(reply, name);
-        let new_name = check_name!(reply, newname);
+        let newname = check_name!(reply, newname);
+        let driver = self.driver.clone();
 
-        let _ = self.op_sender.send(Op::Rename(Rename {
-            reply,
-            parent_ino: parent,
-            new_parent_ino: newparent,
-            name,
-            new_name,
-        }));
+        session!(req, reply, driver.rename(parent, name, newparent, newname), _ => {
+            reply.ok();
+        });
     }
 
     fn link(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         newparent: u64,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let new_name = check_name!(reply, newname);
+        let newname = check_name!(reply, newname);
+        let driver = self.driver.clone();
 
-        let _ = self.op_sender.send(Op::Link(Link {
-            reply,
-            ino,
-            new_name,
-            new_parent_ino: newparent,
-        }));
+        session!(req, reply, driver.link(ino, newparent, newname), attrs => {
+            let generation = 0;
+            reply.entry(&ttl(), &attrs, generation);
+        });
     }
 
     fn symlink(
@@ -352,22 +406,26 @@ impl Filesystem for Elmerfs {
         reply: ReplyEntry,
     ) {
         let link = link.as_os_str();
-
         let link = check_utf8!(reply, link);
         let name = check_name!(reply, name);
-
-        let _ = self.op_sender.send(Op::Symlink(Symlink {
-            reply,
-            parent_ino: parent,
-            name,
-            link,
-            uid: req.uid(),
+        let owner = Owner {
             gid: req.gid(),
-        }));
+            uid: req.uid(),
+        };
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.symlink(parent, owner, name, link), attrs => {
+            let generation = 0;
+            reply.entry(&ttl(), &attrs, generation);
+        });
     }
 
-    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        let _ = self.op_sender.send(Op::ReadLink(ReadLink { reply, ino }));
+    fn readlink(&mut self, req: &Request, ino: u64, reply: ReplyData) {
+        let driver = self.driver.clone();
+
+        session!(req, reply, driver.read_link(ino), path => {
+            reply.data(path.as_bytes());
+        });
     }
 }
 
