@@ -1,4 +1,4 @@
-use crate::key::Kind;
+use crate::key::{KeyWriter, Ty};
 use crate::view::{Name, NameRef, View};
 use antidotec::RawIdent;
 use std::fmt::{self, Display};
@@ -67,18 +67,21 @@ pub struct Key {
 }
 
 impl Key {
-    pub fn new(ino: u64) -> Self {
+    fn new(ino: u64) -> Self {
         Self { ino }
     }
 }
 
+pub fn key(ino: u64) -> Key {
+    Key::new(ino)
+}
+
+
 impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
-        let mut ident = RawIdent::with_capacity(size_of::<Kind>() + size_of::<u64>());
-        ident.push(Kind::Dir as u8);
-        ident.extend_from_slice(&self.ino.to_le_bytes()[..]);
-
-        ident
+        KeyWriter::with_capacity(Ty::Dir, size_of::<u64>())
+            .write_u64(self.ino)
+            .into()
     }
 }
 

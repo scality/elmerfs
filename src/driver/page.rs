@@ -1,17 +1,17 @@
 use crate::driver::Result;
-use crate::key::{self, Bucket, Key};
+use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, RawIdent, Transaction};
 use std::mem;
 use std::ops::Range;
 use tracing::{self, debug};
 
 #[derive(Debug)]
-pub(crate) struct PageDriver {
+pub(crate) struct PageWriter {
     bucket: Bucket,
     page_size: usize,
 }
 
-impl PageDriver {
+impl PageWriter {
     pub fn new(bucket: Bucket, page_size: usize) -> Self {
         Self { bucket, page_size }
     }
@@ -29,13 +29,10 @@ impl PageDriver {
 
         let unaligned_len = (self.page_size - offset_in_page).min(content.len());
         let (content, remaining) = content.split_at(unaligned_len);
-
-        debug!(first_page, offset_in_page, len = unaligned_len);
         self.write_page(tx, ino, first_page as u64, offset_in_page, content)
             .await?;
 
         let extent_start = first_page + 1;
-        debug!(extent_start, len = remaining.len());
         self.write_extent(tx, ino, extent_start as u64, remaining)
             .await?;
 
@@ -53,7 +50,7 @@ impl PageDriver {
         let end = offset_in_page + content.len();
         assert!(end <= self.page_size);
 
-        let page = PageKey::new(ino, page);
+        let page = Key::new(ino, page);
         let mut page_content = {
             let mut reply = tx.read(self.bucket, vec![lwwreg::get(page)]).await?;
             reply.lwwreg(0).unwrap_or_default()
@@ -79,7 +76,7 @@ impl PageDriver {
     ) -> Result<()> {
         let mut page = extent_start;
         let writes = content.chunks_exact(self.page_size).map(|chunk| {
-            let write = lwwreg::set(PageKey::new(ino, page), chunk.into());
+            let write = lwwreg::set(Key::new(ino, page), chunk.into());
             page += 1;
 
             write
@@ -111,7 +108,6 @@ impl PageDriver {
         let offset_in_page = offset - first_page * self.page_size;
 
         let unaligned_len = (self.page_size - offset_in_page).min(len);
-        debug!(first_page, offset_in_page, len = unaligned_len);
         self.read_page(
             tx,
             ino,
@@ -143,14 +139,13 @@ impl PageDriver {
         let end = offset_in_page + len;
         assert!(end <= self.page_size);
 
-        let page = PageKey::new(ino, page);
+        let page = Key::new(ino, page);
         let page_content = {
             let mut reply = tx.read(self.bucket, vec![lwwreg::get(page)]).await?;
             reply.lwwreg(0).unwrap_or_default()
         };
 
-        let overlapping =
-            intersect_range(0..page_content.len(), offset_in_page..end);
+        let overlapping = intersect_range(0..page_content.len(), offset_in_page..end);
         output.extend_from_slice(&page_content[overlapping]);
 
         Ok(())
@@ -167,9 +162,7 @@ impl PageDriver {
         let extent_len = len.saturating_sub(1) / self.page_size + 1;
         let pages = extent_start..(extent_start + extent_len as u64);
 
-        let reads = pages
-            .clone()
-            .map(|page| lwwreg::get(PageKey::new(ino, page)));
+        let reads = pages.clone().map(|page| lwwreg::get(Key::new(ino, page)));
         let mut reply = tx.read(self.bucket, reads).await?;
 
         let mut page_index = 0;
@@ -190,32 +183,28 @@ impl PageDriver {
         Ok(())
     }
 }
-
 #[derive(Debug, Copy, Clone)]
-pub struct PageKey(Key<(u64, u64)>);
+pub struct Key {
+    ino: u64,
+    page: u64,
+}
 
-impl PageKey {
+impl Key {
     pub fn new(ino: u64, page: u64) -> Self {
-        Self(Key {
-            kind: key::Kind::Page,
-            payload: (ino, page),
-        })
+        Key { ino, page }
+    }
+
+    const fn byte_len() -> usize {
+        2 * mem::size_of::<u64>()
     }
 }
 
-impl Into<RawIdent> for PageKey {
+impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
-        let Self(Key {
-            payload: (ino, page),
-            kind,
-        }) = self;
-
-        let mut ident = RawIdent::with_capacity(1 + 2 * mem::size_of::<u64>());
-        ident.push(kind as u8);
-        ident.extend_from_slice(&ino.to_le_bytes()[..]);
-        ident.extend_from_slice(&page.to_le_bytes()[..]);
-
-        ident
+        KeyWriter::with_capacity(Ty::Page, Self::byte_len())
+            .write_u64(self.ino)
+            .write_u64(self.page)
+            .into()
     }
 }
 

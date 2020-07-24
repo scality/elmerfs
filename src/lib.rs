@@ -1,15 +1,10 @@
-mod dir;
+mod model;
 mod driver;
-mod ino;
-mod inode;
 mod key;
-mod page;
-mod pool;
 mod fs;
 mod view;
 
 use crate::driver::Driver;
-use crate::page::PageDriver;
 use async_std::{sync::Arc, task};
 use std::io;
 use std::process::{Command, Stdio};
@@ -17,12 +12,10 @@ use tracing::*;
 use std::ffi::{OsStr, OsString};
 use crate::fs::Elmerfs;
 
-pub use crate::driver::Config;
+pub use crate::driver::{Config, AddressBook};
 pub use crate::key::Bucket;
-pub use crate::pool::AddressBook;
 pub use crate::view::View;
 
-const PAGE_SIZE: usize = 4 * 1024;
 
 /// There is two main thread of execution to follow:
 ///
@@ -36,8 +29,7 @@ const PAGE_SIZE: usize = 4 * 1024;
 pub fn run(cfg: Config, mountpoint: &OsStr) {
     const RETRIES: u32 = 5;
 
-    let page_driver = PageDriver::new(cfg.bucket, PAGE_SIZE);
-    let driver = task::block_on(Driver::new(cfg, page_driver)).expect("driver init");
+    let driver = task::block_on(Driver::new(cfg)).expect("driver init");
 
     let driver = Arc::new(driver);
     let options = ["-o", "fsname=rpfs"]

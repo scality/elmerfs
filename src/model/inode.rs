@@ -97,14 +97,13 @@ impl Inode {
 }
 
 pub use self::mapping::{
-    decode, decode_link, decr_link_count, incr_link_count, read, read_link,
-    remove, set_link, update, update_stats, remove_link,
-    InodeKey as Key, NLinkInc,
+    key, decode, decode_link, decr_link_count, incr_link_count, read, read_link, remove, remove_link,
+    set_link, update, update_stats, Key, NLinkInc,
 };
 
 mod mapping {
     use super::{Inode, Owner};
-    use crate::key::{Key, Kind};
+    use crate::key::{KeyWriter, Ty};
     use antidotec::{counter, crdts, lwwreg, rrmap, RawIdent, ReadQuery, UpdateQuery};
     use std::convert::TryFrom;
     use std::mem;
@@ -127,22 +126,19 @@ mod mapping {
 
     #[derive(Debug, Copy, Clone)]
     pub struct Id {
-        field: Field,
         ino: u64,
+        field: Field,
     }
 
     #[derive(Debug, Copy, Clone)]
-    pub struct InodeKey(Key<Id>);
+    pub struct Key(Id);
 
-    impl InodeKey {
-        pub fn new(ino: u64) -> Self {
-            InodeKey(Key::new(
-                Kind::Inode,
-                Id {
-                    ino,
-                    field: Field::Struct,
-                },
-            ))
+    impl Key {
+        fn new(ino: u64) -> Self {
+            Key(Id {
+                ino,
+                field: Field::Struct,
+            })
         }
 
         pub fn symlink(ino: u64) -> RawIdent {
@@ -150,36 +146,37 @@ mod mapping {
         }
 
         fn field(self, field: Field) -> RawIdent {
-            InodeKey(Key::new(
-                Kind::Inode,
-                Id {
-                    ino: self.0.payload.ino,
-                    field,
-                },
-            ))
+            Key(Id {
+                ino: self.0.ino,
+                field,
+            })
             .into()
+        }
+
+        const fn byte_len() -> usize {
+            mem::size_of::<u8>() + mem::size_of::<u64>()
         }
     }
 
-    impl Into<RawIdent> for InodeKey {
+    pub fn key(ino: u64) -> Key {
+        Key::new(ino)
+    }
+
+    impl Into<RawIdent> for Key {
         fn into(self) -> RawIdent {
-            let mut ident = RawIdent::with_capacity(mem::size_of::<Self>());
-            ident.push(self.0.kind as u8);
-            ident.push(self.0.payload.field as u8);
-
-            let ino_bytes = self.0.payload.ino.to_le_bytes();
-            ident.extend_from_slice(&ino_bytes);
-
-            ident
+            KeyWriter::with_capacity(Ty::Inode, Self::byte_len())
+                .write_u8(self.0.field as u8)
+                .write_u64(self.0.ino)
+                .into()
         }
     }
 
     pub fn read(ino: u64) -> ReadQuery {
-        rrmap::get(InodeKey::new(ino))
+        rrmap::get(key(ino))
     }
 
     pub fn update_stats(inode: &Inode) -> UpdateQuery {
-        let key = InodeKey::new(inode.ino);
+        let key = key(inode.ino);
 
         rrmap::update(key)
             .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
@@ -196,7 +193,7 @@ mod mapping {
     pub struct NLinkInc(pub i32);
 
     pub fn update(inode: &Inode, NLinkInc(nlink_inc): NLinkInc) -> UpdateQuery {
-        let key = InodeKey::new(inode.ino);
+        let key = key(inode.ino);
 
         rrmap::update(key)
             .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
@@ -212,7 +209,7 @@ mod mapping {
     }
 
     pub fn incr_link_count(ino: u64, amount: u32) -> UpdateQuery {
-        let key = InodeKey::new(ino);
+        let key = key(ino);
 
         rrmap::update(key)
             .push(counter::inc(key.field(Field::NLink), amount as i32))
@@ -220,7 +217,7 @@ mod mapping {
     }
 
     pub fn decr_link_count(ino: u64, amount: u32) -> UpdateQuery {
-        let key = InodeKey::new(ino);
+        let key = key(ino);
 
         rrmap::update(key)
             .push(counter::inc(key.field(Field::NLink), -(amount as i32)))
@@ -228,7 +225,7 @@ mod mapping {
     }
 
     pub fn decode(ino: u64, mut map: crdts::RrMap) -> Inode {
-        let key = InodeKey::new(ino);
+        let key = key(ino);
 
         // FIXME: Add helper for decoding from a map or update the API to make
         // it easier if it become a common pattern.
@@ -260,21 +257,21 @@ mod mapping {
     }
 
     pub fn remove(ino: u64) -> UpdateQuery {
-        rrmap::reset(InodeKey::new(ino))
+        rrmap::reset(key(ino))
     }
 
     pub fn remove_link(ino: u64) -> UpdateQuery {
-        let key = InodeKey::new(ino).field(Field::SymlinkPath);
+        let key = key(ino).field(Field::SymlinkPath);
         lwwreg::set(key, vec![])
     }
 
     pub fn read_link(ino: u64) -> ReadQuery {
-        let key = InodeKey::new(ino).field(Field::SymlinkPath);
+        let key = key(ino).field(Field::SymlinkPath);
         lwwreg::get(key)
     }
 
     pub fn set_link(ino: u64, path: String) -> UpdateQuery {
-        let key = InodeKey::new(ino).field(Field::SymlinkPath);
+        let key = key(ino).field(Field::SymlinkPath);
         lwwreg::set(key, path.into_bytes())
     }
 

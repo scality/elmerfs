@@ -1,10 +1,18 @@
-use crate::dir;
-use crate::ino::InoCounter;
-use crate::inode::{self, Inode, Owner};
+mod ino;
+mod page;
+mod pool;
+
+pub use self::pool::AddressBook;
+
+use self::ino::InoGenerator;
+use self::page::PageWriter;
 use crate::key::Bucket;
-use crate::page::PageDriver;
+use crate::model::{
+    dir,
+    inode::{self, Inode, Owner},
+};
 use crate::view::{NameRef, View};
-use crate::{pool::ConnectionPool, AddressBook};
+use self::pool::ConnectionPool;
 use antidotec::{self, Connection, Transaction, TransactionLocks};
 use async_std::sync::Arc;
 use async_std::task;
@@ -17,6 +25,7 @@ use tracing::debug;
 
 const ROOT_INO: u64 = 1;
 const MAX_CONNECTIONS: usize = 32;
+const PAGE_SIZE: usize = 4 * 1024;
 
 const ENOENT: Error = Error::Sys(Errno::ENOENT);
 
@@ -78,13 +87,14 @@ pub struct Config {
 #[derive(Debug)]
 pub(crate) struct Driver {
     cfg: Config,
-    ino_counter: Arc<InoCounter>,
+    ino_counter: Arc<InoGenerator>,
     pool: Arc<ConnectionPool>,
-    pages: PageDriver,
+    pages: PageWriter,
 }
 
 impl Driver {
-    pub async fn new(cfg: Config, pages: PageDriver) -> Result<Self> {
+    pub async fn new(cfg: Config) -> Result<Self> {
+        let pages = PageWriter::new(cfg.bucket, PAGE_SIZE);
         let pool = ConnectionPool::with_capacity(cfg.addresses.clone(), MAX_CONNECTIONS);
 
         let ino_counter = {
@@ -107,11 +117,10 @@ impl Driver {
     pub(crate) async fn load_ino_counter(
         cfg: &Config,
         connection: &mut Connection,
-    ) -> Result<InoCounter> {
-        let mut tx =
-            transaction!(cfg, connection, { exclusive: [InoCounter::key(cfg.view)] }).await?;
+    ) -> Result<InoGenerator> {
+        let mut tx = transaction!(cfg, connection, { exclusive: [ino::key(cfg.view)] }).await?;
 
-        let counter = InoCounter::load(&mut tx, cfg.view, cfg.bucket).await?;
+        let counter = InoGenerator::load(&mut tx, cfg.view, cfg.bucket).await?;
 
         tx.commit().await?;
         Ok(counter)
@@ -119,8 +128,7 @@ impl Driver {
 
     #[tracing::instrument(skip(connection))]
     pub(crate) async fn make_root(cfg: &Config, connection: &mut Connection) -> Result<()> {
-        let mut tx =
-            transaction!(cfg, connection, { exclusive: [inode::Key::new(ROOT_INO)] }).await?;
+        let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ROOT_INO)] }).await?;
 
         match Self::attr_of(cfg, &mut tx, ROOT_INO).await {
             Ok(_) => {
@@ -162,7 +170,7 @@ impl Driver {
     pub(crate) async fn getattr(&self, ino: u64) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
 
-        let mut tx = transaction!(self.cfg, connection, { shared: [inode::Key::new(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let attrs = Self::attr_of(&self.cfg, &mut tx, ino).await?;
 
@@ -188,8 +196,7 @@ impl Driver {
         }
 
         let mut connection = self.pool.acquire().await?;
-        let mut tx =
-            transaction!(self.cfg, connection, { exclusive: [inode::Key::new(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
@@ -215,10 +222,7 @@ impl Driver {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn lookup(&self, parent_ino: u64, name: NameRef) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, {
-            shared: [dir::Key::new(parent_ino)]
-        })
-        .await?;
+        let mut tx = transaction!(self.cfg, connection, { shared: [dir::key(parent_ino)] }).await?;
 
         let entries = {
             let mut reply = tx
@@ -258,7 +262,7 @@ impl Driver {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<ReadDirEntry>> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [dir::Key::new(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { shared: [dir::key(ino)] }).await?;
 
         let entries = {
             let entries = {
@@ -324,8 +328,8 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(parent_ino),
-                dir::Key::new(parent_ino)
+                inode::key(parent_ino),
+                dir::key(parent_ino)
             ]
         })
         .await?;
@@ -388,8 +392,8 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(parent_ino),
-                dir::Key::new(parent_ino)
+                inode::key(parent_ino),
+                dir::key(parent_ino)
             ]
         })
         .await?;
@@ -443,8 +447,8 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(parent_ino),
-                dir::Key::new(parent_ino)
+                inode::key(parent_ino),
+                dir::key(parent_ino)
             ]
         })
         .await?;
@@ -505,8 +509,8 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(parent_ino),
-                dir::Key::new(parent_ino)
+                inode::key(parent_ino),
+                dir::key(parent_ino)
             ]
         })
         .await?;
@@ -558,8 +562,7 @@ impl Driver {
     #[tracing::instrument(skip(self, bytes))]
     pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx =
-            transaction!(self.cfg, connection, { exclusive: [inode::Key::new(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
         self.pages
             .write(&mut tx, ino, offset as usize, bytes)
@@ -589,7 +592,7 @@ impl Driver {
 
         let len = len as usize;
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [inode::Key::new(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = expect_inode!(ino, reply.rrmap(0));
@@ -624,8 +627,8 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(parent_ino),
-                inode::Key::new(new_parent_ino)
+                inode::key(parent_ino),
+                inode::key(new_parent_ino)
             ]
         })
         .await?;
@@ -752,9 +755,9 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(ino),
-                inode::Key::new(new_parent_ino),
-                dir::Key::new(new_parent_ino)
+                inode::key(ino),
+                inode::key(new_parent_ino),
+                dir::key(new_parent_ino)
             ]
         })
         .await?;
@@ -833,8 +836,8 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
-                inode::Key::new(parent_ino),
-                dir::Key::new(parent_ino)
+                inode::key(parent_ino),
+                dir::key(parent_ino)
             ]
         })
         .await?;
@@ -894,8 +897,7 @@ impl Driver {
         #[tracing::instrument(skip(cfg, pool))]
         async fn delete_later(cfg: Config, pool: Arc<ConnectionPool>, ino: u64) -> Result<bool> {
             let mut connection = pool.acquire().await?;
-            let mut tx =
-                transaction!(cfg, connection, { exclusive: [inode::Key::new(ino)] }).await?;
+            let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
             let inode = {
                 let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
@@ -932,13 +934,12 @@ impl Driver {
         #[tracing::instrument(skip(cfg, counter, pool))]
         async fn checkpoint(
             cfg: Config,
-            counter: Arc<InoCounter>,
+            counter: Arc<InoGenerator>,
             pool: Arc<ConnectionPool>,
         ) -> Result<()> {
             let mut connection = pool.acquire().await?;
 
-            let mut tx =
-                transaction!(cfg, connection, { exclusive: [InoCounter::key(cfg.view)] }).await?;
+            let mut tx = transaction!(cfg, connection, { exclusive: [ino::key(cfg.view)] }).await?;
 
             counter.checkpoint(&mut tx).await?;
 

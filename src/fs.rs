@@ -1,7 +1,7 @@
 use time;
 use tracing_futures::Instrument;
 use crate::driver::Driver;
-use crate::inode::Owner;
+use crate::model::inode::Owner;
 use async_std::{sync::Arc, task};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};

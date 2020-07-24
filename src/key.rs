@@ -3,7 +3,7 @@ use std::mem;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Kind {
+pub enum Ty {
     Bucket = 0,
     Inode = 1,
     InoCounter = 2,
@@ -11,37 +11,62 @@ pub enum Kind {
     Dir = 4,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Key<P> {
-    pub kind: Kind,
-    pub payload: P,
+pub struct KeyWriter {
+    buffer: Vec<u8>,
 }
 
-impl<P> Key<P> {
-    pub const fn new(kind: Kind, payload: P) -> Self {
-        Self { kind, payload }
+impl KeyWriter {
+    pub fn with_capacity(ty: Ty, capacity: usize) -> Self {
+        let mut buffer = Vec::with_capacity(capacity + 1);
+        buffer.push(ty as u8);
+
+        KeyWriter { buffer }
+    }
+
+    #[inline]
+    pub fn write_u8(mut self, x: u8) -> Self {
+        self.buffer.extend_from_slice(&x.to_le_bytes()[..]);
+        self
+    }
+
+    #[inline]
+    pub fn write_u16(mut self, x: u16) -> Self {
+        self.buffer.extend_from_slice(&x.to_le_bytes()[..]);
+        self
+    }
+
+    #[inline]
+    pub fn write_u32(mut self, x: u32) -> Self {
+        self.buffer.extend_from_slice(&x.to_le_bytes()[..]);
+        self
+    }
+
+    #[inline]
+    pub fn write_u64(mut self, x: u64) -> Self {
+        self.buffer.extend_from_slice(&x.to_le_bytes()[..]);
+        self
     }
 }
 
-type Id = u32;
+impl Into<RawIdent> for KeyWriter {
+    fn into(self) -> RawIdent {
+        self.buffer
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Bucket(Key<Id>);
+pub struct Bucket(u32);
 
 impl Bucket {
-    pub const fn new(id: Id) -> Self {
-        Self(Key::new(Kind::Bucket, id))
+    pub const fn new(id: u32) -> Self {
+        Self(id)
     }
 }
 
 impl Into<RawIdent> for Bucket {
     fn into(self) -> RawIdent {
-        let mut ident = RawIdent::with_capacity(mem::size_of::<Self>());
-        ident.push(self.0.kind as u8);
-
-        let id = self.0.payload.to_le_bytes();
-        ident.extend_from_slice(&id);
-
-        ident
+        KeyWriter::with_capacity(Ty::Bucket, mem::size_of::<u32>())
+            .write_u32(self.0)
+            .into()
     }
 }

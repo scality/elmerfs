@@ -1,21 +1,17 @@
-use crate::key::{Bucket, Key, Kind};
+use crate::key::{Bucket, Ty, KeyWriter};
 use crate::view::View;
 use antidotec::{counter, Error, RawIdent, Transaction};
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
-pub struct InoCounter {
+pub struct InoGenerator {
     bucket: Bucket,
     view: View,
     counter: AtomicU64,
 }
 
-impl InoCounter {
-    pub fn key(view: View) -> InoCounterKey {
-        InoCounterKey::new(view)
-    }
-
+impl InoGenerator {
     pub async fn load(
         tx: &mut Transaction<'_>,
         view: View,
@@ -38,7 +34,7 @@ impl InoCounter {
     }
 
     pub async fn checkpoint(&self, tx: &mut Transaction<'_>) -> Result<(), Error> {
-        let key = InoCounterKey::new(self.view);
+        let key = key(self.view);
 
         let stored = Self::stored_ino(tx, self.view, self.bucket).await?;
         let current = self.counter.load(Ordering::Relaxed);
@@ -54,7 +50,7 @@ impl InoCounter {
         view: View,
         bucket: Bucket,
     ) -> Result<u64, Error> {
-        let key = InoCounterKey::new(view);
+        let key = key(view);
 
         let mut reply = tx.read(bucket, vec![counter::get(key)]).await?;
 
@@ -76,22 +72,23 @@ impl InoCounter {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct InoCounterKey(Key<View>);
+pub struct Key(View);
 
-impl InoCounterKey {
-    pub fn new(view: View) -> Self {
-        Self(Key::new(Kind::InoCounter, view))
+impl Key {
+    fn new(view: View) -> Self {
+        Self(view)
     }
 }
 
-impl Into<RawIdent> for InoCounterKey {
+pub fn key(view: View) -> Key {
+    Key::new(view)
+}
+
+impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
-        let mut ident = RawIdent::with_capacity(mem::size_of::<Self>());
-        ident.push(self.0.kind as u8);
-
-        let id = self.0.payload.to_le_bytes();
-        ident.extend_from_slice(&id);
-
-        ident
+        KeyWriter::with_capacity(Ty::InoCounter, mem::size_of::<View>())
+            .write_u16(self.0)
+            .into()
     }
 }
+
