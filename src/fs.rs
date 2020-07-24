@@ -1,5 +1,3 @@
-use time;
-use tracing_futures::Instrument;
 use crate::driver::Driver;
 use crate::model::inode::Owner;
 use async_std::{sync::Arc, task};
@@ -7,8 +5,21 @@ use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::OsStr;
 use std::path::Path;
+use time;
 use time::Timespec;
 use tracing::*;
+use tracing_futures::Instrument;
+
+macro_rules! function {
+    () => {{
+        fn f() {}
+        fn type_name_of<T>(_: T) -> &'static str {
+            std::any::type_name::<T>()
+        }
+        let name = type_name_of(f);
+        &name[..name.len() - 3]
+    }};
+}
 
 macro_rules! check_utf8 {
     ($reply:expr, $arg:ident) => {
@@ -68,7 +79,7 @@ macro_rules! session {
             }
         };
         let task = task.instrument(
-            tracing::span!(Level::INFO, "session", id = unique, uid, gid)
+            tracing::span!(Level::INFO, "session", op = function!(), id = unique, uid, gid)
         );
 
         task::spawn(task);
