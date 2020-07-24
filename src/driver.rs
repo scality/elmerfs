@@ -10,7 +10,7 @@ use crate::key::Bucket;
 use crate::model::{
     dir,
     symlink,
-    inode::{self, Inode, Owner},
+    inode::{self, Inode, Kind, Owner},
 };
 use crate::view::{NameRef, View};
 use self::pool::ConnectionPool;
@@ -254,52 +254,32 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<ReadDirEntry>> {
+        assert!(offset >= 0);
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { shared: [dir::key(ino)] }).await?;
 
         let entries = {
             let entries = {
                 let mut reply = tx.read(self.cfg.bucket, vec![dir::read(ino)]).await?;
-
-                match dir::decode(self.cfg.view, &mut reply, 0) {
-                    Some(entries) => entries,
-                    None => {
-                        tx.commit().await?;
-                        return Ok(Vec::new());
-                    }
-                }
+                dir::decode(self.cfg.view, &mut reply, 0).ok_or(ENOENT)?
             };
 
-            let mut names = Vec::with_capacity(entries.len());
-            let mut attr_reads = Vec::with_capacity(entries.len());
-
-            for entry in entries.iter() {
-                if entry.name.prefix == "." || entry.name.prefix == ".." {
-                    names.push((format!("{}", entry.name.prefix), ino));
+            let mut mapped_entries = Vec::with_capacity(entries.len());
+            for entry in entries.iter().skip(offset as usize) {
+                let name = if entry.name.prefix == "." || entry.name.prefix == ".." {
+                    format!("{}", entry.name.prefix)
                 } else {
-                    names.push((format!("{}", entry.name), ino));
-                }
-                attr_reads.push(inode::read(ino));
-            }
+                    format!("{}", entry.name)
+                };
 
-            let mut reply = tx.read(self.cfg.bucket, attr_reads).await?;
-
-            let mut entries = Vec::with_capacity(names.len());
-            assert!(offset >= 0);
-            let names = names.into_iter().enumerate().skip(offset as usize);
-            for (index, (name, ino)) in names {
-                // We share the same view as when we read the directory entries
-                // as we share the same transaction. An non existing entry at
-                // this step means a bug.
-                let inode = inode::decode(ino, &mut reply, index).unwrap();
-                entries.push(ReadDirEntry {
-                    ino,
-                    kind: inode.kind.to_file_type(),
+                mapped_entries.push(ReadDirEntry {
                     name,
+                    ino,
+                    kind: entry.kind.to_file_type(),
                 });
             }
 
-            entries
+            mapped_entries
         };
 
         tx.commit().await?;
@@ -362,7 +342,7 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    dir::add_entry(parent_ino, &dir::Entry::new(name, ino)),
+                    dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Directory)),
                     dir::create(self.cfg.view, parent_ino, ino),
                     inode::create(&inode),
                     inode::update_stats(&parent_inode),
@@ -410,7 +390,7 @@ impl Driver {
                 self.cfg.bucket,
                 vec![
                     inode::decr_link_count(entry.ino, 1),
-                    dir::remove_entry(parent_ino, &dir::Entry::new(name, entry.ino)),
+                    dir::remove_entry(parent_ino, &dir::Entry::new(name, entry.ino, Kind::Directory)),
                 ],
             )
             .await?;
@@ -480,7 +460,7 @@ impl Driver {
                 self.cfg.bucket,
                 vec![
                     inode::update_stats(&parent),
-                    dir::add_entry(parent_ino, &dir::Entry::new(name, ino)),
+                    dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Regular)),
                     inode::create(&inode),
                 ],
             )
@@ -713,7 +693,7 @@ impl Driver {
         let ino = entry.ino;
 
         let new_name = new_name.canonicalize(self.cfg.view);
-        let new_entry = &dir::Entry::new(new_name, ino);
+        let new_entry = &dir::Entry::new(new_name, ino, inode.kind);
 
         tx.update(
             self.cfg.bucket,
@@ -780,7 +760,7 @@ impl Driver {
             self.cfg.bucket,
             vec![
                 inode::update_stats(&parent),
-                dir::add_entry(new_parent_ino, &dir::Entry::new(new_name, ino)),
+                dir::add_entry(new_parent_ino, &dir::Entry::new(new_name, ino, Kind::Regular)),
                 inode::incr_link_count(ino, 1),
             ],
         )
@@ -867,7 +847,7 @@ impl Driver {
             vec![
                 inode::create(&inode),
                 inode::update_stats(&parent),
-                dir::add_entry(parent_ino, &dir::Entry::new(name, ino)),
+                dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Symlink)),
                 symlink::create(ino, link),
             ],
         )

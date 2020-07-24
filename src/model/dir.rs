@@ -1,9 +1,10 @@
 use crate::key::{KeyWriter, Ty};
+use crate::model::inode::Kind;
 use crate::view::{Name, NameRef, View};
 use antidotec::RawIdent;
 use std::fmt::{self, Display};
 use std::mem::size_of;
-
+use std::convert::TryFrom;
 #[derive(Debug, Copy, Clone)]
 pub struct Key {
     ino: u64,
@@ -19,7 +20,6 @@ pub fn key(ino: u64) -> Key {
     Key::new(ino)
 }
 
-
 impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
         KeyWriter::with_capacity(Ty::Dir, size_of::<u64>())
@@ -32,11 +32,12 @@ impl Into<RawIdent> for Key {
 pub struct Entry {
     pub name: Name,
     pub ino: u64,
+    pub kind: Kind,
 }
 
 impl Entry {
-    pub fn new(name: Name, ino: u64) -> Self {
-        Self { name, ino }
+    pub fn new(name: Name, ino: u64, kind: Kind) -> Self {
+        Self { name, ino, kind }
     }
 
     fn into_bytes(&self) -> Vec<u8> {
@@ -49,13 +50,15 @@ impl Entry {
         content.reserve(self.byte_len());
 
         content.extend_from_slice(&self.ino.to_le_bytes()[..]);
+        content.push(self.kind as u8);
         content.extend_from_slice(&self.name.view.to_le_bytes()[..]);
         content.extend_from_slice(&self.name.prefix.as_bytes());
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        let (ino_and_view, prefix) = bytes.split_at(size_of::<u64>() + size_of::<View>());
-        let (ino, view) = ino_and_view.split_at(size_of::<u64>());
+        let (ino, kind_view_prefix) = bytes.split_at(size_of::<u64>());
+        let (kind, view_prefix) = kind_view_prefix.split_at(size_of::<Kind>());
+        let (view, prefix) = view_prefix.split_at(size_of::<View>());
 
         let mut ino_bytes = [0; size_of::<u64>()];
         ino_bytes.copy_from_slice(ino);
@@ -64,9 +67,11 @@ impl Entry {
         view_bytes.copy_from_slice(view);
 
         let prefix = String::from_utf8(prefix.into()).expect("valid utf8");
+        let kind = Kind::try_from(kind[0]).unwrap();
 
         Self {
             ino: u64::from_le_bytes(ino_bytes),
+            kind,
             name: Name {
                 view: View::from_le_bytes(view_bytes),
                 prefix,
@@ -75,7 +80,7 @@ impl Entry {
     }
 
     fn byte_len(&self) -> usize {
-        self.name.prefix.len() + size_of::<View>() + size_of::<u64>()
+        self.name.prefix.len() + size_of::<View>() + size_of::<u64>() + size_of::<Kind>()
     }
 }
 
@@ -85,12 +90,12 @@ impl Display for Name {
     }
 }
 
-
 pub use ops::*;
 
 mod ops {
     use super::{DirView, Entry, Key};
     use crate::view::{Name, View};
+    use crate::model::inode::Kind;
     use antidotec::{rwset, ReadQuery, ReadReply, UpdateQuery};
 
     pub fn read(ino: u64) -> ReadQuery {
@@ -111,8 +116,8 @@ mod ops {
     }
 
     pub fn create(view: View, parent_ino: u64, ino: u64) -> UpdateQuery {
-        let dot = Entry::new(Name::new(".", view), ino);
-        let dotdot = Entry::new(Name::new("..", view), parent_ino);
+        let dot = Entry::new(Name::new(".", view), ino, Kind::Directory);
+        let dotdot = Entry::new(Name::new("..", view), parent_ino, Kind::Directory);
 
         rwset::insert(Key::new(ino))
             .add(dot.into_bytes())

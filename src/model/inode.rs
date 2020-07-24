@@ -5,7 +5,7 @@ use antidotec::RawIdent;
 use std::mem;
 
 #[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub enum Kind {
     Regular = 0,
     Directory = 1,
