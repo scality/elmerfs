@@ -43,6 +43,7 @@ fn ttl() -> time::Timespec {
 macro_rules! session {
     ($req:expr, $reply:ident, $op:expr, $ok:ident => $resp:block) => {
         let unique = $req.unique();
+        let (uid, gid) = ($req.uid(), $req.gid());
 
         let task = async move {
             let result = $op.await;
@@ -67,7 +68,7 @@ macro_rules! session {
             }
         };
         let task = task.instrument(
-            tracing::span!(Level::TRACE, "session", id = unique)
+            tracing::span!(Level::INFO, "session", id = unique, uid, gid)
         );
 
         task::spawn(task);
@@ -371,4 +372,3 @@ impl Filesystem for Elmerfs {
         });
     }
 }
-
