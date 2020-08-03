@@ -1,10 +1,10 @@
 use std::str::FromStr;
 
-const REF_SEP: char = '@';
+pub const REF_SEP: char = ':';
 
 pub type View = u16;
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Name {
     pub view: View,
     pub prefix: String,
@@ -49,4 +49,3 @@ impl FromStr for NameRef {
         Ok(Self::Exact(Name::new(prefix, view)))
     }
 }
-

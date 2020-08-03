@@ -265,15 +265,9 @@ impl Driver {
             };
 
             let mut mapped_entries = Vec::with_capacity(entries.len());
-            for entry in entries.iter().skip(offset as usize) {
-                let name = if entry.name.prefix == "." || entry.name.prefix == ".." {
-                    format!("{}", entry.name.prefix)
-                } else {
-                    format!("{}", entry.name)
-                };
-
+            for entry in entries.iter_from(offset as usize) {
                 mapped_entries.push(ReadDirEntry {
-                    name,
+                    name: entry.name.into_owned(),
                     ino,
                     kind: entry.kind.to_file_type(),
                 });
@@ -501,10 +495,11 @@ impl Driver {
             parent_inode.mtime = t;
             parent_inode.size -= 1;
 
+            let dentry = entry.into_dentry();
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    dir::remove_entry(parent_ino, entry),
+                    dir::remove_entry(parent_ino, &dentry),
                     inode::decr_link_count(entry.ino, 1),
                 ],
             )
@@ -649,12 +644,14 @@ impl Driver {
                 debug!("target is an empty dir, removing");
 
                 let target_entry = target_entry.unwrap();
+                let target_dentry = target_entry.into_dentry();
+
                 tx.update(
                     self.cfg.bucket,
                     vec![
                         inode::remove(target_entry.ino),
                         dir::remove(target_entry.ino),
-                        dir::remove_entry(new_parent_ino, target_entry),
+                        dir::remove_entry(new_parent_ino, &target_dentry),
                     ],
                 )
                 .await?;
@@ -663,11 +660,13 @@ impl Driver {
                 debug!("target is an existing link");
 
                 let target_entry = target_entry.unwrap();
+                let target_dentry = target_entry.into_dentry();
+
                 tx.update(
                     self.cfg.bucket,
                     vec![
                         inode::remove(target.ino),
-                        dir::remove_entry(new_parent_ino, target_entry),
+                        dir::remove_entry(new_parent_ino, &target_dentry),
                         symlink::remove(target.ino),
                     ],
                 )
@@ -692,8 +691,9 @@ impl Driver {
 
         let ino = entry.ino;
 
+        let dentry_to_remove = entry.into_dentry();
         let new_name = new_name.canonicalize(self.cfg.view);
-        let new_entry = &dir::Entry::new(new_name, ino, inode.kind);
+        let new_dentry = &dir::Entry::new(new_name, ino, inode.kind);
 
         tx.update(
             self.cfg.bucket,
@@ -701,8 +701,8 @@ impl Driver {
                 inode::update_stats(&parent),
                 inode::update_stats(&new_parent),
                 inode::update_stats(&inode),
-                dir::remove_entry(parent_ino, entry),
-                dir::add_entry(new_parent_ino, new_entry),
+                dir::remove_entry(parent_ino, &dentry_to_remove),
+                dir::add_entry(new_parent_ino, new_dentry),
             ],
         )
         .await?;

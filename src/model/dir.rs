@@ -2,9 +2,13 @@ use crate::key::{KeyWriter, Ty};
 use crate::model::inode::Kind;
 use crate::view::{Name, NameRef, View};
 use antidotec::RawIdent;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::mem::size_of;
-use std::convert::TryFrom;
+use std::sync::Arc;
+
 #[derive(Debug, Copy, Clone)]
 pub struct Key {
     ino: u64,
@@ -93,26 +97,61 @@ impl Display for Name {
 pub use ops::*;
 
 mod ops {
-    use super::{DirView, Entry, Key};
-    use crate::view::{Name, View};
+    use super::{DirView, Entry, EntryList, EntryView, Key};
     use crate::model::inode::Kind;
+    use crate::view::{Name, View};
     use antidotec::{rwset, ReadQuery, ReadReply, UpdateQuery};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     pub fn read(ino: u64) -> ReadQuery {
         rwset::get(Key::new(ino))
     }
 
     pub fn decode(view: View, reply: &mut ReadReply, index: usize) -> Option<DirView> {
+        use std::collections::hash_map::Entry as HashEntry;
+
         let set = reply.rwset(index)?;
 
         let mut entries = Vec::with_capacity(set.len());
+        let mut by_name: HashMap<_, EntryList> = HashMap::with_capacity(set.len());
         for encoded_entry in set {
             let entry = Entry::from_bytes(&encoded_entry);
-            entries.push(entry);
+            let prefix: Arc<str> = Arc::from(entry.name.prefix);
+
+            entries.push(EntryView {
+                ino: entry.ino,
+                prefix: prefix.clone(),
+                view: entry.name.view,
+                kind: entry.kind,
+                next: None,
+            });
+        }
+        entries.sort();
+
+        for idx in 0..entries.len() {
+            let prefix = entries[idx].prefix.clone();
+
+            match by_name.entry(prefix) {
+                HashEntry::Occupied(mut entry) => {
+                    let entry_list = entry.get_mut();
+                    entries[entry_list.tail].next = Some(idx);
+                    entry_list.tail = idx;
+                }
+                HashEntry::Vacant(entry) => {
+                    entry.insert(EntryList {
+                        head: idx,
+                        tail: idx,
+                    });
+                }
+            }
         }
 
-        entries.sort();
-        Some(DirView { view, entries })
+        Some(DirView {
+            view,
+            entries,
+            by_name,
+        })
     }
 
     pub fn create(view: View, parent_ino: u64, ino: u64) -> UpdateQuery {
@@ -140,10 +179,39 @@ mod ops {
     }
 }
 
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct EntryView {
+    pub ino: u64,
+    pub view: View,
+    pub kind: Kind,
+    pub prefix: Arc<str>,
+    next: Option<usize>,
+}
+
+impl EntryView {
+    pub fn into_dentry(&self) -> Entry {
+        Entry {
+            ino: self.ino,
+            name: Name {
+                prefix: String::from(&*self.prefix as &str),
+                view: self.view,
+            },
+            kind: self.kind,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct EntryList {
+    head: usize,
+    tail: usize,
+}
+
 #[derive(Debug)]
 pub struct DirView {
     view: View,
-    entries: Vec<Entry>,
+    entries: Vec<EntryView>,
+    by_name: HashMap<Arc<str>, EntryList>,
 }
 
 impl DirView {
@@ -151,7 +219,7 @@ impl DirView {
         self.entries.len()
     }
 
-    pub fn get(&self, name: &NameRef) -> Option<&Entry> {
+    pub fn get(&self, name: &NameRef) -> Option<&EntryView> {
         self.position(name).map(|idx| &self.entries[idx])
     }
 
@@ -159,34 +227,97 @@ impl DirView {
         self.get(name).is_some()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.iter()
+    pub fn iter_from(&self, offset: usize) -> impl Iterator<Item = EntryRef<'_>> {
+        let start = offset.min(self.entries.len());
+        Iter {
+            entries: self.entries[start..].iter(),
+            by_name: &self.by_name,
+            view: self.view,
+        }
     }
 
     fn position(&self, name: &NameRef) -> Option<usize> {
         match name {
-            NameRef::Exact(name) => self.entries.iter().position(|e| e.name == *name),
+            NameRef::Exact(name) => {
+                let entry_list = self.by_name.get(&name.prefix as &str)?;
+                self.resolve_by_view(&entry_list, name.view)
+            }
             NameRef::Partial(prefix) => {
                 /* This is simple algorithm to resolve conflicts (multiple entry with
                 the same prefix). If there is only one entry for a given prefix
                 there is no conflict so we can simply entry. Otherwise, try to
                 fetch the exact entry by using our current view */
 
-                let start = self.entries.iter().position(|e| &e.name.prefix == prefix)?;
-                let end = start
-                    + self.entries[start + 1..]
-                        .iter()
-                        .position(|e| &e.name.prefix != prefix)
-                        .map(|i| i + 1)
-                        .unwrap_or(1);
-
-                match (start..end).len() {
-                    1 => Some(start),
-                    _ => self.entries[start..end]
-                        .iter()
-                        .position(|e| e.name.view == self.view),
+                let entry_list = self.by_name.get(prefix as &str)?;
+                if entry_list.head == entry_list.tail {
+                    return Some(entry_list.head);
                 }
+
+                self.resolve_by_view(&entry_list, self.view)
             }
         }
+    }
+
+    fn resolve_by_view(&self, entry_list: &EntryList, view: View) -> Option<usize> {
+        let mut current = Some(entry_list.head);
+        while let Some(idx) = current {
+            let entry = &self.entries[idx];
+            if entry.view == view {
+                return Some(idx);
+            }
+
+            current = entry.next;
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct EntryRef<'a> {
+    pub name: Cow<'a, str>,
+    pub ino: u64,
+    pub kind: Kind,
+}
+
+pub struct Iter<'a> {
+    entries: std::slice::Iter<'a, EntryView>,
+    by_name: &'a HashMap<Arc<str>, EntryList>,
+    view: View,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = EntryRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::view::REF_SEP;
+
+        let entry = self.entries.next()?;
+        let entry_list = self.by_name[&entry.prefix];
+
+        let show_alias = entry_list.head == entry_list.tail || entry.view == self.view;
+
+        let entry = if show_alias {
+            EntryRef {
+                name: Cow::Borrowed(&*entry.prefix as &str),
+                ino: entry.ino,
+                kind: entry.kind,
+            }
+        } else {
+            let fully_qualified = format!(
+                "{prefix}{sep}{view}",
+                prefix = entry.prefix,
+                sep = REF_SEP,
+                view = entry.view
+            );
+
+            EntryRef {
+                name: Cow::Owned(fully_qualified),
+                ino: entry.ino,
+                kind: entry.kind,
+            }
+        };
+
+        Some(entry)
     }
 }
