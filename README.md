@@ -102,14 +102,14 @@ on both site, you will see the following:
 elmerfs0/dir> ls
 f
 f:1
-echo "Hello from elmerfs0' >> f
+elmerfs0/dir> echo "Hello from elmerfs0' >> f
 ```
 
 ```
 elmerfs1/dir> ls
 f
 f:0
-cat f:0
+elmerfs1/dir> cat f:0
 Hello from elmerfs0
 ```
 
