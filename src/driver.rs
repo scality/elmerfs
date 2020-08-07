@@ -379,12 +379,13 @@ impl Driver {
             parent_inode.mtime = t;
             parent_inode.size -= 1;
 
-            let name = name.canonicalize(self.cfg.view);
+            let dentry = entry.into_dentry();
             tx.update(
                 self.cfg.bucket,
                 vec![
                     inode::decr_link_count(entry.ino, 1),
-                    dir::remove_entry(parent_ino, &dir::Entry::new(name, entry.ino, Kind::Directory)),
+                    dir::remove_entry(parent_ino, &dentry),
+                    inode::update_stats(&parent_inode),
                 ],
             )
             .await?;
@@ -393,7 +394,7 @@ impl Driver {
         };
 
         tx.commit().await?;
-        self.clone().schedule_delete(ino);
+        self.schedule_delete(ino);
         Ok(())
     }
 
@@ -865,13 +866,14 @@ impl Driver {
 
             let inode = {
                 let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
-
                 inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?
             };
+            debug!(?inode);
 
             let must_be_removed =
-                (inode.kind == inode::Kind::Directory && inode.nlink == 1) || inode.nlink == 0;
+                (inode.kind == inode::Kind::Directory && inode.nlink <= 1) || inode.nlink == 0;
 
+            debug!(must_be_removed);
             if must_be_removed {
                 tx.update(
                     cfg.bucket,
