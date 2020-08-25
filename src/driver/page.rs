@@ -145,6 +145,12 @@ impl PageWriter {
             reply.lwwreg(0).unwrap_or_default()
         };
 
+        // we read a hole
+        if page_content.len() == 0 {
+            output.resize(output.len() + len, 0);
+            return Ok(())
+        }
+
         let overlapping = intersect_range(0..page_content.len(), offset_in_page..end);
         output.extend_from_slice(&page_content[overlapping]);
 
@@ -169,9 +175,16 @@ impl PageWriter {
         let mut remaining = len;
         while remaining > self.page_size {
             let content = reply.lwwreg(page_index).unwrap_or_default();
-            output.extend_from_slice(&content[..self.page_size.min(content.len())]);
 
-            remaining -= self.page_size;
+            // we read a hole
+            if content.len() == 0 {
+                output.resize(output.len() + self.page_size, 0);
+                remaining -= self.page_size;
+            } else {
+                output.extend_from_slice(&content[..content.len()]);
+                remaining -= content.len();
+            }
+
             page_index += 1;
         }
 

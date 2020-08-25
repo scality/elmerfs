@@ -562,6 +562,7 @@ impl Driver {
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
+        let len = inode.size.saturating_sub(offset).min(len as u64);
         let mut bytes = Vec::with_capacity(len as usize);
         self.pages
             .read(&mut tx, ino, offset as usize, len as usize, &mut bytes)
