@@ -2,8 +2,8 @@ elmerfs
 -------
 
 elmerfs is a filesystem that leverage **Conflict Free Replicated Data Type**
-(CRDT) on top of AntidoteDB to be eventually consistent in a active-active
-geo distributed scenario.
+[CRDT](https://crdt.tech/) on top of [AntidoteDB](https://www.antidotedb.eu/)
+to be eventually consistent in a active-active geo distributed scenario.
 
 ### Building the project
 
@@ -117,7 +117,7 @@ What is interesting here is that applications on both process will work
 seemlessly on their file without interruptions. To resolve the conflict you can
 simply rename the file.
 
-This works the same on a directories.
+This works the same on directories.
 
 #### Locking
 
@@ -139,4 +139,3 @@ The project is able to pass basics and general connectathon test suites. More
 tests will be added in the future to check concurrent update handling.
 
 Note that **concurrent update on file content** is not handled yet.
-
