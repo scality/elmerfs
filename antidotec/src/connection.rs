@@ -10,7 +10,6 @@ use protobuf::ProtobufError;
 use std::mem;
 use std::{convert::TryFrom, u32};
 use thiserror::Error;
-use tracing;
 
 #[derive(Debug, Error)]
 pub enum AntidoteError {
@@ -145,7 +144,7 @@ impl Connection {
         let message_size = u32::from_be_bytes(size_buffer);
         self.scratchpad.resize(message_size as usize, 0);
 
-        assert_eq!((&mut self.scratchpad[..]).len(), message_size as usize);
+        assert_eq!((&self.scratchpad[..]).len(), message_size as usize);
         stream.read_exact(&mut self.scratchpad[..]).await?;
 
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
@@ -186,7 +185,7 @@ impl Transaction<'_> {
         checkr!(self.connection.recv::<ApbCommitResp>().await?);
 
         /* Don't drop to avoid calling abort */
-        mem::replace(&mut self.txid, Vec::new());
+        self.txid = Vec::new();
         mem::forget(self);
 
         Ok(())
@@ -236,7 +235,7 @@ impl Transaction<'_> {
             objects: response
                 .take_objects()
                 .into_iter()
-                .map(|r| Some(r))
+                .map(Some)
                 .collect(),
         })
     }
@@ -336,7 +335,7 @@ impl ReadReply {
     pub fn lwwreg(&mut self, index: usize) -> Option<crdts::LwwReg> {
         let reg = self.object(CRDT_type::LWWREG, index).unwrap().into_lwwreg();
 
-        if reg.len() != 0 {
+        if !reg.is_empty() {
             Some(reg)
         } else {
             None
@@ -346,7 +345,7 @@ impl ReadReply {
     pub fn mvreg(&mut self, index: usize) -> Option<crdts::MvReg> {
         let reg = self.object(CRDT_type::MVREG, index).unwrap().into_mvreg();
 
-        if reg.len() != 0 {
+        if !reg.is_empty() {
             Some(reg)
         } else {
             None
@@ -356,7 +355,7 @@ impl ReadReply {
     pub fn gmap(&mut self, index: usize) -> Option<crdts::GMap> {
         let gmap = self.object(CRDT_type::GMAP, index).unwrap().into_gmap();
 
-        if gmap.len() == 0 {
+        if gmap.is_empty() {
             None
         } else {
             Some(gmap)
@@ -366,7 +365,7 @@ impl ReadReply {
     pub fn rrmap(&mut self, index: usize) -> Option<crdts::RrMap> {
         let rrmap = self.object(CRDT_type::RRMAP, index).unwrap().into_rrmap();
 
-        if rrmap.len() == 0 {
+        if rrmap.is_empty() {
             None
         } else {
             Some(rrmap)
@@ -503,7 +502,6 @@ pub mod gmap {
         ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
         ReadQuery, UpdateQuery,
     };
-    use protobuf;
     use std::collections::HashMap;
 
     pub type GMap = HashMap<RawIdent, Crdt>;
@@ -563,7 +561,6 @@ pub mod rrmap {
         ApbCrdtReset, ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type,
         RawIdent, ReadQuery, UpdateQuery,
     };
-    use protobuf;
     use std::collections::HashMap;
 
     pub type RrMap = HashMap<RawIdent, Crdt>;

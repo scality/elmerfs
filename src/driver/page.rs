@@ -120,7 +120,6 @@ impl PageWriter {
 
         let extent_start = first_page + 1;
         let remaining_len = len - unaligned_len;
-        debug!(extent_start, len = remaining_len);
         self.read_extent(tx, ino, extent_start as u64, remaining_len, output)
             .await?;
 
@@ -146,14 +145,13 @@ impl PageWriter {
         };
 
         // we read a hole
-        if page_content.len() == 0 {
+        if page_content.is_empty() {
             output.resize(output.len() + len, 0);
             return Ok(())
         }
 
         let overlapping = intersect_range(0..page_content.len(), offset_in_page..end);
         output.extend_from_slice(&page_content[overlapping]);
-
         Ok(())
     }
 
@@ -173,11 +171,11 @@ impl PageWriter {
 
         let mut page_index = 0;
         let mut remaining = len;
-        while remaining > self.page_size {
+        while remaining >= self.page_size {
             let content = reply.lwwreg(page_index).unwrap_or_default();
 
             // we read a hole
-            if content.len() == 0 {
+            if content.is_empty() {
                 output.resize(output.len() + self.page_size, 0);
                 remaining -= self.page_size;
             } else {

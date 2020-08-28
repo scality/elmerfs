@@ -54,12 +54,8 @@ impl ConnectionPool {
 
     #[instrument(skip(self))]
     pub async fn acquire(&self) -> Result<PoolGuard<'_>, Error> {
-        debug!("try to acquire a connection");
-
         if let Ok(available) = self.available.pop() {
-            let elasped = available.pushed_at.elapsed();
             if available.pushed_at.elapsed() < self.timeout {
-                debug!(age = elasped.as_secs(), "reusing connection pushed at");
                 return Ok(PoolGuard::new(self, available.connection));
             }
         }
@@ -77,8 +73,6 @@ impl ConnectionPool {
         };
 
         if let Err(PushError(entry)) = self.available.push(entry) {
-            debug!("pool is full");
-
             /* Drop the presumably an older connection */
             let _ = self.available.pop();
             let _ = self.available.push(entry);

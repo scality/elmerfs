@@ -5,7 +5,6 @@ use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::OsStr;
 use std::path::Path;
-use time;
 use time::Timespec;
 use tracing::*;
 use tracing_futures::Instrument;

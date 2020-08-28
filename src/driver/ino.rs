@@ -39,7 +39,7 @@ impl InoGenerator {
         let stored = Self::stored_ino(tx, self.view, self.bucket).await?;
         let current = self.counter.load(Ordering::Relaxed);
 
-        let inc = -1 * (stored.checked_sub(current).unwrap() as i32);
+        let inc = -(stored.checked_sub(current).unwrap() as i32);
         tx.update(self.bucket, vec![counter::inc(key, inc)]).await?;
 
         Ok(())

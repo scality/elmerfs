@@ -140,7 +140,7 @@ impl Driver {
             ctime: t,
             mtime: t,
             owner: Owner { uid: 0, gid: 0 },
-            mode: 0777,
+            mode: 0o777,
             size: 0,
             nlink: 3,
         };
@@ -223,7 +223,6 @@ impl Driver {
 
             dir::decode(self.cfg.view, &mut reply, 0).ok_or(ENOENT)?
         };
-        debug!(?entries);
 
         let attrs = match entries.get(&name) {
             Some(entry) => Self::attr_of(&self.cfg, &mut tx, entry.ino).await,
@@ -536,12 +535,12 @@ impl Driver {
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
-        let wrote = (offset + bytes.len() as u64).saturating_sub(inode.size);
+        let wrote_above_size = (offset + bytes.len() as u64).saturating_sub(inode.size);
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
-        inode.size += wrote as u64;
+        inode.size += wrote_above_size;
 
         tracing::trace!(?inode);
         tx.update(self.cfg.bucket, vec![inode::update_stats(&inode)])
@@ -553,24 +552,23 @@ impl Driver {
 
     pub(crate) async fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
         // Manual trace to avoid priting content result.
-        tracing::trace!(ino, offset, len);
-
         let len = len as usize;
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+        let end = inode.size.min(offset + len as u64);
 
-        let len = inode.size.saturating_sub(offset).min(len as u64);
-        let mut bytes = Vec::with_capacity(len as usize);
+        let truncated_len = (end - offset) as usize;
+
+        let mut bytes = Vec::with_capacity(truncated_len);
         self.pages
             .read(&mut tx, ino, offset as usize, len as usize, &mut bytes)
             .await?;
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
-        debug!(len, read_len = bytes.len(), requested_len = len);
 
         /* FIXME! Update the inode while reading fast seems to make the transaction
         fails.
@@ -619,11 +617,9 @@ impl Driver {
                 dir::decode(self.cfg.view, &mut reply, 3).ok_or(ENOENT)?,
             )
         };
-        debug!(?parent, ?parent_entries, ?new_parent, ?new_parent_entries);
 
         let entry = parent_entries.get(&name).ok_or(ENOENT)?;
         let target_entry = new_parent_entries.get(&new_name);
-        debug!(?entry, ?target_entry);
 
         let (mut inode, target) = {
             let reads = match target_entry {
@@ -637,14 +633,11 @@ impl Driver {
 
             (inode, target)
         };
-        debug!(?inode, ?target);
 
         /* Checks if target is a dir and empty. If it is the case, we have
         to delete it */
         match &target {
             Some(target) if target.kind == inode::Kind::Directory && target.size == 0 => {
-                debug!("target is an empty dir, removing");
-
                 let target_entry = target_entry.unwrap();
                 let target_dentry = target_entry.into_dentry();
 
@@ -659,8 +652,6 @@ impl Driver {
                 .await?;
             }
             Some(target) if target.nlink == 1 => {
-                debug!("target is an existing link");
-
                 let target_entry = target_entry.unwrap();
                 let target_dentry = target_entry.into_dentry();
 
@@ -689,10 +680,8 @@ impl Driver {
         parent.mtime = t;
 
         inode.atime = t;
-        debug!(?parent, ?parent_entries, ?new_parent, ?new_parent_entries);
 
         let ino = entry.ino;
-
         let dentry_to_remove = entry.into_dentry();
         let new_name = new_name.canonicalize(self.cfg.view);
         let new_dentry = &dir::Entry::new(new_name, ino, inode.kind);
@@ -835,7 +824,7 @@ impl Driver {
             ctime: t,
             mtime: t,
             owner,
-            mode: 0644,
+            mode: 0o644,
             size: link.len() as u64,
             nlink: 1,
         };
@@ -869,12 +858,10 @@ impl Driver {
                 let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
                 inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?
             };
-            debug!(?inode);
 
             let must_be_removed =
                 (inode.kind == inode::Kind::Directory && inode.nlink <= 1) || inode.nlink == 0;
 
-            debug!(must_be_removed);
             if must_be_removed {
                 tx.update(
                     cfg.bucket,

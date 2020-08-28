@@ -33,7 +33,8 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
 
     let driver = Arc::new(driver);
     let options = ["-o", "fsname=rpfs",
-                   "-o", "kernel_cache"]
+                   "-o", "kernel_cache",
+                   "-o", "direct_io"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
