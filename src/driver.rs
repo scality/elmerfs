@@ -22,7 +22,6 @@ use nix::errno::Errno;
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::debug;
 
 const ROOT_INO: u64 = 1;
 const MAX_CONNECTIONS: usize = 32;
