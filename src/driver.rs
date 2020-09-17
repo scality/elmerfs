@@ -6,14 +6,14 @@ pub use self::pool::AddressBook;
 
 use self::ino::InoGenerator;
 use self::page::PageWriter;
+use self::pool::ConnectionPool;
 use crate::key::Bucket;
 use crate::model::{
     dir,
-    symlink,
     inode::{self, Inode, Kind, Owner},
+    symlink,
 };
 use crate::view::{NameRef, View};
-use self::pool::ConnectionPool;
 use antidotec::{self, Connection, Transaction, TransactionLocks};
 use async_std::sync::Arc;
 use async_std::task;
@@ -587,14 +587,21 @@ impl Driver {
         new_parent_ino: u64,
         new_name: NameRef,
     ) -> Result<()> {
+        let parents_to_lock = self
+            .up_until_common_ancestor(parent_ino, new_parent_ino)
+            .await?;
+        tracing::trace!(?parents_to_lock);
+
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, {
-            exclusive: [
-                inode::key(parent_ino),
-                inode::key(new_parent_ino)
-            ]
-        })
-        .await?;
+        let mut tx = connection
+            .transaction_with_locks(TransactionLocks {
+                shared: vec![],
+                exclusive: parents_to_lock
+                    .into_iter()
+                    .map(|ino| dir::key(ino).into())
+                    .collect(),
+            })
+            .await?;
 
         let (mut parent, mut new_parent, parent_entries, new_parent_entries) = {
             let mut reply = tx
@@ -750,7 +757,10 @@ impl Driver {
             self.cfg.bucket,
             vec![
                 inode::update_stats(&parent),
-                dir::add_entry(new_parent_ino, &dir::Entry::new(new_name, ino, Kind::Regular)),
+                dir::add_entry(
+                    new_parent_ino,
+                    &dir::Entry::new(new_name, ino, Kind::Regular),
+                ),
                 inode::incr_link_count(ino, 1),
             ],
         )
@@ -764,12 +774,9 @@ impl Driver {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn read_link(&self, ino: u64) -> Result<String> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx =
-            transaction!(self.cfg, connection, { shared: [symlink::key(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { shared: [symlink::key(ino)] }).await?;
 
-        let mut reply = tx
-            .read(self.cfg.bucket, vec![symlink::read(ino)])
-            .await?;
+        let mut reply = tx.read(self.cfg.bucket, vec![symlink::read(ino)]).await?;
 
         let link = symlink::decode(&mut reply, 0).ok_or(ENOENT)?;
 
@@ -864,11 +871,7 @@ impl Driver {
             if must_be_removed {
                 tx.update(
                     cfg.bucket,
-                    vec![
-                        inode::remove(ino),
-                        dir::remove(ino),
-                        symlink::remove(ino),
-                    ],
+                    vec![inode::remove(ino), dir::remove(ino), symlink::remove(ino)],
                 )
                 .await?;
             }
@@ -908,6 +911,41 @@ impl Driver {
         task::spawn(checkpoint(cfg, counter, pool));
 
         Ok(ino)
+    }
+
+    pub async fn up_until_common_ancestor(
+        &self,
+        mut lhs_parent: u64,
+        mut rhs_parent: u64,
+    ) -> Result<Vec<u64>> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.transaction().await?;
+
+        let dotdot = NameRef::Partial("..".into());
+
+        let mut parents = Vec::with_capacity(1);
+        while lhs_parent != rhs_parent {
+            parents.push(lhs_parent);
+            parents.push(rhs_parent);
+
+            let mut reply = tx
+                .read(
+                    self.cfg.bucket,
+                    vec![dir::read(lhs_parent), dir::read(rhs_parent)],
+                )
+                .await?;
+
+            let lhs_entries = dir::decode(self.cfg.view, &mut reply, 0).ok_or(ENOENT)?;
+            let rhs_entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
+
+            lhs_parent = lhs_entries.get(&dotdot).unwrap().ino;
+            rhs_parent = rhs_entries.get(&dotdot).unwrap().ino;
+        }
+        assert_eq!(lhs_parent, rhs_parent);
+        parents.push(lhs_parent);
+
+        tx.commit().await?;
+        Ok(parents)
     }
 }
 
