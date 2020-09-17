@@ -3,7 +3,7 @@ use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, RawIdent, Transaction};
 use std::mem;
 use std::ops::Range;
-use tracing::{self, debug};
+use tracing;
 
 #[derive(Debug)]
 pub(crate) struct PageWriter {

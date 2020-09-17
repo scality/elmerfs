@@ -1,5 +1,5 @@
 use antidotec::{Connection, Error};
-use crossbeam::queue::{ArrayQueue, PushError};
+use crossbeam::queue::{SegQueue, PushError};
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 use tracing::*;
@@ -39,7 +39,8 @@ struct AvailableConnection {
 #[derive(Debug)]
 pub struct ConnectionPool {
     addresses: Arc<AddressBook>,
-    available: ArrayQueue<AvailableConnection>,
+    available: SegQueue<AvailableConnection>,
+    capacity: usize,
     timeout: Duration,
 }
 
@@ -47,13 +48,21 @@ impl ConnectionPool {
     pub fn with_capacity(addresses: Arc<AddressBook>, capacity: usize) -> Self {
         ConnectionPool {
             addresses,
-            available: ArrayQueue::new(capacity),
+            available: SegQueue::new(),
+            capacity,
             timeout: Duration::from_secs(CONNECTION_TIMEOUT_S),
         }
     }
 
     #[instrument(skip(self))]
     pub async fn acquire(&self) -> Result<PoolGuard<'_>, Error> {
+        while self.available.len() > self.capacity {
+            match self.available.pop() {
+                Ok(mut available) => available.connection.close().await?,
+                Err(_) => break,
+            }
+        }
+
         if let Ok(available) = self.available.pop() {
             if available.pushed_at.elapsed() < self.timeout {
                 return Ok(PoolGuard::new(self, available.connection));
@@ -72,11 +81,7 @@ impl ConnectionPool {
             connection,
         };
 
-        if let Err(PushError(entry)) = self.available.push(entry) {
-            /* Drop the presumably an older connection */
-            let _ = self.available.pop();
-            let _ = self.available.push(entry);
-        }
+        self.available.push(entry);
     }
 }
 

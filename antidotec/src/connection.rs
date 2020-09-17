@@ -4,7 +4,6 @@ use async_std::io::BufReader;
 use async_std::{
     io::{self, prelude::*},
     net::TcpStream,
-    task,
 };
 use protobuf::ProtobufError;
 use std::mem;
@@ -68,6 +67,7 @@ macro_rules! checkr {
 pub struct Connection {
     stream: TcpStream,
     scratchpad: Vec<u8>,
+    dropped: Option<TxId>,
 }
 
 impl Connection {
@@ -78,6 +78,7 @@ impl Connection {
         Ok(Self {
             stream,
             scratchpad: Vec::new(),
+            dropped: None
         })
     }
 
@@ -91,6 +92,8 @@ impl Connection {
         &mut self,
         locks: TransactionLocks,
     ) -> Result<Transaction<'_>, Error> {
+        self.abort_pending_transaction().await?;
+
         let mut transaction = ApbStartTransaction::new();
 
         let mut properties = ApbTxnProperties::default();
@@ -168,6 +171,26 @@ impl Connection {
 
         Ok(protobuf::parse_from_bytes(&self.scratchpad[1..])?)
     }
+
+    async fn abort_pending_transaction(&mut self) -> Result<(), Error> {
+        let txid = match self.dropped.take() {
+            Some(txid) => txid,
+            None => return Ok(()),
+        };
+        tracing::warn!("aborting previous transaction");
+
+        let mut message = ApbAbortTransaction::new();
+        message.set_transaction_descriptor(txid);
+
+        self.send(message).await?;
+        self.recv::<ApbBoundObject>().await?;
+
+        Ok(())
+    }
+
+    pub async fn close(&mut self) -> Result<(), Error> {
+        self.abort_pending_transaction().await
+    }
 }
 
 pub struct Transaction<'a> {
@@ -232,11 +255,7 @@ impl Transaction<'_> {
             checkr!(self.connection.recv::<ApbReadObjectsResp>().await?);
 
         Ok(ReadReply {
-            objects: response
-                .take_objects()
-                .into_iter()
-                .map(Some)
-                .collect(),
+            objects: response.take_objects().into_iter().map(Some).collect(),
         })
     }
 
@@ -275,6 +294,13 @@ impl Transaction<'_> {
     }
 }
 
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        assert!(self.connection.dropped.is_none());
+        self.connection.dropped = Some(mem::replace(&mut self.txid, Vec::new()));
+    }
+}
+
 #[derive(Debug)]
 pub struct TransactionLocks {
     pub exclusive: Vec<RawIdent>,
@@ -304,12 +330,6 @@ impl TransactionLocks {
     pub fn push_shared(&mut self, ident: impl Into<RawIdent>) -> &mut Self {
         self.shared.push(ident.into());
         self
-    }
-}
-
-impl Drop for Transaction<'_> {
-    fn drop(&mut self) {
-        let _ = task::block_on(self.abort());
     }
 }
 
@@ -648,7 +668,8 @@ pub mod rrmap {
 
 pub mod rwset {
     use super::{
-        ApbCrdtReset, ApbSetUpdate, ApbSetUpdate_SetOpType, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
+        ApbCrdtReset, ApbSetUpdate, ApbSetUpdate_SetOpType, ApbUpdateOperation, CRDT_type,
+        RawIdent, ReadQuery, UpdateQuery,
     };
     use std::collections::HashSet;
     pub type RwSet = HashSet<Vec<u8>>;
@@ -673,7 +694,6 @@ pub mod rwset {
             self.inserts.push(value);
             self
         }
-
 
         pub fn build(self) -> UpdateQuery {
             let mut updates = ApbSetUpdate::new();
@@ -709,7 +729,6 @@ pub mod rwset {
             self
         }
 
-
         pub fn build(self) -> UpdateQuery {
             let mut updates = ApbSetUpdate::new();
             updates.set_optype(ApbSetUpdate_SetOpType::REMOVE);
@@ -733,7 +752,6 @@ pub mod rwset {
         }
     }
 
-
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
@@ -744,8 +762,8 @@ pub mod rwset {
 
 pub mod crdts {
     pub use super::{
-        counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap, RawIdent,
-        rwset::RwSet,
+        counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap, rwset::RwSet,
+        RawIdent,
     };
     use super::{ApbReadObjectResp, CRDT_type};
     use std::collections::{HashMap, HashSet};
@@ -830,7 +848,7 @@ pub mod crdts {
             }
 
             output
-        } 
+        }
 
         fn map(mut read: ApbReadObjectResp) -> HashMap<RawIdent, Crdt> {
             let entries = read.take_map().take_entries();
