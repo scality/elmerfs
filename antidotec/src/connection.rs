@@ -192,15 +192,12 @@ impl Transaction<'_> {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn abort(mut self) -> Result<(), Error> {
+    async fn abort(&mut self) -> Result<(), Error> {
         let mut message = ApbAbortTransaction::new();
         message.set_transaction_descriptor(self.txid.clone());
 
         self.connection.send(message).await?;
         checkr!(self.connection.recv::<ApbOperationResp>().await?);
-
-        self.txid = Vec::new();
-        mem::forget(self);
 
         Ok(())
     }
@@ -307,6 +304,12 @@ impl TransactionLocks {
     pub fn push_shared(&mut self, ident: impl Into<RawIdent>) -> &mut Self {
         self.shared.push(ident.into());
         self
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        let _ = task::block_on(self.abort());
     }
 }
 

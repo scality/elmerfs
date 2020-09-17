@@ -29,18 +29,6 @@ const PAGE_SIZE: usize = 4 * 1024;
 
 const ENOENT: Error = Error::Sys(Errno::ENOENT);
 
-macro_rules! enoent {
-    ($tx:expr, $res:expr) => {{
-        match $res {
-            Some(x) => x,
-            None => {
-                $tx.abort().await?;
-                return Err(ENOENT);
-            }
-        }
-    }}
-}
-
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
         transaction!($cfg, { shared: [], exclusive: [] })
@@ -139,10 +127,7 @@ impl Driver {
                 return Ok(());
             }
             Err(Error::Sys(Errno::ENOENT)) => {}
-            Err(error) => {
-                tx.abort().await?;
-                return Err(error);
-            },
+            Err(error) => return Err(error),
         };
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -206,7 +191,7 @@ impl Driver {
 
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-            let mut inode = enoent!(tx, inode::decode(ino, &mut reply, 0));
+            let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
@@ -235,7 +220,7 @@ impl Driver {
                 .read(self.cfg.bucket, vec![dir::read(parent_ino)])
                 .await?;
 
-            enoent!(tx, dir::decode(self.cfg.view, &mut reply, 0))
+            dir::decode(self.cfg.view, &mut reply, 0).ok_or(ENOENT)?
         };
 
         let attrs = match entries.get(&name) {
@@ -274,7 +259,7 @@ impl Driver {
         let entries = {
             let entries = {
                 let mut reply = tx.read(self.cfg.bucket, vec![dir::read(ino)]).await?;
-                enoent!(tx, dir::decode(self.cfg.view, &mut reply, 0))
+                dir::decode(self.cfg.view, &mut reply, 0).ok_or(ENOENT)?
             };
 
             let mut mapped_entries = Vec::with_capacity(entries.len());
@@ -320,11 +305,9 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = enoent!(tx, inode::decode(parent_ino, &mut reply, 0));
-            let entries = enoent!(tx, dir::decode(self.cfg.view, &mut reply, 1));
-
+            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+            let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
             if entries.contains_key(&name) {
-                tx.abort().await?;
                 return Err(Error::Sys(Errno::EEXIST));
             }
 
@@ -385,9 +368,9 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = enoent!(tx, inode::decode(parent_ino, &mut reply, 0));
-            let entries = enoent!(tx, dir::decode(self.cfg.view, &mut reply, 1));
-            let entry = enoent!(tx, entries.get(&name));
+            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+            let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
+            let entry = entries.get(&name).ok_or(ENOENT)?;
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             parent_inode.atime = t;
@@ -441,10 +424,9 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent = enoent!(tx, inode::decode(parent_ino, &mut reply, 0));
-            let entries = enoent!(tx, dir::decode(self.cfg.view, &mut reply, 1));
+            let mut parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+            let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
             if entries.contains_key(&name) {
-                tx.abort().await?;
                 return Err(Error::Sys(Errno::EEXIST));
             }
 
@@ -503,9 +485,9 @@ impl Driver {
                 )
                 .await?;
 
-            let mut parent_inode = enoent!(tx, inode::decode(parent_ino, &mut reply, 0));
-            let entries = enoent!(tx, dir::decode(self.cfg.view, &mut reply, 1));
-            let entry = enoent!(tx, entries.get(&name));
+            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+            let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
+            let entry = entries.get(&name).ok_or(ENOENT)?;
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             parent_inode.atime = t;
@@ -550,7 +532,7 @@ impl Driver {
             .await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-        let mut inode = enoent!(tx, inode::decode(ino, &mut reply, 0));
+        let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
         let wrote_above_size = (offset + bytes.len() as u64).saturating_sub(inode.size);
 
@@ -574,7 +556,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-        let mut inode = enoent!(tx, inode::decode(ino, &mut reply, 0));
+        let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
         let end = inode.size.min(offset + len as u64);
 
         let truncated_len = (end - offset) as usize;
@@ -628,14 +610,14 @@ impl Driver {
                 .await?;
 
             (
-                enoent!(tx, inode::decode(parent_ino, &mut reply, 0)),
-                enoent!(tx, inode::decode(new_parent_ino, &mut reply, 1)),
-                enoent!(tx, dir::decode(self.cfg.view, &mut reply, 2)),
-                enoent!(tx, dir::decode(self.cfg.view, &mut reply, 3)),
+                inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?,
+                inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?,
+                dir::decode(self.cfg.view, &mut reply, 2).ok_or(ENOENT)?,
+                dir::decode(self.cfg.view, &mut reply, 3).ok_or(ENOENT)?,
             )
         };
 
-        let entry = enoent!(tx, parent_entries.get(&name));
+        let entry = parent_entries.get(&name).ok_or(ENOENT)?;
         let target_entry = new_parent_entries.get(&new_name);
 
         let (mut inode, target) = {
@@ -645,7 +627,7 @@ impl Driver {
             };
             let mut reply = tx.read(self.cfg.bucket, reads).await?;
 
-            let inode = enoent!(tx, inode::decode(entry.ino, &mut reply, 0));
+            let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
             let target = target_entry.and_then(|e| inode::decode(e.ino, &mut reply, 1));
 
             (inode, target)
@@ -748,9 +730,9 @@ impl Driver {
                 )
                 .await?;
 
-            let inode = enoent!(tx, inode::decode(ino, &mut reply, 0));
-            let parent = enoent!(tx, inode::decode(new_parent_ino, &mut reply, 1));
-            let entries = enoent!(tx, dir::decode(self.cfg.view, &mut reply, 2));
+            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+            let parent = inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?;
+            let entries = dir::decode(self.cfg.view, &mut reply, 2).ok_or(ENOENT)?;
 
             (inode, parent, entries)
         };
@@ -789,7 +771,7 @@ impl Driver {
             .read(self.cfg.bucket, vec![symlink::read(ino)])
             .await?;
 
-        let link = enoent!(tx, symlink::decode(&mut reply, 0));
+        let link = symlink::decode(&mut reply, 0).ok_or(ENOENT)?;
 
         tx.commit().await?;
         Ok(link)
@@ -822,14 +804,13 @@ impl Driver {
                 )
                 .await?;
 
-            let parent = enoent!(tx, inode::decode(parent_ino, &mut reply, 0));
-            let entries = enoent!(tx, dir::decode(self.cfg.view, &mut reply, 1));
+            let parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+            let entries = dir::decode(self.cfg.view, &mut reply, 1).ok_or(ENOENT)?;
 
             (parent, entries)
         };
 
         if entries.contains_key(&name) {
-            tx.abort().await?;
             return Err(Error::Sys(Errno::EEXIST));
         }
 
@@ -874,7 +855,7 @@ impl Driver {
 
             let inode = {
                 let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
-                enoent!(tx, inode::decode(ino, &mut reply, 0))
+                inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?
             };
 
             let must_be_removed =
@@ -912,13 +893,8 @@ impl Driver {
             let mut connection = pool.acquire().await?;
 
             let mut tx = transaction!(cfg, connection, { exclusive: [ino::key(cfg.view)] }).await?;
-            match counter.checkpoint(&mut tx).await {
-                Ok(_) => {},
-                Err(err) => {
-                    tx.abort().await?;
-                    return Err(Error::Antidote(err));
-                }
-            };
+
+            counter.checkpoint(&mut tx).await?;
 
             tx.commit().await?;
             Ok(())
