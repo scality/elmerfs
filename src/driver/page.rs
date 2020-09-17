@@ -106,8 +106,11 @@ impl PageWriter {
     ) -> Result<()> {
         let first_page = offset / self.page_size;
         let offset_in_page = offset - first_page * self.page_size;
+        tracing::info!(first_page, offset_in_page);
 
         let unaligned_len = (self.page_size - offset_in_page).min(len);
+        tracing::info!(unaligned_len);
+
         self.read_page(
             tx,
             ino,
@@ -163,14 +166,20 @@ impl PageWriter {
         len: usize,
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        let extent_len = len.saturating_sub(1) / self.page_size + 1;
+        if len == 0 {
+            return Ok(());
+        }
+
+        let extent_len = len.checked_sub(1).unwrap() / self.page_size + 1;
         let pages = extent_start..(extent_start + extent_len as u64);
+        tracing::info!(?pages);
 
         let reads = pages.clone().map(|page| lwwreg::get(Key::new(ino, page)));
         let mut reply = tx.read(self.bucket, reads).await?;
 
         let mut page_index = 0;
         let mut remaining = len;
+        tracing::info!(?page_index, remaining);
         while remaining >= self.page_size {
             let content = reply.lwwreg(page_index).unwrap_or_default();
 
@@ -184,6 +193,7 @@ impl PageWriter {
             }
 
             page_index += 1;
+            tracing::info!(?page_index, remaining);
         }
 
         if remaining > 0 {

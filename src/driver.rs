@@ -444,7 +444,7 @@ impl Driver {
                 nlink: 1,
             };
             parent.mtime = t;
-            parent.atime = t;
+            parent.ctime = t;
             parent.size += 1;
 
             let attr = inode.attr();
@@ -490,8 +490,8 @@ impl Driver {
             let entry = entries.get(&name).ok_or(ENOENT)?;
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            parent_inode.atime = t;
             parent_inode.mtime = t;
+            parent_inode.ctime = t;
             parent_inode.size -= 1;
 
             let dentry = entry.into_dentry();
@@ -539,9 +539,11 @@ impl Driver {
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
-        inode.size += wrote_above_size;
 
-        tracing::trace!(?inode);
+        let new_size = inode.size + wrote_above_size;
+        tracing::info!(old_size = inode.size, new_size);
+
+        inode.size += wrote_above_size;
         tx.update(self.cfg.bucket, vec![inode::update_stats(&inode)])
             .await?;
 
@@ -550,24 +552,32 @@ impl Driver {
     }
 
     pub(crate) async fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
-        // Manual trace to avoid priting content result.
         let len = len as usize;
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-        let end = inode.size.min(offset + len as u64);
 
-        let truncated_len = (end - offset) as usize;
+        tracing::info!(file_size=inode.size, read_end=offset+len as u64);
+        if offset > inode.size {
+            return Err(Error::Sys(Errno::EINVAL));
+        }
 
-        let mut bytes = Vec::with_capacity(truncated_len);
+        let mut bytes = Vec::with_capacity(len);
+
+        let read_end = (offset + len as u64).min(inode.size);
+        let truncated_len = read_end - offset;
+        tracing::info!(read_end, len, truncated_len);
         self.pages
-            .read(&mut tx, ino, offset as usize, len as usize, &mut bytes)
+            .read(&mut tx, ino, offset as usize, truncated_len as usize, &mut bytes)
             .await?;
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
+
+        let padding = len.saturating_sub(bytes.len());
+        bytes.resize(bytes.len() + padding, 0);
 
         /* FIXME! Update the inode while reading fast seems to make the transaction
         fails.
@@ -575,6 +585,7 @@ impl Driver {
         tx.update(self.cfg.bucket, vec![inode::update(&inode)])
           .await?; */
 
+        assert!(bytes.len() == len);
         tx.commit().await?;
         Ok(bytes)
     }

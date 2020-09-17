@@ -32,9 +32,7 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
     let driver = task::block_on(Driver::new(cfg)).expect("driver init");
 
     let driver = Arc::new(driver);
-    let options = ["-o", "fsname=rpfs",
-                   "-o", "kernel_cache",
-                   "-o", "direct_io"]
+    let options = ["-o", "fsname=rpfs"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();

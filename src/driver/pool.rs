@@ -1,5 +1,5 @@
 use antidotec::{Connection, Error};
-use crossbeam::queue::{SegQueue, PushError};
+use crossbeam::queue::SegQueue;
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 use tracing::*;

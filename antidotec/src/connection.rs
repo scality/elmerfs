@@ -183,7 +183,7 @@ impl Connection {
         message.set_transaction_descriptor(txid);
 
         self.send(message).await?;
-        self.recv::<ApbBoundObject>().await?;
+        self.recv::<ApbOperationResp>().await?;
 
         Ok(())
     }
