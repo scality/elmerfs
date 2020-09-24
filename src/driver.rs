@@ -1,10 +1,12 @@
 mod ino;
+mod lock;
 mod page;
 mod pool;
 
 pub use self::pool::AddressBook;
 
 use self::ino::InoGenerator;
+use self::lock::PageLocks;
 use self::page::PageWriter;
 use self::pool::ConnectionPool;
 use crate::key::Bucket;
@@ -81,13 +83,13 @@ pub(crate) struct Driver {
     ino_counter: Arc<InoGenerator>,
     pool: Arc<ConnectionPool>,
     pages: PageWriter,
+    page_locks: PageLocks,
 }
 
 impl Driver {
     pub async fn new(cfg: Config) -> Result<Self> {
         let pages = PageWriter::new(cfg.bucket, PAGE_SIZE);
         let pool = ConnectionPool::with_capacity(cfg.addresses.clone(), MAX_CONNECTIONS);
-
         let ino_counter = {
             let mut connection = pool.acquire().await?;
             Self::make_root(&cfg, &mut connection).await?;
@@ -101,6 +103,7 @@ impl Driver {
             ino_counter: Arc::new(ino_counter),
             pages,
             pool: Arc::new(pool),
+            page_locks: PageLocks::new(PAGE_SIZE),
         })
     }
 
@@ -185,6 +188,11 @@ impl Driver {
                 $target = $v.unwrap_or($target);
             };
         }
+        /* Note that here we don't lock any pages when truncating. It is expected
+        as while concurrent read/write or write/write to the same register
+        might lead to invalid output even if they concerns different ranges,
+        here we are discarding without being dependant on a previously read
+        value. */
 
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
@@ -192,17 +200,17 @@ impl Driver {
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
             let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-            
+
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
             update!(inode.owner.gid, gid);
             update!(inode.atime, atime);
             update!(inode.mtime, mtime);
-            
+
             let update = if let Some(new_size) = size {
                 if new_size < inode.size {
-                    tracing::info!(old_size=inode.size, new_size, "truncate");
-                    
+                    tracing::info!(old_size = inode.size, new_size, "truncate");
+
                     let remove_range = new_size..inode.size;
                     self.pages.remove(&mut tx, ino, remove_range).await?;
                 }
@@ -213,8 +221,7 @@ impl Driver {
                 inode::update_stats(&inode)
             };
 
-            tx.update(self.cfg.bucket, std::iter::once(update))
-                .await?;
+            tx.update(self.cfg.bucket, std::iter::once(update)).await?;
 
             inode
         };
@@ -537,12 +544,20 @@ impl Driver {
 
     #[tracing::instrument(skip(self, bytes))]
     pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
+        let byte_range = offset..(offset + bytes.len() as u64);
+        let lock = self.page_locks.lock(ino, byte_range).await;
+
+        let result = self.write_nolock(ino, bytes, offset).await;
+
+        self.page_locks.unlock(lock).await;
+        result
+    }
+
+    pub(crate) async fn write_nolock(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
-        self.pages
-            .write(&mut tx, ino, offset, bytes)
-            .await?;
+        self.pages.write(&mut tx, ino, offset, bytes).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
@@ -552,7 +567,7 @@ impl Driver {
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
-        
+
         let update = if wrote_above_size > 0 {
             inode.size += wrote_above_size;
 
@@ -560,13 +575,23 @@ impl Driver {
         } else {
             inode::update_stats(&inode)
         };
-        
+
         tx.update(self.cfg.bucket, std::iter::once(update)).await?;
         tx.commit().await?;
         Ok(())
     }
 
     pub(crate) async fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
+        let byte_range = offset..(offset + len as u64);
+        let lock = self.page_locks.lock(ino, byte_range).await;
+
+        let result = self.read_nolock(ino, offset, len).await;
+
+        self.page_locks.unlock(lock).await;
+        result
+    }
+
+    async fn read_nolock(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
         let len = len as usize;
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
@@ -574,7 +599,7 @@ impl Driver {
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
-        tracing::info!(file_size=inode.size, read_end=offset+len as u64);
+        tracing::info!(file_size = inode.size, read_end = offset + len as u64);
         if offset > inode.size {
             return Err(Error::Sys(Errno::EINVAL));
         }

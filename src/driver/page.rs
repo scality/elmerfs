@@ -1,17 +1,12 @@
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, RawIdent, Transaction};
-use async_std::sync::{Condvar, Mutex};
-use std::collections::HashMap;
-use std::mem;
 use std::ops::Range;
-use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct PageWriter {
     bucket: Bucket,
     page_size: u64,
-    locks: PageLocks,
 }
 
 impl PageWriter {
@@ -19,33 +14,11 @@ impl PageWriter {
         Self {
             bucket,
             page_size,
-            locks: PageLocks::new(page_size),
         }
     }
 
     #[tracing::instrument(skip(self, tx, content))]
     pub async fn write(
-        &self,
-        tx: &mut Transaction<'_>,
-        ino: u64,
-        offset: u64,
-        content: &[u8],
-    ) -> Result<()> {
-        if content.len() == 0 {
-            return Ok(());
-        }
-
-        let byte_range = offset..(offset + content.len() as u64);
-        let guard = self.locks.lock(ino, byte_range).await;
-
-        let result = self.write_nolock(tx, ino, offset, content).await;
-
-        self.locks.unlock(guard).await;
-        result
-    }
-
-    #[tracing::instrument(skip(self, tx, content))]
-    pub async fn write_nolock(
         &self,
         tx: &mut Transaction<'_>,
         ino: u64,
@@ -137,28 +110,6 @@ impl PageWriter {
 
     #[tracing::instrument(skip(self, tx, output))]
     pub async fn read(
-        &self,
-        tx: &mut Transaction<'_>,
-        ino: u64,
-        offset: u64,
-        len: u64,
-        output: &mut Vec<u8>,
-    ) -> Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-
-        let byte_range = offset..(offset + len);
-        let guard = self.locks.lock(ino, byte_range).await;
-
-        let result = self.read_nolock(tx, ino, offset, len, output).await;
-
-        self.locks.unlock(guard).await;
-        result
-    }
-
-    #[tracing::instrument(skip(self, tx, output))]
-    pub async fn read_nolock(
         &self,
         tx: &mut Transaction<'_>,
         ino: u64,
@@ -282,26 +233,6 @@ impl PageWriter {
             return Ok(());
         }
 
-        let guard = self.locks.lock(ino, range.clone()).await;
-
-        let result = self.remove_nolock(tx, ino, range).await;
-
-        self.locks.unlock(guard).await;
-        result
-    }
-
-    #[tracing::instrument(skip(tx))]
-    pub async fn remove_nolock(
-        &self,
-        tx: &mut Transaction<'_>,
-        ino: u64,
-        range: Range<u64>,
-    ) -> Result<()> {
-        let len = range.end.saturating_sub(range.start);
-        if len == 0 {
-            return Ok(());
-        }
-
         let first_page = range.start / self.page_size as u64;
         let offset_in_page = range.start - first_page * self.page_size as u64;
         tracing::info!(first_page, offset_in_page);
@@ -344,7 +275,7 @@ impl Key {
     }
 
     const fn byte_len() -> usize {
-        2 * mem::size_of::<u64>()
+        2 * std::mem::size_of::<u64>()
     }
 }
 
@@ -363,105 +294,4 @@ fn intersect_range(lhs: Range<u64>, rhs: Range<u64>) -> Range<u64> {
     }
 
     lhs.start.max(rhs.start)..lhs.end.min(rhs.end)
-}
-
-#[derive(Debug)]
-struct RangeLock {
-    used_ranges: Vec<Range<u64>>,
-    range_signal: Arc<Condvar>,
-}
-
-#[derive(Debug)]
-pub struct PageLocks {
-    page_size: u64,
-    by_ino: Mutex<HashMap<u64, RangeLock>>,
-}
-
-impl PageLocks {
-    pub fn new(page_size: u64) -> Self {
-        Self {
-            page_size,
-            by_ino: Mutex::new(HashMap::default()),
-        }
-    }
-
-    pub async fn lock(&self, ino: u64, byte_range: Range<u64>) -> RangeGuard {
-        let requested_pages = self.page_range(byte_range);
-
-        let mut by_ino = self.by_ino.lock().await;
-        by_ino.entry(ino).or_insert(RangeLock {
-            used_ranges: Vec::with_capacity(1),
-            range_signal: Arc::new(Condvar::new()),
-        });
-
-        while let Some(_) =
-            Self::intersection_position(&by_ino[&ino].used_ranges[..], &requested_pages)
-        {
-            let cond = by_ino[&ino].range_signal.clone();
-            by_ino = cond.wait(by_ino).await;
-        }
-
-        let range_lock = by_ino.get_mut(&ino).unwrap();
-
-        tracing::trace!(?requested_pages, "lock acquired");
-        range_lock.used_ranges.push(requested_pages.clone());
-
-        RangeGuard {
-            ino,
-            pages: requested_pages,
-        }
-    }
-
-    pub async fn unlock(&self, guard: RangeGuard) {
-        let ino = guard.ino;
-        let pages = guard.pages.clone();
-        mem::forget(guard);
-
-        let mut by_ino = self.by_ino.lock().await;
-        let range_lock = by_ino.get_mut(&ino).unwrap();
-
-        let ranges = &range_lock.used_ranges[..];
-        tracing::trace!(?ranges);
-
-        let index = Self::intersection_position(&range_lock.used_ranges[..], &pages).unwrap();
-        range_lock.used_ranges.swap_remove(index);
-        range_lock.range_signal.notify_all();
-
-        if range_lock.used_ranges.len() == 0 && Arc::strong_count(&range_lock.range_signal) == 1 {
-            by_ino.remove(&ino);
-        }
-    }
-
-    fn page_range(&self, byte_range: Range<u64>) -> Range<u64> {
-        let len = byte_range.end.saturating_sub(byte_range.start);
-        if len == 0 {
-            return 0..0;
-        }
-
-        let page_count = (len - 1) / self.page_size + 1;
-        let page_offset = byte_range.start / self.page_size;
-
-        page_offset..(page_offset + page_count)
-    }
-
-    fn intersection_position(ranges: &[Range<u64>], range: &Range<u64>) -> Option<usize> {
-        for (i, current) in ranges.iter().enumerate() {
-            if current.start < range.end && range.start < current.end {
-                return Some(i);
-            }
-        }
-
-        None
-    }
-}
-
-pub struct RangeGuard {
-    ino: u64,
-    pages: Range<u64>,
-}
-
-impl Drop for RangeGuard {
-    fn drop(&mut self) {
-        panic!("locked");
-    }
 }
