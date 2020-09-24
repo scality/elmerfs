@@ -14,7 +14,6 @@ impl PageWriter {
         Self { bucket, page_size }
     }
 
-    #[tracing::instrument(skip(self, tx, content))]
     pub async fn write(
         &self,
         tx: &mut Transaction<'_>,
@@ -24,24 +23,17 @@ impl PageWriter {
     ) -> Result<()> {
         let first_page = offset / self.page_size;
         let offset_in_page = offset - first_page * self.page_size;
-        tracing::info!(first_page, offset_in_page);
-
         let unaligned_len = (self.page_size - offset_in_page).min(content.len() as u64);
-        tracing::info!(?unaligned_len);
-
         let (content, remaining) = content.split_at(unaligned_len as usize);
 
-        tracing::trace!(content_len = content.len(), remaining = remaining.len());
         self.write_page(tx, ino, first_page as u64, offset_in_page, content)
             .await?;
 
         let extent_start = first_page + 1;
 
-        tracing::trace!(?extent_start);
         self.write_extent(tx, ino, extent_start as u64, remaining)
             .await?;
 
-        tracing::trace!("done write_nolock");
         Ok(())
     }
 
@@ -88,10 +80,7 @@ impl PageWriter {
             write
         });
 
-        tracing::trace!("writing extent");
         tx.update(self.bucket, writes).await?;
-
-        tracing::trace!("writing remaining page");
         self.write_page(
             tx,
             ino,
@@ -105,7 +94,6 @@ impl PageWriter {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, tx, output))]
     pub async fn read(
         &self,
         tx: &mut Transaction<'_>,
@@ -157,7 +145,6 @@ impl PageWriter {
             reply.lwwreg(0).unwrap_or_default()
         };
 
-        // we read a hole
         if page_content.is_empty() {
             output.resize(output.len() + len as usize, 0);
             return Ok(());
@@ -183,18 +170,15 @@ impl PageWriter {
 
         let extent_len = len.checked_sub(1).unwrap() / self.page_size + 1;
         let pages = extent_start..(extent_start + extent_len as u64);
-        tracing::info!(?pages);
 
         let reads = pages.clone().map(|page| lwwreg::get(Key::new(ino, page)));
         let mut reply = tx.read(self.bucket, reads).await?;
 
         let mut page_index = 0;
         let mut remaining = len;
-        tracing::info!(?page_index, remaining);
         while remaining >= self.page_size {
             let content = reply.lwwreg(page_index).unwrap_or_default();
 
-            // we read a hole
             if content.is_empty() {
                 output.resize(output.len() + self.page_size as usize, 0);
                 remaining -= self.page_size;
@@ -207,7 +191,6 @@ impl PageWriter {
             }
 
             page_index += 1;
-            tracing::info!(?page_index, remaining);
         }
 
         if remaining > 0 {
@@ -218,7 +201,6 @@ impl PageWriter {
         Ok(())
     }
 
-    #[tracing::instrument(skip(tx))]
     pub async fn remove(
         &self,
         tx: &mut Transaction<'_>,
@@ -232,7 +214,6 @@ impl PageWriter {
 
         let first_page = range.start / self.page_size as u64;
         let offset_in_page = range.start - first_page * self.page_size as u64;
-        tracing::info!(first_page, offset_in_page);
 
         let first_page_update = {
             let page_key = Key::new(ino, first_page);
@@ -246,7 +227,6 @@ impl PageWriter {
 
         let remaining_pages = len.checked_sub(1).unwrap() / self.page_size as u64;
         let page_offset = first_page + 1;
-        tracing::info!(remaining_pages, page_offset);
 
         let truncates = (page_offset..(page_offset + remaining_pages))
             .map(|i| lwwreg::set(Key::new(ino, i), Vec::new()));

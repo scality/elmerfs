@@ -35,15 +35,16 @@ impl PageLocks {
         while let Some(_) =
             Self::intersection_position(&by_ino[&ino].used_ranges[..], &requested_pages)
         {
-            let cond = by_ino[&ino].range_signal.clone();
+            let range_lock = &by_ino[&ino];
+
+            tracing::warn!(?range_lock, ?requested_pages, "page contention");
+            let cond = range_lock.range_signal.clone();
             by_ino = cond.wait(by_ino).await;
         }
 
         let range_lock = by_ino.get_mut(&ino).unwrap();
 
-        tracing::trace!(?requested_pages, "lock acquired");
         range_lock.used_ranges.push(requested_pages.clone());
-
         RangeGuard {
             ino,
             pages: requested_pages,
@@ -57,9 +58,6 @@ impl PageLocks {
 
         let mut by_ino = self.by_ino.lock().await;
         let range_lock = by_ino.get_mut(&ino).unwrap();
-
-        let ranges = &range_lock.used_ranges[..];
-        tracing::trace!(?ranges);
 
         let index = Self::intersection_position(&range_lock.used_ranges[..], &pages).unwrap();
         range_lock.used_ranges.swap_remove(index);
