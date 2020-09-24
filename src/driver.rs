@@ -25,7 +25,7 @@ use thiserror::Error;
 
 const ROOT_INO: u64 = 1;
 const MAX_CONNECTIONS: usize = 32;
-const PAGE_SIZE: usize = 4 * 1024;
+const PAGE_SIZE: u64 = 64 * 1024;
 
 const ENOENT: Error = Error::Sys(Errno::ENOENT);
 
@@ -192,15 +192,28 @@ impl Driver {
         let inode = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
             let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-
+            
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
             update!(inode.owner.gid, gid);
-            update!(inode.size, size);
             update!(inode.atime, atime);
             update!(inode.mtime, mtime);
+            
+            let update = if let Some(new_size) = size {
+                if new_size < inode.size {
+                    tracing::info!(old_size=inode.size, new_size, "truncate");
+                    
+                    let remove_range = new_size..inode.size;
+                    self.pages.remove(&mut tx, ino, remove_range).await?;
+                }
 
-            tx.update(self.cfg.bucket, vec![inode::update_stats(&inode)])
+                inode.size = new_size;
+                inode::update_stats_and_size(&inode)
+            } else {
+                inode::update_stats(&inode)
+            };
+
+            tx.update(self.cfg.bucket, std::iter::once(update))
                 .await?;
 
             inode
@@ -324,9 +337,9 @@ impl Driver {
                 size: 0,
                 nlink: 2,
             };
-            parent_inode.size += 1;
             parent_inode.mtime = t;
             parent_inode.atime = t;
+            parent_inode.size += 1;
 
             let attr = inode.attr();
 
@@ -337,7 +350,7 @@ impl Driver {
                     dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Directory)),
                     dir::create(self.cfg.view, parent_ino, ino),
                     inode::create(&inode),
-                    inode::update_stats(&parent_inode),
+                    inode::update_stats_and_size(&parent_inode),
                 ],
             )
             .await?;
@@ -383,7 +396,7 @@ impl Driver {
                 vec![
                     inode::decr_link_count(entry.ino, 1),
                     dir::remove_entry(parent_ino, &dentry),
-                    inode::update_stats(&parent_inode),
+                    inode::update_stats_and_size(&parent_inode),
                 ],
             )
             .await?;
@@ -452,7 +465,7 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    inode::update_stats(&parent),
+                    inode::update_stats_and_size(&parent),
                     dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Regular)),
                     inode::create(&inode),
                 ],
@@ -528,7 +541,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
         self.pages
-            .write(&mut tx, ino, offset as usize, bytes)
+            .write(&mut tx, ino, offset, bytes)
             .await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
@@ -539,14 +552,16 @@ impl Driver {
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         inode.atime = t;
         inode.mtime = t;
+        
+        let update = if wrote_above_size > 0 {
+            inode.size += wrote_above_size;
 
-        let new_size = inode.size + wrote_above_size;
-        tracing::info!(old_size = inode.size, new_size);
-
-        inode.size += wrote_above_size;
-        tx.update(self.cfg.bucket, vec![inode::update_stats(&inode)])
-            .await?;
-
+            inode::update_stats_and_size(&inode)
+        } else {
+            inode::update_stats(&inode)
+        };
+        
+        tx.update(self.cfg.bucket, std::iter::once(update)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -570,7 +585,7 @@ impl Driver {
         let truncated_len = read_end - offset;
         tracing::info!(read_end, len, truncated_len);
         self.pages
-            .read(&mut tx, ino, offset as usize, truncated_len as usize, &mut bytes)
+            .read(&mut tx, ino, offset, truncated_len, &mut bytes)
             .await?;
 
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -579,8 +594,8 @@ impl Driver {
         let padding = len.saturating_sub(bytes.len());
         bytes.resize(bytes.len() + padding, 0);
 
-        /* FIXME! Update the inode while reading fast seems to make the transaction
-        fails.
+        /* FIXME ! ! !Update the inode while reading fast seems to make
+        the transaction fails.
 
         tx.update(self.cfg.bucket, vec![inode::update(&inode)])
           .await?; */
@@ -706,8 +721,8 @@ impl Driver {
         tx.update(
             self.cfg.bucket,
             vec![
-                inode::update_stats(&parent),
-                inode::update_stats(&new_parent),
+                inode::update_stats_and_size(&parent),
+                inode::update_stats_and_size(&new_parent),
                 inode::update_stats(&inode),
                 dir::remove_entry(parent_ino, &dentry_to_remove),
                 dir::add_entry(new_parent_ino, new_dentry),
@@ -762,12 +777,13 @@ impl Driver {
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         parent.mtime = t;
         parent.atime = t;
+        parent.size += 1;
 
         let new_name = new_name.canonicalize(self.cfg.view);
         tx.update(
             self.cfg.bucket,
             vec![
-                inode::update_stats(&parent),
+                inode::update_stats_and_size(&parent),
                 dir::add_entry(
                     new_parent_ino,
                     &dir::Entry::new(new_name, ino, Kind::Regular),
@@ -854,7 +870,7 @@ impl Driver {
             self.cfg.bucket,
             vec![
                 inode::create(&inode),
-                inode::update_stats(&parent),
+                inode::update_stats_and_size(&parent),
                 dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Symlink)),
                 symlink::create(ino, link),
             ],

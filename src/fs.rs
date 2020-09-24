@@ -78,7 +78,7 @@ macro_rules! session {
             }
         };
         let task = task.instrument(
-            tracing::span!(Level::INFO, "session", op = function!(), id = unique, uid, gid)
+            tracing::trace_span!("session", op = function!(), id = unique, uid, gid)
         );
 
         task::spawn(task);

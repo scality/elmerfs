@@ -1,16 +1,15 @@
 use clap::{App, Arg};
-use elmerfs::{self, View, AddressBook, Bucket, Config};
-use tracing_subscriber::{self, filter::EnvFilter};
+use elmerfs::{self, AddressBook, Bucket, Config, View};
 use std::sync::Arc;
-
+use tracing_subscriber::{self, filter::EnvFilter};
 const MAIN_BUCKET: Bucket = Bucket::new(0);
 
 fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_default()
-        .add_directive("async_std::task=warn".parse().unwrap())
-        .add_directive("fuse=error".parse().unwrap())
-        .add_directive("antidotec=error".parse().unwrap());
+        .add_directive("elmerfs=trace".parse().unwrap())
+        .add_directive("polling=warn".parse().unwrap())
+        .add_directive("async_io=warn".parse().unwrap());
 
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
@@ -33,18 +32,23 @@ fn main() {
                 .short("s")
                 .value_name("URL")
                 .default_value("127.0.0.1:8101")
-                .multiple(true)
+                .multiple(true),
         )
+        .arg(Arg::with_name("nlocks").long("no-locks").takes_value(false))
         .arg(
-            Arg::with_name("nlocks")
-            .long("no-locks")
-            .takes_value(false),
+            Arg::with_name("view")
+                .long("view")
+                .value_name("VIEW")
+                .required(true),
         )
-        .arg(Arg::with_name("view").long("view").value_name("VIEW").required(true))
         .get_matches();
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
-    let addresses = args.values_of("antidote").unwrap().map(String::from).collect();
+    let addresses = args
+        .values_of("antidote")
+        .unwrap()
+        .map(String::from)
+        .collect();
     let locks = !args.is_present("nlocks");
 
     let view = args.value_of("view").unwrap();

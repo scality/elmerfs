@@ -82,17 +82,18 @@ impl Connection {
         })
     }
 
-    #[tracing::instrument(skip(self))]
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.transaction_with_locks(TransactionLocks::new()).await
     }
 
-    #[tracing::instrument(skip(self))]
     pub async fn transaction_with_locks(
         &mut self,
         locks: TransactionLocks,
     ) -> Result<Transaction<'_>, Error> {
-        self.abort_pending_transaction().await?;
+        // Dangling transactions leading to errors, shouldn't bubble up. 
+        if let Err(error) = self.abort_pending_transaction().await {
+            tracing::warn!(?error, "aborting dangling transaction");
+        }
 
         let mut transaction = ApbStartTransaction::new();
 
@@ -116,8 +117,8 @@ impl Connection {
         P: ApbMessage,
     {
         let code = P::code();
+
         let message_size = request.compute_size() + 1 /* code byte */;
-        tracing::trace!(?code, message_size);
 
         self.scratchpad.clear();
 
@@ -149,12 +150,10 @@ impl Connection {
 
         assert_eq!((&self.scratchpad[..]).len(), message_size as usize);
         stream.read_exact(&mut self.scratchpad[..]).await?;
-
+        
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
-        tracing::trace!(?code, message_size);
-
         if code == ApbMessageCode::ApbErrorResp {
-            let msg: ApbErrorResp = protobuf::parse_from_bytes(&self.scratchpad[..])?;
+            let msg: ApbErrorResp = protobuf::parse_from_bytes(&self.scratchpad[1..])?;
 
             return Err(Error::AntidoteErrResp(
                 AntidoteError::from(msg.get_errcode()),
@@ -177,14 +176,13 @@ impl Connection {
             Some(txid) => txid,
             None => return Ok(()),
         };
-        tracing::warn!("aborting previous transaction");
 
+        tracing::warn!(?txid, "aborting");
         let mut message = ApbAbortTransaction::new();
         message.set_transaction_descriptor(txid);
 
         self.send(message).await?;
         self.recv::<ApbOperationResp>().await?;
-
         Ok(())
     }
 
@@ -199,33 +197,22 @@ pub struct Transaction<'a> {
 }
 
 impl Transaction<'_> {
-    #[tracing::instrument(skip(self))]
     pub async fn commit(mut self) -> Result<(), Error> {
         let mut message = ApbCommitTransaction::new();
         message.set_transaction_descriptor(self.txid.clone());
 
+        
         self.connection.send(message).await?;
-        checkr!(self.connection.recv::<ApbCommitResp>().await?);
+        let result = self.connection.recv::<ApbCommitResp>().await;
 
         /* Don't drop to avoid calling abort */
         self.txid = Vec::new();
         mem::forget(self);
 
+        checkr!(result?);
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn abort(&mut self) -> Result<(), Error> {
-        let mut message = ApbAbortTransaction::new();
-        message.set_transaction_descriptor(self.txid.clone());
-
-        self.connection.send(message).await?;
-        checkr!(self.connection.recv::<ApbOperationResp>().await?);
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn read(
         &mut self,
         bucket: impl Into<RawIdent>,
@@ -259,7 +246,6 @@ impl Transaction<'_> {
         })
     }
 
-    #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn update(
         &mut self,
         bucket: impl Into<RawIdent>,
@@ -297,6 +283,9 @@ impl Transaction<'_> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         assert!(self.connection.dropped.is_none());
+        assert!(!self.txid.is_empty());
+
+        tracing::warn!(?self.txid, "dropped, will be aborted");
         self.connection.dropped = Some(mem::replace(&mut self.txid, Vec::new()));
     }
 }

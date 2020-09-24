@@ -191,6 +191,19 @@ mod ops {
             .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
             .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
             .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
+            .build()
+    }
+
+    pub fn update_stats_and_size(inode: &Inode) -> UpdateQuery {
+        let key = key(inode.ino);
+
+        rrmap::update(key)
+            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
+            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
+            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
+            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
             .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
             .build()
     }

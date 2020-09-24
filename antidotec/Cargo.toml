@@ -12,7 +12,6 @@ async-std = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 
-
 [build-dependencies]
 protobuf-codegen-pure = "2.3"
 
