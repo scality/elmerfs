@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use async_std::sync::{Condvar, Mutex};
-use std::ops::Range;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct RangeLock {

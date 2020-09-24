@@ -63,7 +63,7 @@ macro_rules! apb_messages {
                 fn code() -> ApbMessageCode {
                     ApbMessageCode::$msg
                 }
-            } 
+            }
         )*
     };
 }

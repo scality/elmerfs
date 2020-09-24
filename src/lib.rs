@@ -1,21 +1,20 @@
-mod model;
 mod driver;
-mod key;
 mod fs;
+mod key;
+mod model;
 mod view;
 
 use crate::driver::Driver;
+use crate::fs::Elmerfs;
 use async_std::{sync::Arc, task};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::process::{Command, Stdio};
 use tracing::*;
-use std::ffi::{OsStr, OsString};
-use crate::fs::Elmerfs;
 
-pub use crate::driver::{Config, AddressBook};
+pub use crate::driver::{AddressBook, Config};
 pub use crate::key::Bucket;
 pub use crate::view::View;
-
 
 /// There is two main thread of execution to follow:
 ///

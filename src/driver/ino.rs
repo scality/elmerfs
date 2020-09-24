@@ -1,4 +1,4 @@
-use crate::key::{Bucket, Ty, KeyWriter};
+use crate::key::{Bucket, KeyWriter, Ty};
 use crate::view::View;
 use antidotec::{counter, Error, RawIdent, Transaction};
 use std::mem;
@@ -12,11 +12,7 @@ pub struct InoGenerator {
 }
 
 impl InoGenerator {
-    pub async fn load(
-        tx: &mut Transaction<'_>,
-        view: View,
-        bucket: Bucket,
-    ) -> Result<Self, Error> {
+    pub async fn load(tx: &mut Transaction<'_>, view: View, bucket: Bucket) -> Result<Self, Error> {
         let next_ino = Self::stored_ino(tx, view, bucket).await?;
 
         Ok(Self {
@@ -91,4 +87,3 @@ impl Into<RawIdent> for Key {
             .into()
     }
 }
-

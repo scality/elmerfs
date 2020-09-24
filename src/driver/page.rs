@@ -11,10 +11,7 @@ pub(crate) struct PageWriter {
 
 impl PageWriter {
     pub fn new(bucket: Bucket, page_size: u64) -> Self {
-        Self {
-            bucket,
-            page_size,
-        }
+        Self { bucket, page_size }
     }
 
     #[tracing::instrument(skip(self, tx, content))]

@@ -1,8 +1,8 @@
-use crate::key::{Ty, KeyWriter};
-use fuse::{FileAttr, FileType};
-use std::{convert::TryFrom, time::Duration};
+use crate::key::{KeyWriter, Ty};
 use antidotec::RawIdent;
+use fuse::{FileAttr, FileType};
 use std::mem;
+use std::{convert::TryFrom, time::Duration};
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
@@ -132,7 +132,8 @@ impl Key {
         Key {
             ino: self.ino,
             field,
-        }.into()
+        }
+        .into()
     }
 
     const fn byte_len() -> usize {
@@ -153,21 +154,20 @@ impl Into<RawIdent> for Key {
     }
 }
 
-
 pub use ops::*;
 
 mod ops {
-    use super::{key, Inode, Owner, Field};
+    use super::{key, Field, Inode, Owner};
+    use antidotec::{counter, lwwreg, rrmap, ReadQuery, ReadReply, UpdateQuery};
     use std::convert::TryFrom;
-    use antidotec::{rrmap, lwwreg, counter, ReadQuery, ReadReply, UpdateQuery};
 
     pub fn read(ino: u64) -> ReadQuery {
         rrmap::get(key(ino))
     }
-    
+
     pub fn create(inode: &Inode) -> UpdateQuery {
         let key = key(inode.ino);
-    
+
         rrmap::update(key)
             .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
             .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
@@ -241,7 +241,7 @@ mod ops {
 
         let kind = TryFrom::try_from(kind_byte).expect("invalid code byte");
         let owner = Owner::from(lwwreg::read_u64(&owner));
-        
+
         Some(Inode {
             ino,
             kind,

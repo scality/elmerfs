@@ -78,7 +78,7 @@ impl Connection {
         Ok(Self {
             stream,
             scratchpad: Vec::new(),
-            dropped: None
+            dropped: None,
         })
     }
 
@@ -90,7 +90,7 @@ impl Connection {
         &mut self,
         locks: TransactionLocks,
     ) -> Result<Transaction<'_>, Error> {
-        // Dangling transactions leading to errors, shouldn't bubble up. 
+        // Dangling transactions leading to errors, shouldn't bubble up.
         if let Err(error) = self.abort_pending_transaction().await {
             tracing::warn!(?error, "aborting dangling transaction");
         }
@@ -150,7 +150,7 @@ impl Connection {
 
         assert_eq!((&self.scratchpad[..]).len(), message_size as usize);
         stream.read_exact(&mut self.scratchpad[..]).await?;
-        
+
         let code = ApbMessageCode::try_from(self.scratchpad[0])?;
         if code == ApbMessageCode::ApbErrorResp {
             let msg: ApbErrorResp = protobuf::parse_from_bytes(&self.scratchpad[1..])?;
@@ -201,7 +201,6 @@ impl Transaction<'_> {
         let mut message = ApbCommitTransaction::new();
         message.set_transaction_descriptor(self.txid.clone());
 
-        
         self.connection.send(message).await?;
         let result = self.connection.recv::<ApbCommitResp>().await;
 

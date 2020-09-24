@@ -12,7 +12,10 @@ pub struct Name {
 
 impl Name {
     pub fn new(prefix: impl Into<String>, view: View) -> Self {
-        Name { view, prefix: prefix.into() }
+        Name {
+            view,
+            prefix: prefix.into(),
+        }
     }
 }
 
@@ -35,14 +38,14 @@ pub struct NameRefParseError;
 
 impl FromStr for NameRef {
     type Err = NameRefParseError;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut s = s.split(REF_SEP);
 
         let prefix = String::from(s.next().ok_or(NameRefParseError)?);
         let view = match s.next() {
             Some(view) => view,
-            None => return Ok(Self::Partial(prefix))  
+            None => return Ok(Self::Partial(prefix)),
         };
 
         let view = view.parse().map_err(|_| NameRefParseError)?;

@@ -1,14 +1,14 @@
-use elmerfs::{Bucket, Config, View, AddressBook};
+use elmerfs::{AddressBook, Bucket, Config, View};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile;
 use tracing::info;
 use tracing_subscriber::{self, filter::EnvFilter};
-use std::sync::Arc;
 
 const TEST_VIEW: View = 0;
 const CHTON_PATH: &str = "vendor/cthon04/";
@@ -23,9 +23,7 @@ fn setup_logging() {
         .add_directive("antidotec=trace".parse().unwrap())
         .add_directive("elmerfs=trace".parse().unwrap());
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 #[test]
@@ -36,7 +34,9 @@ fn cthon_basic() {
     let cfg = Config {
         view: TEST_VIEW,
         bucket: CTHON_BASIC_BUCKET,
-        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)])),
+        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
+            ANTIDOTE_URL,
+        )])),
         locks: true,
     };
 
@@ -69,7 +69,9 @@ fn cthon_general() {
     let cfg = Config {
         view: TEST_VIEW,
         bucket: CTHON_BASIC_BUCKET,
-        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(ANTIDOTE_URL)])),
+        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
+            ANTIDOTE_URL,
+        )])),
         locks: true,
     };
 
