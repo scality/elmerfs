@@ -24,7 +24,7 @@ impl PageLocks {
     }
 
     pub async fn lock(&self, ino: u64, byte_range: Range<u64>) -> RangeGuard {
-        let requested_pages = self.page_range(byte_range);
+        let requested_pages = self.page_range(&byte_range);
 
         let mut by_ino = self.by_ino.lock().await;
         by_ino.entry(ino).or_insert(RangeLock {
@@ -68,16 +68,12 @@ impl PageLocks {
         }
     }
 
-    fn page_range(&self, byte_range: Range<u64>) -> Range<u64> {
-        let len = byte_range.end.saturating_sub(byte_range.start);
-        if len == 0 {
-            return 0..0;
-        }
+    fn page_range(&self, byte_range: &Range<u64>) -> Range<u64> {
+        let first = byte_range.start / self.page_size;
+        let last = byte_range.end / self.page_size; 
+        tracing::debug!(first, last);
 
-        let page_count = (len - 1) / self.page_size + 1;
-        let page_offset = byte_range.start / self.page_size;
-
-        page_offset..(page_offset + page_count)
+        first..(last + 1)
     }
 
     fn intersection_position(ranges: &[Range<u64>], range: &Range<u64>) -> Option<usize> {

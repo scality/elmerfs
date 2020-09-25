@@ -6,7 +6,6 @@ use nix::{errno::Errno, libc};
 use std::ffi::OsStr;
 use std::path::Path;
 use time::Timespec;
-use tracing::*;
 use tracing_futures::Instrument;
 
 macro_rules! function {
@@ -16,7 +15,7 @@ macro_rules! function {
             std::any::type_name::<T>()
         }
         let name = type_name_of(f);
-        &name[..name.len() - 3]
+        (&name[..name.len() - 3]).rsplit("::").next().unwrap()
     }};
 }
 
@@ -58,14 +57,18 @@ macro_rules! session {
         let task = async move {
             let result = $op.await;
 
+            if result.is_ok() {
+                let result: Result<_, ()> = Ok(()); /* ommit the content */
+                tracing::info!(?result);
+            } else {
+                tracing::error!(?result);
+            };
+
             match result {
                 Ok($ok) => {
-                    info!("ok");
                     $resp
                 }
                 Err(error) => {
-                    error!(?error);
-
                     match error {
                         crate::driver::Error::Sys(errno) => {
                             $reply.error(errno as libc::c_int);

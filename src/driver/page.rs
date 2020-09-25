@@ -21,17 +21,18 @@ impl PageWriter {
         offset: u64,
         content: &[u8],
     ) -> Result<()> {
-        let first_page = offset / self.page_size;
-        let offset_in_page = offset - first_page * self.page_size;
-        let unaligned_len = (self.page_size - offset_in_page).min(content.len() as u64);
-        let (content, remaining) = content.split_at(unaligned_len as usize);
+        let byte_range = offset..(offset + content.len() as u64);
+        let pages = self.page_range(&byte_range);
+        let remaining_pages = (pages.start + 1)..pages.end;
+        let offset = byte_range.start - pages.start * self.page_size;
+        tracing::debug!(?byte_range, ?pages, ?remaining_pages, ?offset);
 
-        self.write_page(tx, ino, first_page as u64, offset_in_page, content)
-            .await?;
+        let head_len = (self.page_size - offset).min(content.len() as u64);
+        let (head, remaining) = content.split_at(head_len as usize);
 
-        let extent_start = first_page + 1;
+        self.write_page(tx, ino, pages.start, offset, head).await?;
 
-        self.write_extent(tx, ino, extent_start as u64, remaining)
+        self.write_extent(tx, ino, remaining_pages.start, remaining)
             .await?;
 
         Ok(())
@@ -42,11 +43,13 @@ impl PageWriter {
         tx: &mut Transaction<'_>,
         ino: u64,
         page: u64,
-        offset_in_page: u64,
+        offset: u64,
         content: &[u8],
     ) -> Result<()> {
-        let end = offset_in_page + content.len() as u64;
-        assert!(end <= self.page_size);
+        assert!(content.len() as u64 <= self.page_size);
+
+        let write_range = offset..(offset + content.len() as u64);
+        tracing::debug!(?write_range);
 
         let page = Key::new(ino, page);
         let mut page_content = {
@@ -54,11 +57,15 @@ impl PageWriter {
             reply.lwwreg(0).unwrap_or_default()
         };
 
-        if end > page_content.len() as u64 {
-            page_content.resize(end as usize, 0);
+        let previous_len = page_content.len();
+        if write_range.end > page_content.len() as u64 {
+            tracing::debug!(
+                previous_len,
+                extended = (write_range.end - previous_len as u64)
+            );
+            page_content.resize(write_range.end as usize, 0);
         }
-        page_content[offset_in_page as usize..end as usize].copy_from_slice(content);
-
+        page_content[write_range.start as usize..write_range.end as usize].copy_from_slice(content);
         tx.update(self.bucket, vec![lwwreg::set(page, page_content)])
             .await?;
 
@@ -90,7 +97,6 @@ impl PageWriter {
         )
         .await?;
 
-        tracing::trace!("done");
         Ok(())
     }
 
@@ -102,26 +108,18 @@ impl PageWriter {
         len: u64,
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        let first_page = offset / self.page_size;
-        let offset_in_page = offset - first_page * self.page_size;
-        tracing::info!(first_page, offset_in_page);
+        let byte_range = offset..(offset + len);
+        let pages = self.page_range(&byte_range);
+        let remaining_pages = (pages.start + 1)..pages.end;
+        let offset = byte_range.start - pages.start * self.page_size;
+        tracing::debug!(?byte_range, ?pages, ?remaining_pages, ?offset);
 
-        let unaligned_len = (self.page_size - offset_in_page).min(len);
-        tracing::info!(unaligned_len);
+        let head_len = (self.page_size - offset).min(len);
+        self.read_page(tx, ino, pages.start as u64, offset, head_len, output)
+            .await?;
 
-        self.read_page(
-            tx,
-            ino,
-            first_page as u64,
-            offset_in_page,
-            unaligned_len,
-            output,
-        )
-        .await?;
-
-        let extent_start = first_page + 1;
-        let remaining_len = len - unaligned_len;
-        self.read_extent(tx, ino, extent_start, remaining_len, output)
+        let remaining_len = len.saturating_sub(head_len);
+        self.read_extent(tx, ino, remaining_pages.start, remaining_len, output)
             .await?;
 
         Ok(())
@@ -201,42 +199,41 @@ impl PageWriter {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, tx, ino))]
     pub async fn remove(
         &self,
         tx: &mut Transaction<'_>,
         ino: u64,
-        range: Range<u64>,
+        byte_range: Range<u64>,
     ) -> Result<()> {
-        let len = range.end.saturating_sub(range.start);
-        if len == 0 {
-            return Ok(());
-        }
+        let pages = self.page_range(&byte_range);
+        let remaining_pages = (pages.start + 1)..(pages.end);
+        let offset = byte_range.start - pages.start * self.page_size;
+        tracing::debug!(?byte_range, ?pages, ?remaining_pages, offset);
 
-        let first_page = range.start / self.page_size as u64;
-        let offset_in_page = range.start - first_page * self.page_size as u64;
-
-        let first_page_update = {
-            let page_key = Key::new(ino, first_page);
+        let content_tail = {
+            let page_key = Key::new(ino, pages.start);
             let mut reply = tx.read(self.bucket, vec![lwwreg::get(page_key)]).await?;
             let mut content = reply.lwwreg(0).unwrap_or_default();
-            content.truncate(offset_in_page as usize);
-            tracing::info!(old_len = content.len(), new_len = offset_in_page);
 
+            content.truncate(offset as usize);
             lwwreg::set(page_key, content)
         };
 
-        let remaining_pages = len.checked_sub(1).unwrap() / self.page_size as u64;
-        let page_offset = first_page + 1;
+        let removes = remaining_pages.map(|p| lwwreg::set(Key::new(ino, p), Vec::new()));
 
-        let truncates = (page_offset..(page_offset + remaining_pages))
-            .map(|i| lwwreg::set(Key::new(ino, i), Vec::new()));
-
-        let truncates = std::iter::once(first_page_update)
-            .chain(truncates)
-            .collect::<Vec<_>>();
-        tx.update(self.bucket, truncates).await?;
+        let updates = std::iter::once(content_tail).chain(removes);
+        tx.update(self.bucket, updates).await?;
 
         Ok(())
+    }
+
+    fn page_range(&self, byte_range: &Range<u64>) -> Range<u64> {
+        let first = byte_range.start / self.page_size;
+        let last = byte_range.end / self.page_size; 
+        tracing::debug!(first, last);
+
+        first..(last + 1)
     }
 }
 

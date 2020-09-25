@@ -188,6 +188,7 @@ impl Driver {
                 $target = $v.unwrap_or($target);
             };
         }
+
         /* Note that here we don't lock any pages when truncating. It is expected
         as while concurrent read/write or write/write to the same register
         might lead to invalid output even if they concerns different ranges,
@@ -209,10 +210,12 @@ impl Driver {
 
             let update = if let Some(new_size) = size {
                 if new_size < inode.size {
-                    tracing::info!(old_size = inode.size, new_size, "truncate");
+                    tracing::debug!("truncate DOWN from 0x{:x} to 0x{:x}", inode.size, new_size);
 
                     let remove_range = new_size..inode.size;
                     self.pages.remove(&mut tx, ino, remove_range).await?;
+                } else {
+                    tracing::debug!("truncate UP from 0x{:X} to 0x{:X}", inode.size, new_size);
                 }
 
                 inode.size = new_size;
@@ -542,7 +545,7 @@ impl Driver {
         self.getattr(ino).await.map(|_| ())
     }
 
-    #[tracing::instrument(skip(self, bytes))]
+    #[tracing::instrument(skip(self, bytes), fields(offset, len = bytes.len()))]
     pub(crate) async fn write(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
         let byte_range = offset..(offset + bytes.len() as u64);
         let lock = self.page_locks.lock(ino, byte_range).await;
@@ -571,6 +574,7 @@ impl Driver {
         let update = if wrote_above_size > 0 {
             inode.size += wrote_above_size;
 
+            tracing::debug!(extended = inode.size);
             inode::update_stats_and_size(&inode)
         } else {
             inode::update_stats(&inode)
@@ -597,35 +601,19 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
-        let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-
-        tracing::info!(file_size = inode.size, read_end = offset + len as u64);
-        if offset > inode.size {
-            return Err(Error::Sys(Errno::EINVAL));
-        }
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
         let mut bytes = Vec::with_capacity(len);
-
         let read_end = (offset + len as u64).min(inode.size);
         let truncated_len = read_end - offset;
-        tracing::info!(read_end, len, truncated_len);
         self.pages
             .read(&mut tx, ino, offset, truncated_len, &mut bytes)
             .await?;
 
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        inode.atime = t;
-
         let padding = len.saturating_sub(bytes.len());
         bytes.resize(bytes.len() + padding, 0);
-
-        /* FIXME ! ! !Update the inode while reading fast seems to make
-        the transaction fails.
-
-        tx.update(self.cfg.bucket, vec![inode::update(&inode)])
-          .await?; */
-
         assert!(bytes.len() == len);
+
         tx.commit().await?;
         Ok(bytes)
     }

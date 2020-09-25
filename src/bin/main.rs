@@ -9,7 +9,9 @@ fn main() {
         .unwrap_or_default()
         .add_directive("elmerfs=trace".parse().unwrap())
         .add_directive("polling=warn".parse().unwrap())
-        .add_directive("async_io=warn".parse().unwrap());
+        .add_directive("fuse::request=info".parse().unwrap())
+        .add_directive("async_io=info".parse().unwrap())
+        .add_directive("async_std=info".parse().unwrap());
 
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
