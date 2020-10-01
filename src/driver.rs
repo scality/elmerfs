@@ -605,12 +605,18 @@ impl Driver {
 
         let mut bytes = Vec::with_capacity(len);
         let read_end = (offset + len as u64).min(inode.size);
+
+        if offset > inode.size {
+            return Err(Error::Sys(Errno::EINVAL));
+        }
+
         let truncated_len = read_end - offset;
         self.pages
             .read(&mut tx, ino, offset, truncated_len, &mut bytes)
             .await?;
 
         let padding = len.saturating_sub(bytes.len());
+        tracing::debug!(?padding, output_len = bytes.len());
         bytes.resize(bytes.len() + padding, 0);
         assert!(bytes.len() == len);
 

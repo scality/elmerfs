@@ -22,6 +22,7 @@ impl PageWriter {
         content: &[u8],
     ) -> Result<()> {
         let byte_range = offset..(offset + content.len() as u64);
+
         let pages = self.page_range(&byte_range);
         let remaining_pages = (pages.start + 1)..pages.end;
         let offset = byte_range.start - pages.start * self.page_size;
@@ -32,8 +33,10 @@ impl PageWriter {
 
         self.write_page(tx, ino, pages.start, offset, head).await?;
 
-        self.write_extent(tx, ino, remaining_pages.start, remaining)
-            .await?;
+        if remaining.len() > 0 {
+            self.write_extent(tx, ino, remaining_pages.start, remaining)
+                .await?;
+        }
 
         Ok(())
     }
@@ -47,7 +50,6 @@ impl PageWriter {
         content: &[u8],
     ) -> Result<()> {
         assert!(content.len() as u64 <= self.page_size);
-
         let write_range = offset..(offset + content.len() as u64);
         tracing::debug!(?write_range);
 
@@ -65,6 +67,7 @@ impl PageWriter {
             );
             page_content.resize(write_range.end as usize, 0);
         }
+
         page_content[write_range.start as usize..write_range.end as usize].copy_from_slice(content);
         tx.update(self.bucket, vec![lwwreg::set(page, page_content)])
             .await?;
@@ -81,6 +84,7 @@ impl PageWriter {
     ) -> Result<()> {
         let mut page = extent_start;
         let writes = content.chunks_exact(self.page_size as usize).map(|chunk| {
+            assert!(chunk.len() == self.page_size as usize);
             let write = lwwreg::set(Key::new(ino, page), chunk.into());
             page += 1;
 
@@ -88,14 +92,12 @@ impl PageWriter {
         });
 
         tx.update(self.bucket, writes).await?;
-        self.write_page(
-            tx,
-            ino,
-            page,
-            0,
-            content.chunks_exact(self.page_size as usize).remainder(),
-        )
-        .await?;
+
+        let remaining = content.chunks_exact(self.page_size as usize).remainder();
+
+        if remaining.len() > 0 {
+            self.write_page(tx, ino, page, 0, remaining).await?;
+        }
 
         Ok(())
     }
@@ -115,12 +117,17 @@ impl PageWriter {
         tracing::debug!(?byte_range, ?pages, ?remaining_pages, ?offset);
 
         let head_len = (self.page_size - offset).min(len);
+        tracing::error!(?head_len, len, end = offset + head_len);
         self.read_page(tx, ino, pages.start as u64, offset, head_len, output)
             .await?;
+        assert_eq!(output.len(), head_len as usize);
 
         let remaining_len = len.saturating_sub(head_len);
-        self.read_extent(tx, ino, remaining_pages.start, remaining_len, output)
-            .await?;
+
+        if remaining_len > 0 {
+            self.read_extent(tx, ino, remaining_pages, remaining_len, output)
+                .await?;
+        }
 
         Ok(())
     }
@@ -148,9 +155,17 @@ impl PageWriter {
             return Ok(());
         }
 
+        let page = 0..page_content.len();
+        let read = offset_in_page..end;
         let overlapping = intersect_range(0..page_content.len() as u64, offset_in_page..end);
         output
             .extend_from_slice(&page_content[overlapping.start as usize..overlapping.end as usize]);
+
+        let padding = read.end.saturating_sub(page.end as u64).min(len);
+        if padding > 0 {
+            output.resize(output.len() + padding as usize, 0);
+        }
+
         Ok(())
     }
 
@@ -158,32 +173,24 @@ impl PageWriter {
         &self,
         tx: &mut Transaction<'_>,
         ino: u64,
-        extent_start: u64,
+        pages: Range<u64>,
         len: u64,
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-
-        let extent_len = len.checked_sub(1).unwrap() / self.page_size + 1;
-        let pages = extent_start..(extent_start + extent_len as u64);
-
         let reads = pages.clone().map(|page| lwwreg::get(Key::new(ino, page)));
         let mut reply = tx.read(self.bucket, reads).await?;
 
         let mut page_index = 0;
         let mut remaining = len;
         while remaining >= self.page_size {
-            let content = reply.lwwreg(page_index).unwrap_or_default();
-
+            let content = reply.lwwreg(page_index as usize).unwrap_or_default();
             if content.is_empty() {
                 output.resize(output.len() + self.page_size as usize, 0);
                 remaining -= self.page_size;
             } else {
                 output.extend_from_slice(&content[..content.len()]);
 
-                let padding = self.page_size - content.len() as u64;
+                let padding = self.page_size.checked_sub(content.len() as u64).unwrap();
                 output.resize(output.len() + padding as usize, 0);
                 remaining -= self.page_size;
             }
@@ -192,7 +199,7 @@ impl PageWriter {
         }
 
         if remaining > 0 {
-            let content = reply.lwwreg(page_index).unwrap_or_default();
+            let content = reply.lwwreg(page_index as usize).unwrap_or_default();
             output.extend_from_slice(&content[..remaining.min(content.len() as u64) as usize]);
         }
 
@@ -230,7 +237,7 @@ impl PageWriter {
 
     fn page_range(&self, byte_range: &Range<u64>) -> Range<u64> {
         let first = byte_range.start / self.page_size;
-        let last = byte_range.end / self.page_size; 
+        let last = byte_range.end / self.page_size;
         tracing::debug!(first, last);
 
         first..(last + 1)

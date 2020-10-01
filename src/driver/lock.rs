@@ -70,8 +70,8 @@ impl PageLocks {
 
     fn page_range(&self, byte_range: &Range<u64>) -> Range<u64> {
         let first = byte_range.start / self.page_size;
-        let last = byte_range.end / self.page_size; 
-        tracing::debug!(first, last);
+        let last = byte_range.end / self.page_size;
+        tracing::debug!(?byte_range, first, last);
 
         first..(last + 1)
     }
