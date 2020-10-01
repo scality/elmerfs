@@ -7,7 +7,6 @@ const MAIN_BUCKET: Bucket = Bucket::new(0);
 fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_default()
-        .add_directive("elmerfs=trace".parse().unwrap())
         .add_directive("polling=warn".parse().unwrap())
         .add_directive("fuse::request=info".parse().unwrap())
         .add_directive("async_io=info".parse().unwrap())

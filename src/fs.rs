@@ -58,8 +58,8 @@ macro_rules! session {
             let result = $op.await;
 
             if result.is_ok() {
-                let result: Result<_, ()> = Ok(()); /* ommit the content */
-                tracing::info!(?result);
+                let result: Result<_, ()> = Ok(()); /* omit the content */
+                tracing::debug!(?result);
             } else {
                 tracing::error!(?result);
             };
