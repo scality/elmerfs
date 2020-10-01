@@ -61,7 +61,12 @@ macro_rules! session {
                 let result: Result<_, ()> = Ok(()); /* omit the content */
                 tracing::debug!(?result);
             } else {
-                tracing::error!(?result);
+                match &result {
+                    Err(crate::driver::Error::Sys(Errno::ENOENT)) => {}
+                    result => {
+                        tracing::error!(?result);
+                    }
+                }
             };
 
             match result {
