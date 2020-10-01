@@ -902,7 +902,7 @@ impl Driver {
 
     fn schedule_delete(&self, ino: u64) {
         #[tracing::instrument(skip(cfg, pool))]
-        async fn delete_later(cfg: Config, pool: Arc<ConnectionPool>, ino: u64) -> Result<bool> {
+        async fn delete_later(cfg: Config, pool: Arc<ConnectionPool>, pages: PageWriter, ino: u64) -> Result<bool> {
             let mut connection = pool.acquire().await?;
             let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
@@ -920,6 +920,12 @@ impl Driver {
                     vec![inode::remove(ino), dir::remove(ino), symlink::remove(ino)],
                 )
                 .await?;
+
+                if inode.kind == inode::Kind::Regular {
+                    /* At this point we should be (locally) the only one
+                       seeing this file, don't bother locking up the pages */
+                    pages.remove(&mut tx, ino, 0..inode.size).await?;
+                }
             }
 
             tx.commit().await?;
@@ -928,7 +934,8 @@ impl Driver {
 
         let cfg = self.cfg.clone();
         let pool = self.pool.clone();
-        task::spawn(delete_later(cfg, pool, ino));
+        let pages = self.pages;
+        task::spawn(delete_later(cfg, pool, pages, ino));
     }
 
     #[tracing::instrument(skip(self))]

@@ -3,7 +3,7 @@ use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, RawIdent, Transaction};
 use std::ops::Range;
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) struct PageWriter {
     bucket: Bucket,
     page_size: u64,
@@ -117,7 +117,6 @@ impl PageWriter {
         tracing::debug!(?byte_range, ?pages, ?remaining_pages, ?offset);
 
         let head_len = (self.page_size - offset).min(len);
-        tracing::error!(?head_len, len, end = offset + head_len);
         self.read_page(tx, ino, pages.start as u64, offset, head_len, output)
             .await?;
         assert_eq!(output.len(), head_len as usize);
