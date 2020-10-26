@@ -4,3 +4,6 @@
 [submodule "3rdparty/antidote-tools"]
 	path = 3rdparty/antidote-tools
 	url = https://github.com/lplit/antidote-tools
+[submodule "3rdparty/chton04"]
+	path = 3rdparty/chton04
+	url = https://github.com/phdeniel/cthon04
