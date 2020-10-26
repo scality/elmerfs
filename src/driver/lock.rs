@@ -37,7 +37,7 @@ impl PageLocks {
         {
             let range_lock = &by_ino[&ino];
 
-            tracing::warn!(?range_lock, ?requested_pages, "page contention");
+            tracing::debug!(?range_lock, ?requested_pages, "page contention");
             let cond = range_lock.range_signal.clone();
             by_ino = cond.wait(by_ino).await;
         }

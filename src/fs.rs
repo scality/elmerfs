@@ -46,7 +46,7 @@ macro_rules! check_name {
 }
 
 fn ttl() -> time::Timespec {
-    time::Timespec::new(600, 0)
+    time::Timespec::new(0, 0)
 }
 
 macro_rules! session {
