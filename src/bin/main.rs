@@ -1,5 +1,5 @@
 use clap::{App, Arg};
-use elmerfs::{self, AddressBook, Bucket, Config, View};
+use elmerfs::{self, AddressBook, Bucket, Config};
 use std::sync::Arc;
 use tracing_subscriber::{self, filter::EnvFilter};
 const MAIN_BUCKET: Bucket = Bucket::new(0);
@@ -42,12 +42,6 @@ fn main() {
                 .possible_values(&["full", "partial"])
                 .default_value("partial"),
         )
-        .arg(
-            Arg::with_name("view")
-                .long("view")
-                .value_name("VIEW")
-                .required(true),
-        )
         .get_matches();
 
     let mountpoint = args.value_of_os("mountpoint").unwrap();
@@ -59,11 +53,7 @@ fn main() {
     let locks = !args.is_present("nlocks");
     let listing_flavor = args.value_of("lf").unwrap().parse().unwrap();
 
-    let view = args.value_of("view").unwrap();
-    let view: View = view.parse().unwrap();
-
     let cfg = Config {
-        view,
         bucket: MAIN_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(addresses)),
         locks,

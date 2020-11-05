@@ -1,8 +1,30 @@
 use std::str::FromStr;
+use std::str;
+use nix::unistd;
 
-pub const REF_SEP: char = ':';
+pub const REF_SEP: &str = ":";
 
-pub type View = u16;
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct View {
+    pub uid: u32,
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error("invalid view name")]
+pub struct ParseViewError;
+
+impl str::FromStr for View {
+    type Err = ParseViewError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let user = unistd::User::from_name(name).map_err(|_| ParseViewError)?;
+
+        match user {
+            Some(user) => Ok(View { uid: user.uid.as_raw() as u32 }),
+            None => Err(ParseViewError)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Name {

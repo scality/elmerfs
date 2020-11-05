@@ -325,6 +325,7 @@ dependencies = [
  "crossbeam",
  "fuse",
  "nix",
+ "once_cell",
  "tempfile",
  "thiserror",
  "time",

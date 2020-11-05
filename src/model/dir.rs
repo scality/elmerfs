@@ -1,13 +1,15 @@
+use crate::driver::Error;
 use crate::key::{KeyWriter, Ty};
 use crate::model::inode::Kind;
 use crate::view::{Name, NameRef, View};
 use antidotec::RawIdent;
-use std::str;
+use nix::unistd;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::fmt::{self, Display};
+use std::convert::TryInto;
 use std::mem::size_of;
+use std::str;
 use std::sync::Arc;
 
 #[derive(Debug, Copy, Clone)]
@@ -56,7 +58,7 @@ impl Entry {
 
         content.extend_from_slice(&self.ino.to_le_bytes()[..]);
         content.push(self.kind as u8);
-        content.extend_from_slice(&self.name.view.to_le_bytes()[..]);
+        content.extend_from_slice(&self.name.view.uid.to_le_bytes()[..]);
         content.extend_from_slice(&self.name.prefix.as_bytes());
     }
 
@@ -78,7 +80,9 @@ impl Entry {
             ino: u64::from_le_bytes(ino_bytes),
             kind,
             name: Name {
-                view: View::from_le_bytes(view_bytes),
+                view: View {
+                    uid: u32::from_le_bytes(view.try_into().unwrap()),
+                },
                 prefix,
             },
         }
@@ -86,12 +90,6 @@ impl Entry {
 
     fn byte_len(&self) -> usize {
         self.name.prefix.len() + size_of::<View>() + size_of::<u64>() + size_of::<Kind>()
-    }
-}
-
-impl Display for Name {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.prefix, self.view)
     }
 }
 
@@ -216,29 +214,30 @@ pub struct DirView {
 }
 
 impl DirView {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    pub fn get(&self, name: &NameRef) -> Option<&EntryView> {
+    pub(crate) fn get(&self, name: &NameRef) -> Option<&EntryView> {
         self.position(name).map(|idx| &self.entries[idx])
     }
 
-    pub fn contains_key(&self, name: &NameRef) -> bool {
+    pub(crate) fn contains_key(&self, name: &NameRef) -> bool {
         self.get(name).is_some()
     }
 
-    pub fn iter_from(
+    pub(crate) fn iter_from(
         &self,
         listing_flavor: ListingFlavor,
         offset: usize,
-    ) -> impl Iterator<Item = EntryRef<'_>> {
+    ) -> impl Iterator<Item = Result<EntryRef<'_>, Error>> {
         let start = offset.min(self.entries.len());
         Iter {
             listing_flavor,
             entries: self.entries[start..].iter(),
             by_name: &self.by_name,
             view: self.view,
+            user_mapping: HashMap::default(),
         }
     }
 
@@ -307,16 +306,16 @@ impl str::FromStr for ListingFlavor {
     }
 }
 
-pub struct Iter<'a> {
+pub(crate) struct Iter<'a> {
     listing_flavor: ListingFlavor,
     entries: std::slice::Iter<'a, EntryView>,
     by_name: &'a HashMap<Arc<str>, EntryList>,
-
+    user_mapping: HashMap<u32, String>,
     view: View,
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = EntryRef<'a>;
+    type Item = Result<EntryRef<'a>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         use crate::view::REF_SEP;
@@ -324,32 +323,50 @@ impl<'a> Iterator for Iter<'a> {
         let entry = self.entries.next()?;
         let entry_list = self.by_name[&entry.prefix];
 
-        let show_alias =
-            ((entry_list.head == entry_list.tail || entry.view == self.view)
-             && self.listing_flavor == ListingFlavor::Partial)
+        let show_alias = ((entry_list.head == entry_list.tail || entry.view == self.view)
+            && self.listing_flavor == ListingFlavor::Partial)
             || (&*entry.prefix == "." || &*entry.prefix == "..");
 
         let entry = if show_alias {
-            EntryRef {
+            Ok(EntryRef {
                 name: Cow::Borrowed(&*entry.prefix as &str),
                 ino: entry.ino,
                 kind: entry.kind,
-            }
+            })
         } else {
+            let username = match cached_username(&mut self.user_mapping, entry.view.uid) {
+                Err(error) => return Some(Err(error)),
+                Ok(username) => username,
+            };
+
             let fully_qualified = format!(
-                "{prefix}{sep}{view}",
+                "{prefix}{sep}{username}",
                 prefix = entry.prefix,
                 sep = REF_SEP,
-                view = entry.view
+                username = username
             );
 
-            EntryRef {
+            Ok(EntryRef {
                 name: Cow::Owned(fully_qualified),
                 ino: entry.ino,
                 kind: entry.kind,
-            }
+            })
         };
 
         Some(entry)
+    }
+}
+
+fn cached_username(cache: &mut HashMap<u32, String>, uid: u32) -> Result<&str, Error> {
+    use std::collections::hash_map::Entry;
+
+    match cache.entry(uid) {
+        Entry::Occupied(entry) => Ok(&*entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let user = unistd::User::from_uid(unistd::Uid::from_raw(uid))?;
+
+            let name = user.map(|u| u.name).unwrap_or_else(|| "UNKNOWN".into());
+            Ok(&*entry.insert(name))
+        }
     }
 }

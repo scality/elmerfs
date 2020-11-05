@@ -81,6 +81,16 @@ macro_rules! session {
                         crate::driver::Error::Antidote(_) => {
                             $reply.error(Errno::EIO as libc::c_int);
                         }
+                        crate::driver::Error::Nix(error) => {
+                            match error {
+                                nix::Error::Sys(errno) => {
+                                    $reply.error(errno as libc::c_int);
+                                },
+                                _ => {
+                                    $reply.error(Errno::EINVAL as libc::c_int);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -104,16 +114,18 @@ pub struct Elmerfs {
 impl Filesystem for Elmerfs {
     fn getattr(&mut self, req: &Request, ino: u64, reply: ReplyAttr) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.getattr(ino), attrs => {
+        session!(req, reply, driver.getattr(view, ino), attrs => {
             reply.attr(&ttl(), &attrs);
         });
     }
 
     fn opendir(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.opendir(ino), _ => {
+        session!(req, reply, driver.opendir(view, ino), _ => {
             let flags = 0;
             reply.opened(ino, flags);
         });
@@ -121,8 +133,9 @@ impl Filesystem for Elmerfs {
 
     fn releasedir(&mut self, req: &Request, ino: u64, _fh: u64, _flags: u32, reply: ReplyEmpty) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.opendir(ino), _ => {
+        session!(req, reply, driver.opendir(view, ino), _ => {
             reply.ok()
         });
     }
@@ -136,8 +149,9 @@ impl Filesystem for Elmerfs {
         mut reply: ReplyDirectory,
     ) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.readdir(ino, offset), entries => {
+        session!(req, reply, driver.readdir(view, ino, offset), entries => {
             for (i, entry) in entries.into_iter().enumerate() {
                 let offset = offset + i as i64 + 1;
 
@@ -154,8 +168,9 @@ impl Filesystem for Elmerfs {
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name = check_name!(reply, name);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.lookup(parent, name), attrs => {
+        session!(req, reply, driver.lookup(view, parent, name), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -175,8 +190,9 @@ impl Filesystem for Elmerfs {
         };
         let name = check_name!(reply, name);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.mkdir(owner, mode, parent_ino, name), attrs => {
+        session!(req, reply, driver.mkdir(view, owner, mode, parent_ino, name), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -185,8 +201,9 @@ impl Filesystem for Elmerfs {
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = check_name!(reply, name);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.rmdir(parent, name), _ => {
+        session!(req, reply, driver.rmdir(view, parent, name), _ => {
             reply.ok();
         });
     }
@@ -206,8 +223,9 @@ impl Filesystem for Elmerfs {
             uid: req.uid(),
         };
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.mknod(owner, mode, parent, name, rdev), attrs => {
+        session!(req, reply, driver.mknod(view, owner, mode, parent, name, rdev), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -216,8 +234,9 @@ impl Filesystem for Elmerfs {
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = check_name!(reply, name);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.unlink(parent, name), _ => {
+        session!(req, reply, driver.unlink(view, parent, name), _ => {
             reply.ok();
         });
     }
@@ -243,11 +262,12 @@ impl Filesystem for Elmerfs {
         let atime = atime.map(t2d);
         let mtime = mtime.map(t2d);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
         session!(
             req,
             reply,
-            driver.setattr(ino, mode, uid, gid, size, atime, mtime),
+            driver.setattr(view, ino, mode, uid, gid, size, atime, mtime),
             attrs => {
                 reply.attr(&ttl(), &attrs);
             }
@@ -256,8 +276,9 @@ impl Filesystem for Elmerfs {
 
     fn open(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.open(ino), _ => {
+        session!(req, reply, driver.open(view, ino), _ => {
             let flags = 0;
             reply.opened(ino, flags);
         });
@@ -274,8 +295,9 @@ impl Filesystem for Elmerfs {
         reply: ReplyEmpty,
     ) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.release(ino), _ => {
+        session!(req, reply, driver.release(view, ino), _ => {
             reply.ok();
         });
     }
@@ -296,9 +318,10 @@ impl Filesystem for Elmerfs {
         }
         let offset = offset as u64;
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
         let data = Vec::from(data);
 
-        session!(req, reply, driver.write(ino, &data, offset), _ => {
+        session!(req, reply, driver.write(view, ino, &data, offset), _ => {
             reply.written(data.len() as u32);
         });
     }
@@ -336,8 +359,9 @@ impl Filesystem for Elmerfs {
         let name = check_name!(reply, name);
         let newname = check_name!(reply, newname);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.rename(parent, name, newparent, newname), _ => {
+        session!(req, reply, driver.rename(view, parent, name, newparent, newname), _ => {
             reply.ok();
         });
     }
@@ -352,8 +376,9 @@ impl Filesystem for Elmerfs {
     ) {
         let newname = check_name!(reply, newname);
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.link(ino, newparent, newname), attrs => {
+        session!(req, reply, driver.link(view, ino, newparent, newname), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -375,8 +400,9 @@ impl Filesystem for Elmerfs {
             uid: req.uid(),
         };
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.symlink(parent, owner, name, link), attrs => {
+        session!(req, reply, driver.symlink(view, parent, owner, name, link), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -384,8 +410,9 @@ impl Filesystem for Elmerfs {
 
     fn readlink(&mut self, req: &Request, ino: u64, reply: ReplyData) {
         let driver = self.driver.clone();
+        let view = crate::view::View { uid: req.uid() };
 
-        session!(req, reply, driver.read_link(ino), path => {
+        session!(req, reply, driver.read_link(view, ino), path => {
             reply.data(path.as_bytes());
         });
     }
