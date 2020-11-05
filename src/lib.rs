@@ -15,6 +15,8 @@ use tracing::*;
 pub use crate::driver::{AddressBook, Config};
 pub use crate::key::Bucket;
 pub use crate::model::dir::ListingFlavor;
+pub use crate::view::View;
+
 
 /// There is two main thread of execution to follow:
 ///
@@ -25,7 +27,7 @@ pub use crate::model::dir::ListingFlavor;
 /// The second one, the dispatcher thread, it takes fuse request and dispatch
 /// them into asynchronous tasks calling into the root of the filesystem,
 /// the Rp driver.
-pub fn run(cfg: Config, mountpoint: &OsStr) {
+pub fn run(cfg: Config, forced_view: Option<View>, mountpoint: &OsStr) {
     const RETRIES: u32 = 5;
 
     let driver = task::block_on(Driver::new(cfg)).expect("driver init");
@@ -40,6 +42,7 @@ pub fn run(cfg: Config, mountpoint: &OsStr) {
         let _umount = UmountOnDrop(mountpoint.to_os_string());
 
         let fs = Elmerfs {
+            forced_view,
             driver: driver.clone(),
         };
         match fuse::mount(fs, &mountpoint, &options) {
