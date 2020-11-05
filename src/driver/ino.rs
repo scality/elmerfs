@@ -1,89 +1,93 @@
 use crate::key::{Bucket, KeyWriter, Ty};
-use crate::view::View;
-use antidotec::{counter, Error, RawIdent, Transaction};
-use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
+use antidotec::{lwwreg, Connection, Error, RawIdent, TransactionLocks};
+use std::ops::Range;
+use async_std::sync::Mutex;
+
+const BATCH_SIZE: u64 = 1 << 16;
 
 #[derive(Debug)]
 pub struct InoGenerator {
     bucket: Bucket,
-    view: View,
-    counter: AtomicU64,
+    range: Mutex<Range<u64>>,
 }
 
 impl InoGenerator {
-    pub async fn load(tx: &mut Transaction<'_>, view: View, bucket: Bucket) -> Result<Self, Error> {
-        let next_ino = Self::stored_ino(tx, view, bucket).await?;
+    pub async fn load(connection: &mut Connection, bucket: Bucket) -> Result<Self, Error> {
+        let (next, max) = Self::allocate_range(connection, bucket).await?;
 
         Ok(Self {
-            view,
             bucket,
-            counter: AtomicU64::new(next_ino),
+            range: Mutex::new(next..max),
         })
     }
 
-    pub fn next(&self) -> u64 {
-        let next_ino = self.counter.fetch_sub(1, Ordering::Relaxed);
-        assert!(next_ino > 1 && next_ino < (1 << 48));
+    pub async fn next(&self, connection: &mut Connection) -> Result<u64, Error> {
+        let mut range = self.range.lock().await;
 
-        (next_ino << 16) | self.view as u64
-    }
+        let found = loop {
+            let next = range.start + 1;
+            *range = next..range.end;
 
-    pub async fn checkpoint(&self, tx: &mut Transaction<'_>) -> Result<(), Error> {
-        let key = key(self.view);
-
-        let stored = Self::stored_ino(tx, self.view, self.bucket).await?;
-        let current = self.counter.load(Ordering::Relaxed);
-
-        let inc = -(stored.checked_sub(current).unwrap() as i32);
-        tx.update(self.bucket, vec![counter::inc(key, inc)]).await?;
-
-        Ok(())
-    }
-
-    async fn stored_ino(
-        tx: &mut Transaction<'_>,
-        view: View,
-        bucket: Bucket,
-    ) -> Result<u64, Error> {
-        let key = key(view);
-
-        let mut reply = tx.read(bucket, vec![counter::get(key)]).await?;
-
-        let offset = i32::max_value() as u32;
-        let counter = match reply.counter(0) {
-            0 => {
-                let start_value = i32::max_value();
-                tx.update(bucket, vec![counter::inc(key, start_value)])
-                    .await?;
-
-                start_value as u32 + offset
+            if next >= range.end {
+                let (next, max) = Self::allocate_range(connection, self.bucket).await?;
+                *range = next..max;
+            } else {
+                break next;
             }
-            x => x as u32 + offset,
         };
 
-        /* Note that Antidote support only 32bit counters */
-        Ok(counter as u64)
+        Ok(found)
+    }
+
+    pub async fn allocate_range(
+        connection: &mut Connection,
+        bucket: Bucket,
+    ) -> Result<(u64, u64), Error> {
+        let mut tx = connection
+            .transaction_with_locks(TransactionLocks {
+                exclusive: vec![key().into()],
+                shared: vec![],
+            })
+            .await?;
+
+        let mut reply = tx.read(bucket, vec![lwwreg::get(key())]).await?;
+        let result = match reply.lwwreg(0) {
+            None => {
+                let next = 2;
+                let max = next + BATCH_SIZE;
+                tx.update(bucket, vec![lwwreg::set_u64(key(), max)]).await?;
+
+                (next, max)
+            }
+            Some(previous_max) => {
+                let next = lwwreg::read_u64(&previous_max);
+                let max = next + BATCH_SIZE;
+                tx.update(bucket, vec![lwwreg::set_u64(key(), max)]).await?;
+
+                (next, max)
+            }
+        };
+
+        tx.commit().await?;
+        Ok(result)
     }
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct Key(View);
+pub struct Key {}
 
 impl Key {
-    fn new(view: View) -> Self {
-        Self(view)
+    fn new() -> Self {
+        Self {}
     }
 }
 
-pub fn key(view: View) -> Key {
-    Key::new(view)
+pub fn key() -> Key {
+    Key::new()
 }
 
 impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
-        KeyWriter::with_capacity(Ty::InoCounter, mem::size_of::<View>())
-            .write_u16(self.0)
-            .into()
+        KeyWriter::with_capacity(Ty::InoCounter, 0).into()
     }
 }

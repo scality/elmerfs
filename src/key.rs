@@ -31,12 +31,6 @@ impl KeyWriter {
     }
 
     #[inline]
-    pub fn write_u16(mut self, x: u16) -> Self {
-        self.buffer.extend_from_slice(&x.to_le_bytes()[..]);
-        self
-    }
-
-    #[inline]
     pub fn write_u32(mut self, x: u32) -> Self {
         self.buffer.extend_from_slice(&x.to_le_bytes()[..]);
         self

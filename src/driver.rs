@@ -113,11 +113,7 @@ impl Driver {
         cfg: &Config,
         connection: &mut Connection,
     ) -> Result<InoGenerator> {
-        let mut tx = transaction!(cfg, connection, { exclusive: [ino::key(cfg.view)] }).await?;
-
-        let counter = InoGenerator::load(&mut tx, cfg.view, cfg.bucket).await?;
-
-        tx.commit().await?;
+        let counter = InoGenerator::load(connection, cfg.bucket).await?;
         Ok(counter)
     }
 
@@ -310,9 +306,9 @@ impl Driver {
         parent_ino: u64,
         name: NameRef,
     ) -> Result<FileAttr> {
-        let ino = self.next_ino()?;
-
         let mut connection = self.pool.acquire().await?;
+        let ino = self.ino_counter.next(&mut connection).await?;
+
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
@@ -429,9 +425,9 @@ impl Driver {
         name: NameRef,
         _rdev: u32,
     ) -> Result<FileAttr> {
-        let ino = self.next_ino()?;
-
         let mut connection = self.pool.acquire().await?;
+        let ino = self.ino_counter.next(&mut connection).await?;
+
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
@@ -839,9 +835,9 @@ impl Driver {
         name: NameRef,
         link: String,
     ) -> Result<FileAttr> {
-        let ino = self.next_ino()?;
-
         let mut connection = self.pool.acquire().await?;
+        let ino = self.ino_counter.next(&mut connection).await?;
+
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
@@ -942,34 +938,6 @@ impl Driver {
         let pool = self.pool.clone();
         let pages = self.pages;
         task::spawn(delete_later(cfg, pool, pages, ino));
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub(crate) fn next_ino(&self) -> Result<u64> {
-        #[tracing::instrument(skip(cfg, counter, pool))]
-        async fn checkpoint(
-            cfg: Config,
-            counter: Arc<InoGenerator>,
-            pool: Arc<ConnectionPool>,
-        ) -> Result<()> {
-            let mut connection = pool.acquire().await?;
-
-            let mut tx = transaction!(cfg, connection, { exclusive: [ino::key(cfg.view)] }).await?;
-
-            counter.checkpoint(&mut tx).await?;
-
-            tx.commit().await?;
-            Ok(())
-        }
-
-        let ino = self.ino_counter.next();
-
-        let counter = self.ino_counter.clone();
-        let pool = self.pool.clone();
-        let cfg = self.cfg.clone();
-        task::spawn(checkpoint(cfg, counter, pool));
-
-        Ok(ino)
     }
 
     pub async fn up_until_common_ancestor(
