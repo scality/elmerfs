@@ -324,8 +324,10 @@ impl<'a> Iterator for Iter<'a> {
         let entry = self.entries.next()?;
         let entry_list = self.by_name[&entry.prefix];
 
-        let show_alias = (entry_list.head == entry_list.tail || entry.view == self.view)
-            && self.listing_flavor == ListingFlavor::Partial;
+        let show_alias =
+            ((entry_list.head == entry_list.tail || entry.view == self.view)
+             && self.listing_flavor == ListingFlavor::Partial)
+            || (&*entry.prefix == "." || &*entry.prefix == "..");
 
         let entry = if show_alias {
             EntryRef {
