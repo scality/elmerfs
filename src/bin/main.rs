@@ -37,6 +37,12 @@ fn main() {
         )
         .arg(Arg::with_name("nlocks").long("no-locks").takes_value(false))
         .arg(
+            Arg::with_name("lf")
+                .long("listing-flavor")
+                .possible_values(&["full", "partial"])
+                .default_value("partial"),
+        )
+        .arg(
             Arg::with_name("view")
                 .long("view")
                 .value_name("VIEW")
@@ -51,6 +57,7 @@ fn main() {
         .map(String::from)
         .collect();
     let locks = !args.is_present("nlocks");
+    let listing_flavor = args.value_of("lf").unwrap().parse().unwrap();
 
     let view = args.value_of("view").unwrap();
     let view: View = view.parse().unwrap();
@@ -60,6 +67,7 @@ fn main() {
         bucket: MAIN_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(addresses)),
         locks,
+        listing_flavor
     };
 
     elmerfs::run(cfg, mountpoint);

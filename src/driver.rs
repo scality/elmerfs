@@ -21,8 +21,8 @@ use async_std::sync::Arc;
 use async_std::task;
 use fuse::*;
 use nix::errno::Errno;
-use std::fmt::Debug;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{fmt::Debug};
 use thiserror::Error;
 
 const ROOT_INO: u64 = 1;
@@ -75,6 +75,7 @@ pub struct Config {
     pub bucket: Bucket,
     pub addresses: Arc<AddressBook>,
     pub locks: bool,
+    pub listing_flavor: dir::ListingFlavor,
 }
 
 #[derive(Debug)]
@@ -286,7 +287,7 @@ impl Driver {
             };
 
             let mut mapped_entries = Vec::with_capacity(entries.len());
-            for entry in entries.iter_from(offset as usize) {
+            for entry in entries.iter_from(self.cfg.listing_flavor, offset as usize) {
                 mapped_entries.push(ReadDirEntry {
                     name: entry.name.into_owned(),
                     ino,

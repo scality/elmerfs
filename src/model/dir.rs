@@ -2,6 +2,7 @@ use crate::key::{KeyWriter, Ty};
 use crate::model::inode::Kind;
 use crate::view::{Name, NameRef, View};
 use antidotec::RawIdent;
+use std::str;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -227,9 +228,14 @@ impl DirView {
         self.get(name).is_some()
     }
 
-    pub fn iter_from(&self, offset: usize) -> impl Iterator<Item = EntryRef<'_>> {
+    pub fn iter_from(
+        &self,
+        listing_flavor: ListingFlavor,
+        offset: usize,
+    ) -> impl Iterator<Item = EntryRef<'_>> {
         let start = offset.min(self.entries.len());
         Iter {
+            listing_flavor,
             entries: self.entries[start..].iter(),
             by_name: &self.by_name,
             view: self.view,
@@ -280,9 +286,32 @@ pub struct EntryRef<'a> {
     pub kind: Kind,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ListingFlavor {
+    FullyQualified,
+    Partial,
+}
+#[derive(Debug, thiserror::Error)]
+#[error("invalid listing flavor name")]
+pub struct ListingParseError;
+
+impl str::FromStr for ListingFlavor {
+    type Err = ListingParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(Self::FullyQualified),
+            "partial" => Ok(Self::Partial),
+            _ => Err(ListingParseError),
+        }
+    }
+}
+
 pub struct Iter<'a> {
+    listing_flavor: ListingFlavor,
     entries: std::slice::Iter<'a, EntryView>,
     by_name: &'a HashMap<Arc<str>, EntryList>,
+
     view: View,
 }
 
@@ -295,7 +324,8 @@ impl<'a> Iterator for Iter<'a> {
         let entry = self.entries.next()?;
         let entry_list = self.by_name[&entry.prefix];
 
-        let show_alias = entry_list.head == entry_list.tail || entry.view == self.view;
+        let show_alias = (entry_list.head == entry_list.tail || entry.view == self.view)
+            && self.listing_flavor == ListingFlavor::Partial;
 
         let entry = if show_alias {
             EntryRef {

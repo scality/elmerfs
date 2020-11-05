@@ -1,4 +1,4 @@
-use elmerfs::{AddressBook, Bucket, Config, View};
+use elmerfs::{AddressBook, Bucket, Config, View, ListingFlavor};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -32,6 +32,7 @@ fn cthon_basic() {
 
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
+        listing_flavor: ListingFlavor::FullyQualified,
         view: TEST_VIEW,
         bucket: CTHON_BASIC_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
@@ -67,6 +68,7 @@ fn cthon_general() {
 
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
+        listing_flavor: ListingFlavor::FullyQualified,
         view: TEST_VIEW,
         bucket: CTHON_BASIC_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
