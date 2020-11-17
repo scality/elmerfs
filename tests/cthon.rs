@@ -1,4 +1,4 @@
-use elmerfs::{AddressBook, Bucket, Config, View, ListingFlavor};
+use elmerfs::{AddressBook, UmountOnDrop, Bucket, Config, View, ListingFlavor};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -10,7 +10,8 @@ use tempfile;
 use tracing::info;
 use tracing_subscriber::{self, filter::EnvFilter};
 
-const TEST_VIEW: View = 0;
+/* Run test as if they were on the behalf of the root user */
+const TEST_VIEW: View = View { uid: 0 };
 const CHTON_PATH: &str = "vendor/cthon04/";
 const CTHON_BASIC_BUCKET: Bucket = Bucket::new(0);
 const ANTIDOTE_URL: &str = "127.0.0.1:8101";
@@ -33,19 +34,18 @@ fn cthon_basic() {
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
         listing_flavor: ListingFlavor::FullyQualified,
-        view: TEST_VIEW,
         bucket: CTHON_BASIC_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
             ANTIDOTE_URL,
         )])),
         locks: true,
     };
-
     fs::create_dir_all(&tests_dir.path()).expect("failed ot create test mountpoint");
     info!(workdir = ?tests_dir.path().as_os_str());
 
     let tests_dir_path = OsString::from(tests_dir.path().as_os_str());
-    let rpfs_thread = thread::spawn(move || elmerfs::run(cfg, &tests_dir_path));
+    let umount = UmountOnDrop::new(&tests_dir_path);
+    let rpfs_thread = thread::spawn(move || elmerfs::run(cfg, Some(TEST_VIEW), &tests_dir_path));
 
     thread::sleep(Duration::from_secs(5));
     let bin_dir = Path::new(CHTON_PATH).join("basic");
@@ -59,6 +59,7 @@ fn cthon_basic() {
     assert_eq!(chton_status.code(), Some(0));
 
     tracing::info!("cleanup");
+    drop(umount);
     assert!(rpfs_thread.join().is_ok());
 }
 
@@ -69,7 +70,6 @@ fn cthon_general() {
     let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
     let cfg = Config {
         listing_flavor: ListingFlavor::FullyQualified,
-        view: TEST_VIEW,
         bucket: CTHON_BASIC_BUCKET,
         addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
             ANTIDOTE_URL,
@@ -81,7 +81,8 @@ fn cthon_general() {
     info!(workdir = ?tests_dir.path().as_os_str());
 
     let tests_dir_path = OsString::from(tests_dir.path().as_os_str());
-    let rpfs_thread = thread::spawn(move || elmerfs::run(cfg, &tests_dir_path));
+    let umount = UmountOnDrop::new(&tests_dir_path);
+    let rpfs_thread = thread::spawn(move || elmerfs::run(cfg, Some(TEST_VIEW), &tests_dir_path));
 
     thread::sleep(Duration::from_secs(5));
     let bin_dir = Path::new(CHTON_PATH).join("general");
@@ -95,5 +96,7 @@ fn cthon_general() {
     assert_eq!(chton_status.code(), Some(0));
 
     tracing::info!("cleanup");
+
+    drop(umount);
     assert!(rpfs_thread.join().is_ok());
 }

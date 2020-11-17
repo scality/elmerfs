@@ -39,7 +39,7 @@ pub fn run(cfg: Config, forced_view: Option<View>, mountpoint: &OsStr) {
         .collect::<Vec<&OsStr>>();
 
     for _ in 0..RETRIES {
-        let _umount = UmountOnDrop(mountpoint.to_os_string());
+        let _umount = UmountOnDrop::new(mountpoint);
 
         let fs = Elmerfs {
             forced_view,
@@ -57,7 +57,13 @@ pub fn run(cfg: Config, forced_view: Option<View>, mountpoint: &OsStr) {
     }
 }
 
-struct UmountOnDrop(OsString);
+pub struct UmountOnDrop(OsString);
+
+impl UmountOnDrop {
+    pub fn new(mountpoint: &OsStr) -> Self {
+        Self(mountpoint.to_os_string())
+    }
+}
 
 impl Drop for UmountOnDrop {
     fn drop(&mut self) {
