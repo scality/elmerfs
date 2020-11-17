@@ -22,7 +22,7 @@ When running the main binary, you will have the following options:
 elmerfs
 
 USAGE:
-    main [FLAGS] [OPTIONS] --mount <MOUNTPOINT> --view <VIEW>
+    main [FLAGS] [OPTIONS] --mount <MOUNTPOINT>
 
 FLAGS:
     -h, --help        Prints help information
@@ -30,16 +30,17 @@ FLAGS:
     -V, --version     Prints version information
 
 OPTIONS:
-    -s, --antidote <URL>...      [default: 127.0.0.1:8101]
+    -s, --antidote <URL>...       [default: 127.0.0.1:8101]
+        --force-view <UID>
+        --listing-flavor <lf>     [default: partial]  [possible values: full, partial]
     -m, --mount <MOUNTPOINT>
-        --view <VIEW>
 ```
 
 A usual launch will also include logs and backtrace env variables, for example, to
 run the fs on a local antidote cluster:
 
 ```
-RUST_BACKTRACE=1 RUST_LOG=info cargo run --release --bin main -- --mount ../elmerfsmount/ --antidote=127.0.0.1:8101 --antidote=127.0.0.1:8102 --antidote=127.0.0.1:8103 --no-locks --view=0
+RUST_BACKTRACE=1 RUST_LOG=info cargo run --release --bin main -- --mount ../elmerfsmount/ --antidote=127.0.0.1:8101 --antidote=127.0.0.1:8102 --antidote=127.0.0.1:8103 --no-locks
 ```
 
 Note that is is important that all antidote IPs address are from the same
@@ -49,12 +50,14 @@ datacenter !
 
 #### The View
 
-Each `elmerfs` process have its own view of the current filesystem.
-Consequently, each process running should have a different view id.
-This id is used later on to resolve concurrent updates gracefully.
+Each `elmerfs` process have one or multiple view attached to it.
+For convenience the view is based on the user which perform the operations.
+It is expected that the user cannot perform conflicting update by himself against
+himself. This means that an user should always contact and perform operation
+on the same process.
 
-Each time you create file or a directory, the view id that it was created from
-will be saved alongside the metadatas.
+Each time you create file or a directory, the user that it was created from
+will be saved alongside the metadata.
 
 #### Naming
 
@@ -62,10 +65,10 @@ In relation to the view id. There is two way to refer to a file in `elmerfs`.
 You can either refer to it by what you are using to, by its name or,
 by its fully qualified name `name:view_id`.
 
-For example if you are view 0:
+For example if you are the root user:
 
 ```bash
-echo "Hello" > file:0
+echo "Hello" > file:root
 echo " World!" >> file
 cat file
 Hello World!
@@ -101,20 +104,20 @@ on both site, you will see the following:
 ```
 elmerfs0/dir> ls
 f
-f:1
+f:toto
 echo "Hello from elmerfs0' >> f
 ```
 
 ```
 elmerfs1/dir> ls
 f
-f:0
-cat f:0
+f:root
+cat f:root
 Hello from elmerfs0
 ```
 
 What is interesting here is that applications on both process will work
-seemlessly on their file without interruptions. To resolve the conflict you can
+seamlessly on their file without interruptions. To resolve the conflict you can
 simply rename the file.
 
 This works the same on directories.
@@ -127,15 +130,35 @@ When locks are used, no conflicts can happen, but you lose latency and availabil
 #### Atomicity
 
 Every fs operation is synchronous and done inside a unique transaction,
-meaning that if an operation fails, nothing will be commited.
+meaning that if an operation fails, nothing will be committed.
+
+### Running chton tests
+
+Cthon04 test suite must be built
+from the 3rdparty submodule and copied into a vendor directory at the root
+of this project.
+
+Then, a simple `cargo test` should work.
+
+```
+$ destdir=$(realpath ./vendor/chton04)
+$ mkdir -p $destdir
+$ (cd 3rdparty/cthon04 && make all && make copy DESTDIR=$destdir)
+$ cargo test
+```
 
 ### State of the project
 
 **elmerfs** is still in its early stage, basic fs operation are implemented
 and the aim is to provide a prototype that is valid and resilient
-but not necessarely performant.
+but not necessarily fast.
 
-The project is able to pass basics and general connectathon test suites. More
-tests will be added in the future to check concurrent update handling.
+The project is able to pass basics and general connectathon test suites.
+Fsx from the linux test project is also able to run for
+an extended period of time without issues.
 
-Note that **concurrent update on file content** is not handled yet.
+More tests will be added in the future to check concurrent update handling.
+
+Note that **concurrent update on file content** is not well handled yet.
+Conflicts resolution of such update is done at the register level,
+not at the update boundaries.
