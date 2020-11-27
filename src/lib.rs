@@ -14,7 +14,7 @@ use tracing::*;
 
 pub use crate::driver::{AddressBook, Config};
 pub use crate::key::Bucket;
-pub use crate::model::dir::ListingFlavor;
+pub use crate::driver::ListingFlavor;
 pub use crate::view::View;
 
 

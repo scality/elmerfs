@@ -1,3 +1,4 @@
+mod dir;
 mod ino;
 mod lock;
 mod page;
@@ -5,15 +6,16 @@ mod pool;
 
 pub use self::pool::AddressBook;
 
+use self::dir::DirDriver;
 use self::ino::InoGenerator;
 use self::lock::PageLocks;
 use self::page::PageWriter;
 use self::pool::ConnectionPool;
 use crate::key::Bucket;
 use crate::model::{
-    dir,
     inode::{self, Inode, Kind, Owner},
     symlink,
+    dentries,
 };
 use crate::view::{NameRef, View};
 use antidotec::{self, Connection, Transaction, TransactionLocks};
@@ -21,15 +23,19 @@ use async_std::sync::Arc;
 use async_std::task;
 use fuse::*;
 use nix::errno::Errno;
+use std::fmt::Debug;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{fmt::Debug};
 use thiserror::Error;
+
+pub use self::dir::ListingFlavor;
 
 const ROOT_INO: u64 = 1;
 const MAX_CONNECTIONS: usize = 32;
 const PAGE_SIZE: u64 = 64 * 1024;
 
 const ENOENT: Error = Error::Sys(Errno::ENOENT);
+
+
 
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
@@ -87,12 +93,16 @@ pub(crate) struct Driver {
     pool: Arc<ConnectionPool>,
     pages: PageWriter,
     page_locks: PageLocks,
+    dirs: DirDriver,
 }
 
 impl Driver {
     pub async fn new(cfg: Config) -> Result<Self> {
         let pages = PageWriter::new(cfg.bucket, PAGE_SIZE);
-        let pool = ConnectionPool::with_capacity(cfg.addresses.clone(), MAX_CONNECTIONS);
+        let pool = Arc::new(ConnectionPool::with_capacity(
+            cfg.addresses.clone(),
+            MAX_CONNECTIONS,
+        ));
         let ino_counter = {
             let mut connection = pool.acquire().await?;
             Self::make_root(&cfg, &mut connection).await?;
@@ -101,12 +111,15 @@ impl Driver {
             ino_counter
         };
 
+        let dirs = DirDriver::new(cfg.clone(), pool.clone());
+
         Ok(Self {
             cfg,
             ino_counter: Arc::new(ino_counter),
             pages,
-            pool: Arc::new(pool),
+            pool,
             page_locks: PageLocks::new(PAGE_SIZE),
+            dirs,
         })
     }
 
@@ -150,7 +163,7 @@ impl Driver {
             cfg.bucket,
             vec![
                 inode::create(&root_inode),
-                dir::create(View { uid: 0 }, ROOT_INO, ROOT_INO),
+                dentries::create(View { uid: 0 }, ROOT_INO, ROOT_INO),
             ],
         )
         .await?;
@@ -234,18 +247,19 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn lookup(&self, view: View, parent_ino: u64, name: NameRef) -> Result<FileAttr> {
+    pub(crate) async fn lookup(
+        &self,
+        view: View,
+        parent_ino: u64,
+        name: NameRef,
+    ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [dir::key(parent_ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, {
+            shared: [dentries::key(parent_ino)]
+        })
+        .await?;
 
-        let entries = {
-            let mut reply = tx
-                .read(self.cfg.bucket, vec![dir::read(parent_ino)])
-                .await?;
-
-            dir::decode(view, &mut reply, 0).ok_or(ENOENT)?
-        };
-
+        let entries = self.dirs.load(view, &mut tx, parent_ino).await?;
         let attrs = match entries.get(&name) {
             Some(entry) => Self::attr_of(&self.cfg, &mut tx, entry.ino).await,
             None => Err(Error::Sys(Errno::ENOENT)),
@@ -263,27 +277,27 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn opendir(&self, view: View, ino: u64) -> Result<()> {
-        // FIXME: For now we are stateless, meaning that we do not track open
-        // close calls. just perform a simple getattr as a dummy check.
-        self.getattr(view, ino).await.map(|_| ())
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn releasedir(&self, view: View, ino: u64) -> Result<()> {
-        self.getattr(view, ino).await.map(|_| ())
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn readdir(&self, view: View, ino: u64, offset: i64) -> Result<Vec<ReadDirEntry>> {
+    pub(crate) async fn readdir(
+        &self,
+        view: View,
+        ino: u64,
+        offset: i64,
+    ) -> Result<Vec<ReadDirEntry>> {
         assert!(offset >= 0);
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [dir::key(ino)] }).await?;
+        let mut tx = transaction!(self.cfg, connection, { shared: [dentries::key(ino)] }).await?;
 
         let entries = {
-            let entries = {
-                let mut reply = tx.read(self.cfg.bucket, vec![dir::read(ino)]).await?;
-                dir::decode(view, &mut reply, 0).ok_or(ENOENT)?
-            };
+            let entries = self.dirs.load(view, &mut tx, ino).await?;
 
             let mut mapped_entries = Vec::with_capacity(entries.len());
             for entry in entries.iter_from(self.cfg.listing_flavor, offset as usize) {
@@ -318,7 +332,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
-                dir::key(parent_ino)
+                dentries::key(parent_ino)
             ]
         })
         .await?;
@@ -327,12 +341,14 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![inode::read(parent_ino), dir::read(parent_ino)],
+                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
                 )
                 .await?;
 
             let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dir::decode(view, &mut reply, 1).ok_or(ENOENT)?;
+            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
+            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+
             if entries.contains_key(&name) {
                 return Err(Error::Sys(Errno::EEXIST));
             }
@@ -360,8 +376,11 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Directory)),
-                    dir::create(view, parent_ino, ino),
+                    dentries::add_entry(
+                        parent_ino,
+                        &dentries::Entry::new(name, ino, Kind::Directory),
+                    ),
+                    dentries::create(view, parent_ino, ino),
                     inode::create(&inode),
                     inode::update_stats_and_size(&parent_inode),
                 ],
@@ -376,12 +395,17 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn rmdir(self: Arc<Driver>, view: View, parent_ino: u64, name: NameRef) -> Result<()> {
+    pub(crate) async fn rmdir(
+        self: Arc<Driver>,
+        view: View,
+        parent_ino: u64,
+        name: NameRef,
+    ) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
-                dir::key(parent_ino)
+                dentries::key(parent_ino)
             ]
         })
         .await?;
@@ -390,25 +414,26 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![inode::read(parent_ino), dir::read(parent_ino)],
+                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
                 )
                 .await?;
 
             let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dir::decode(view, &mut reply, 1).ok_or(ENOENT)?;
+            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
+            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
             let entry = entries.get(&name).ok_or(ENOENT)?;
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             parent_inode.atime = t;
             parent_inode.mtime = t;
-            parent_inode.size -= 1;
+            parent_inode.size = parent_inode.size.saturating_sub(1);
 
             let dentry = entry.into_dentry();
             tx.update(
                 self.cfg.bucket,
                 vec![
                     inode::decr_link_count(entry.ino, 1),
-                    dir::remove_entry(parent_ino, &dentry),
+                    dentries::remove_entry(parent_ino, &dentry),
                     inode::update_stats_and_size(&parent_inode),
                 ],
             )
@@ -438,7 +463,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
-                dir::key(parent_ino)
+                dentries::key(parent_ino)
             ]
         })
         .await?;
@@ -447,12 +472,14 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![inode::read(parent_ino), dir::read(parent_ino)],
+                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
                 )
                 .await?;
 
             let mut parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dir::decode(view, &mut reply, 1).ok_or(ENOENT)?;
+            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
+            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+
             if entries.contains_key(&name) {
                 return Err(Error::Sys(Errno::EEXIST));
             }
@@ -480,7 +507,10 @@ impl Driver {
                 self.cfg.bucket,
                 vec![
                     inode::update_stats_and_size(&parent),
-                    dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Regular)),
+                    dentries::add_entry(
+                        parent_ino,
+                        &dentries::Entry::new(name, ino, Kind::Regular),
+                    ),
                     inode::create(&inode),
                 ],
             )
@@ -499,7 +529,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
-                dir::key(parent_ino)
+                dentries::key(parent_ino)
             ]
         })
         .await?;
@@ -508,12 +538,13 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![inode::read(parent_ino), dir::read(parent_ino)],
+                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
                 )
                 .await?;
 
             let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dir::decode(view, &mut reply, 1).ok_or(ENOENT)?;
+            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
+            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
             let entry = entries.get(&name).ok_or(ENOENT)?;
 
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -525,7 +556,7 @@ impl Driver {
             tx.update(
                 self.cfg.bucket,
                 vec![
-                    dir::remove_entry(parent_ino, &dentry),
+                    dentries::remove_entry(parent_ino, &dentry),
                     inode::decr_link_count(entry.ino, 1),
                 ],
             )
@@ -541,16 +572,22 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn open(&self, view: View, ino: u64) -> Result<()> {
-        self.getattr(view, ino).await.map(|_| ())
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn release(&self, view: View, ino: u64) -> Result<()> {
-        self.getattr(view, ino).await.map(|_| ())
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, bytes), fields(offset, len = bytes.len()))]
-    pub(crate) async fn write(&self, view: View, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
+    pub(crate) async fn write(
+        &self,
+        view: View,
+        ino: u64,
+        bytes: &[u8],
+        offset: u64,
+    ) -> Result<()> {
         let byte_range = offset..(offset + bytes.len() as u64);
         let lock = self.page_locks.lock(ino, byte_range).await;
 
@@ -648,7 +685,7 @@ impl Driver {
                 shared: vec![],
                 exclusive: parents_to_lock
                     .into_iter()
-                    .map(|ino| dir::key(ino).into())
+                    .map(|ino| dentries::key(ino).into())
                     .collect(),
             })
             .await?;
@@ -660,8 +697,8 @@ impl Driver {
                     vec![
                         inode::read(parent_ino),
                         inode::read(new_parent_ino),
-                        dir::read(parent_ino),
-                        dir::read(new_parent_ino),
+                        dentries::read(parent_ino),
+                        dentries::read(new_parent_ino),
                     ],
                 )
                 .await?;
@@ -669,10 +706,16 @@ impl Driver {
             (
                 inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?,
                 inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?,
-                dir::decode(view, &mut reply, 2).ok_or(ENOENT)?,
-                dir::decode(view, &mut reply, 3).ok_or(ENOENT)?,
+                dentries::decode(&mut reply, 2).ok_or(ENOENT)?,
+                dentries::decode(&mut reply, 3).ok_or(ENOENT)?,
             )
         };
+
+        let parent_entries = self.dirs.view(view, &mut tx, parent_entries, parent_ino).await?;
+        let new_parent_entries = self
+            .dirs
+            .view(view, &mut tx, new_parent_entries, new_parent_ino)
+            .await?;
 
         let entry = parent_entries.get(&name).ok_or(ENOENT)?;
         let target_entry = new_parent_entries.get(&new_name);
@@ -701,8 +744,8 @@ impl Driver {
                     self.cfg.bucket,
                     vec![
                         inode::remove(target_entry.ino),
-                        dir::remove(target_entry.ino),
-                        dir::remove_entry(new_parent_ino, &target_dentry),
+                        dentries::remove(target_entry.ino),
+                        dentries::remove_entry(new_parent_ino, &target_dentry),
                     ],
                 )
                 .await?;
@@ -715,7 +758,7 @@ impl Driver {
                     self.cfg.bucket,
                     vec![
                         inode::remove(target.ino),
-                        dir::remove_entry(new_parent_ino, &target_dentry),
+                        dentries::remove_entry(new_parent_ino, &target_dentry),
                         symlink::remove(target.ino),
                     ],
                 )
@@ -736,11 +779,12 @@ impl Driver {
         parent.mtime = t;
 
         inode.atime = t;
+        inode.parent = new_parent_ino;
 
         let ino = entry.ino;
         let dentry_to_remove = entry.into_dentry();
         let new_name = new_name.canonicalize(view);
-        let new_dentry = &dir::Entry::new(new_name, ino, inode.kind);
+        let new_dentry = &dentries::Entry::new(new_name, ino, inode.kind);
 
         tx.update(
             self.cfg.bucket,
@@ -748,8 +792,8 @@ impl Driver {
                 inode::update_stats_and_size(&parent),
                 inode::update_stats_and_size(&new_parent),
                 inode::update_stats(&inode),
-                dir::remove_entry(parent_ino, &dentry_to_remove),
-                dir::add_entry(new_parent_ino, new_dentry),
+                dentries::remove_entry(parent_ino, &dentry_to_remove),
+                dentries::add_entry(new_parent_ino, new_dentry),
             ],
         )
         .await?;
@@ -771,7 +815,7 @@ impl Driver {
             exclusive: [
                 inode::key(ino),
                 inode::key(new_parent_ino),
-                dir::key(new_parent_ino)
+                dentries::key(new_parent_ino)
             ]
         })
         .await?;
@@ -783,14 +827,15 @@ impl Driver {
                     vec![
                         inode::read(ino),
                         inode::read(new_parent_ino),
-                        dir::read(new_parent_ino),
+                        dentries::read(new_parent_ino),
                     ],
                 )
                 .await?;
 
             let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
             let parent = inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?;
-            let entries = dir::decode(view, &mut reply, 2).ok_or(ENOENT)?;
+            let entries = dentries::decode(&mut reply, 2).ok_or(ENOENT)?;
+            let entries = self.dirs.view(view, &mut tx, entries, new_parent_ino).await?;
 
             (inode, parent, entries)
         };
@@ -809,9 +854,9 @@ impl Driver {
             self.cfg.bucket,
             vec![
                 inode::update_stats_and_size(&parent),
-                dir::add_entry(
+                dentries::add_entry(
                     new_parent_ino,
-                    &dir::Entry::new(new_name, ino, Kind::Regular),
+                    &dentries::Entry::new(new_name, ino, Kind::Regular),
                 ),
                 inode::incr_link_count(ino, 1),
             ],
@@ -851,7 +896,7 @@ impl Driver {
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
                 inode::key(parent_ino),
-                dir::key(parent_ino)
+                dentries::key(parent_ino)
             ]
         })
         .await?;
@@ -860,12 +905,13 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![inode::read(parent_ino), dir::read(parent_ino)],
+                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
                 )
                 .await?;
 
             let parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dir::decode(view, &mut reply, 1).ok_or(ENOENT)?;
+            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
+            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
 
             (parent, entries)
         };
@@ -897,7 +943,7 @@ impl Driver {
             vec![
                 inode::create(&inode),
                 inode::update_stats_and_size(&parent),
-                dir::add_entry(parent_ino, &dir::Entry::new(name, ino, Kind::Symlink)),
+                dentries::add_entry(parent_ino, &dentries::Entry::new(name, ino, Kind::Symlink)),
                 symlink::create(ino, link),
             ],
         )
@@ -929,7 +975,11 @@ impl Driver {
             if must_be_removed {
                 tx.update(
                     cfg.bucket,
-                    vec![inode::remove(ino), dir::remove(ino), symlink::remove(ino)],
+                    vec![
+                        inode::remove(ino),
+                        dentries::remove(ino),
+                        symlink::remove(ino),
+                    ],
                 )
                 .await?;
 
@@ -969,12 +1019,15 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![dir::read(lhs_parent), dir::read(rhs_parent)],
+                    vec![dentries::read(lhs_parent), dentries::read(rhs_parent)],
                 )
                 .await?;
 
-            let lhs_entries = dir::decode(view, &mut reply, 0).ok_or(ENOENT)?;
-            let rhs_entries = dir::decode(view, &mut reply, 1).ok_or(ENOENT)?;
+            let lhs_entries = dentries::decode(&mut reply, 0).ok_or(ENOENT)?;
+            let lhs_entries = self.dirs.view(view, &mut tx, lhs_entries, lhs_parent).await?;
+
+            let rhs_entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
+            let rhs_entries = self.dirs.view(view, &mut tx, rhs_entries, rhs_parent).await?;
 
             lhs_parent = lhs_entries.get(&dotdot).unwrap().ino;
             rhs_parent = rhs_entries.get(&dotdot).unwrap().ino;
