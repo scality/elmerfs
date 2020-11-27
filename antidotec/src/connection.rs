@@ -234,6 +234,10 @@ impl Transaction<'_> {
             })
             .collect();
 
+        if bound_objects.len() == 0 {
+            return Ok(ReadReply { objects: Vec::new() });
+        }
+
         message.set_boundobjects(protobuf::RepeatedField::from(bound_objects));
 
         self.connection.send(message).await?;
@@ -270,6 +274,11 @@ impl Transaction<'_> {
                 op
             })
             .collect();
+
+        if bound_objects.len() == 0 {
+            return Ok(());
+        }
+
         message.set_updates(protobuf::RepeatedField::from(bound_objects));
 
         self.connection.send(message).await?;
@@ -855,4 +864,28 @@ pub mod crdts {
             map
         }
     }
+}
+
+#[macro_export]
+macro_rules! chain {
+    ($head:expr, ($tail:expr),+) => {
+        std::iter::once($head).chain(chain!($($tail),+))
+    };
+    ($item:expr) => {
+        std::iter::once($item)
+    };
+}
+
+#[macro_export]
+macro_rules! reads {
+    ($($item:expr),*) => {
+        $crate::chain!($($item),*)
+    };
+}
+
+#[macro_export]
+macro_rules! updates {
+    ($($item:expr),*) => {
+        $crate::chain!($($item),*)
+    };
 }

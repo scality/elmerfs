@@ -60,7 +60,7 @@ macro_rules! session {
 
             if result.is_ok() {
                 let result: Result<_, ()> = Ok(()); /* omit the content */
-                tracing::debug!(?result);
+                tracing::error!(?result);
             } else {
                 match &result {
                     Err(crate::driver::Error::Sys(Errno::ENOENT)) => {}
