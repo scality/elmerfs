@@ -33,7 +33,7 @@ impl PageWriter {
 
         self.write_page(tx, ino, pages.start, offset, head).await?;
 
-        if remaining.len() > 0 {
+        if !remaining.is_empty() {
             self.write_extent(tx, ino, remaining_pages.start, remaining)
                 .await?;
         }
@@ -95,7 +95,7 @@ impl PageWriter {
 
         let remaining = content.chunks_exact(self.page_size as usize).remainder();
 
-        if remaining.len() > 0 {
+        if !remaining.is_empty() {
             self.write_page(tx, ino, page, 0, remaining).await?;
         }
 

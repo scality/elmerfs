@@ -3,8 +3,9 @@ use crate::driver::{Config, Result, ENOENT};
 use crate::key::Bucket;
 use crate::model::{
     dentries,
-    inode::{self, Kind},
+    inode,
 };
+use crate::driver::ino;
 use crate::view::View;
 use crate::view::{Name, NameRef};
 use antidotec::{Transaction};
@@ -61,8 +62,7 @@ impl DirDriver {
 
         self.check_directory_parent_ino(tx, ino, &entries[..], &mut entries_to_purge)
             .await?;
-        tracing::debug!(?entries_to_purge, "invalid pino.");
-        tracing::error!("checked");
+        tracing::debug!(?entries_to_purge, "invalid parent ino.");
 
         entries_to_purge.sort();
         entries_to_purge.dedup_by(|lhs, rhs| lhs.idx == rhs.idx);
@@ -92,7 +92,7 @@ impl DirDriver {
         let directories = sorted_entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.kind == inode::Kind::Directory && e.name.prefix != "..");
+            .filter(|(_, e)| ino::kind(e.ino) == ino::Directory && !Self::is_dot(&e.name.prefix));
 
         for (idx, entry) in directories {
             if entry.ino == previous_ino {
@@ -116,7 +116,7 @@ impl DirDriver {
         let directories = sorted_entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.kind == inode::Kind::Directory && e.name.prefix != "..");
+            .filter(|(_, e)| ino::kind(e.ino) == ino::Directory && !Self::is_dot(&e.name.prefix));
 
         let mut attrs = tx
             .read(
@@ -148,7 +148,7 @@ impl DirDriver {
         let mut purged = purged.iter().peekable();
 
         entries.iter().cloned().enumerate().filter_map(|(idx, e)| {
-            if e.kind != inode::Kind::Directory {
+            if ino::kind(e.ino) != ino::Directory {
                 return Some(e);
             }
 
@@ -203,7 +203,6 @@ impl DirDriver {
                 ino: entry.ino,
                 prefix: Arc::from(entry.name.prefix),
                 view: entry.name.view,
-                kind: entry.kind,
                 next: None,
             })
             .collect();
@@ -232,6 +231,10 @@ impl DirDriver {
             by_name,
         }
     }
+
+    pub fn is_dot(prefix: &str) -> bool {
+        prefix == "." || prefix == ".."
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -244,7 +247,6 @@ pub struct PurgeEntry {
 pub struct EntryView {
     pub ino: u64,
     pub view: View,
-    pub kind: Kind,
     pub prefix: Arc<str>,
     next: Option<usize>,
 }
@@ -257,7 +259,6 @@ impl EntryView {
                 prefix: String::from(&*self.prefix as &str),
                 view: self.view,
             },
-            kind: self.kind,
         }
     }
 }
@@ -344,7 +345,6 @@ impl DirView {
 pub struct EntryRef<'a> {
     pub name: Cow<'a, str>,
     pub ino: u64,
-    pub kind: Kind,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -387,13 +387,12 @@ impl<'a> Iterator for Iter<'a> {
 
         let show_alias = ((entry_list.head == entry_list.tail || entry.view == self.view)
             && self.listing_flavor == ListingFlavor::Partial)
-            || (&*entry.prefix == "." || &*entry.prefix == "..");
+            || DirDriver::is_dot(&*entry.prefix);
 
         let entry = if show_alias {
             Ok(EntryRef {
                 name: Cow::Borrowed(&*entry.prefix as &str),
                 ino: entry.ino,
-                kind: entry.kind,
             })
         } else {
             let username = match cached_username(&mut self.user_mapping, entry.view.uid) {
@@ -411,7 +410,6 @@ impl<'a> Iterator for Iter<'a> {
             Ok(EntryRef {
                 name: Cow::Owned(fully_qualified),
                 ino: entry.ino,
-                kind: entry.kind,
             })
         };
 

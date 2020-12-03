@@ -1,8 +1,6 @@
 use crate::key::{KeyWriter, Ty};
-use crate::model::inode::Kind;
 use crate::view::{Name, View};
 use antidotec::RawIdent;
-use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::mem::size_of;
 
@@ -32,13 +30,12 @@ impl Into<RawIdent> for Key {
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Entry {
     pub ino: u64,
-    pub kind: Kind,
     pub name: Name,
 }
 
 impl Entry {
-    pub fn new(name: Name, ino: u64, kind: Kind) -> Self {
-        Self { name, ino, kind }
+    pub fn new(name: Name, ino: u64) -> Self {
+        Self { name, ino }
     }
 
     fn into_bytes(&self) -> Vec<u8> {
@@ -51,14 +48,12 @@ impl Entry {
         content.reserve(self.byte_len());
 
         content.extend_from_slice(&self.ino.to_le_bytes()[..]);
-        content.push(self.kind as u8);
         content.extend_from_slice(&self.name.view.uid.to_le_bytes()[..]);
         content.extend_from_slice(&self.name.prefix.as_bytes());
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        let (ino, kind_view_prefix) = bytes.split_at(size_of::<u64>());
-        let (kind, view_prefix) = kind_view_prefix.split_at(size_of::<Kind>());
+        let (ino, view_prefix) = bytes.split_at(size_of::<u64>());
         let (view, prefix) = view_prefix.split_at(size_of::<View>());
 
         let mut ino_bytes = [0; size_of::<u64>()];
@@ -68,11 +63,9 @@ impl Entry {
         view_bytes.copy_from_slice(view);
 
         let prefix = String::from_utf8(prefix.into()).expect("valid utf8");
-        let kind = Kind::try_from(kind[0]).unwrap();
 
         Self {
             ino: u64::from_le_bytes(ino_bytes),
-            kind,
             name: Name {
                 view: View {
                     uid: u32::from_le_bytes(view.try_into().unwrap()),
@@ -83,7 +76,7 @@ impl Entry {
     }
 
     fn byte_len(&self) -> usize {
-        self.name.prefix.len() + size_of::<View>() + size_of::<u64>() + size_of::<Kind>()
+        self.name.prefix.len() + size_of::<View>() + size_of::<u64>()
     }
 }
 
@@ -91,7 +84,6 @@ pub use ops::*;
 
 mod ops {
     use super::{Entry, Key};
-    use crate::model::inode::Kind;
     use crate::view::{Name, View};
     use antidotec::{rwset, ReadQuery, ReadReply, UpdateQuery};
 
@@ -112,8 +104,8 @@ mod ops {
     }
 
     pub fn create(view: View, parent_ino: u64, ino: u64) -> UpdateQuery {
-        let dot = Entry::new(Name::new(".", view), ino, Kind::Directory);
-        let dotdot = Entry::new(Name::new("..", view), parent_ino, Kind::Directory);
+        let dot = Entry::new(Name::new(".", view), ino);
+        let dotdot = Entry::new(Name::new("..", view), parent_ino);
 
         rwset::insert(Key::new(ino))
             .add(dot.into_bytes())

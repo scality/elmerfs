@@ -32,8 +32,7 @@ impl PageLocks {
             range_signal: Arc::new(Condvar::new()),
         });
 
-        while let Some(_) =
-            Self::intersection_position(&by_ino[&ino].used_ranges[..], &requested_pages)
+        while Self::intersection_position(&by_ino[&ino].used_ranges[..], &requested_pages).is_some()
         {
             let range_lock = &by_ino[&ino];
 
@@ -63,7 +62,7 @@ impl PageLocks {
         range_lock.used_ranges.swap_remove(index);
         range_lock.range_signal.notify_all();
 
-        if range_lock.used_ranges.len() == 0 && Arc::strong_count(&range_lock.range_signal) == 1 {
+        if range_lock.used_ranges.is_empty()  && Arc::strong_count(&range_lock.range_signal) == 1 {
             by_ino.remove(&ino);
         }
     }
