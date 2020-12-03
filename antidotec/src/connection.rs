@@ -234,7 +234,7 @@ impl Transaction<'_> {
             })
             .collect();
 
-        if bound_objects.len() == 0 {
+        if bound_objects.is_empty() {
             return Ok(ReadReply { objects: Vec::new() });
         }
 
@@ -275,7 +275,7 @@ impl Transaction<'_> {
             })
             .collect();
 
-        if bound_objects.len() == 0 {
+        if bound_objects.is_empty() {
             return Ok(());
         }
 
@@ -392,7 +392,7 @@ impl ReadReply {
     pub fn rwset(&mut self, index: usize) -> Option<crdts::RwSet> {
         let rwset = self.object(CRDT_type::RWSET, index).unwrap().into_rwset();
 
-        if rwset.len() == 0 {
+        if rwset.is_empty() {
             None
         } else {
             Some(rwset)

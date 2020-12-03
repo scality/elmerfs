@@ -1,5 +1,5 @@
 mod dir;
-mod ino;
+pub(crate) mod ino;
 mod lock;
 mod page;
 mod pool;
@@ -13,7 +13,7 @@ use self::page::PageWriter;
 use self::pool::ConnectionPool;
 use crate::key::Bucket;
 use crate::model::{
-    inode::{self, Inode, Kind, Owner},
+    inode::{self, Inode, Owner},
     symlink,
     dentries,
 };
@@ -148,7 +148,6 @@ impl Driver {
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let root_inode = Inode {
             ino: ROOT_INO,
-            kind: inode::Kind::Directory,
             parent: 1,
             atime: t,
             ctime: t,
@@ -305,8 +304,8 @@ impl Driver {
 
                 mapped_entries.push(ReadDirEntry {
                     name: entry.name.into_owned(),
-                    ino,
-                    kind: entry.kind.to_file_type(),
+                    ino: entry.ino,
+                    kind: ino::file_type(ino)
                 });
             }
 
@@ -327,7 +326,7 @@ impl Driver {
         name: NameRef,
     ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(&mut connection).await?;
+        let ino = self.ino_counter.next(ino::Directory, &mut connection).await?;
 
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
@@ -356,7 +355,6 @@ impl Driver {
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             let inode = Inode {
                 ino,
-                kind: inode::Kind::Directory,
                 parent: parent_ino,
                 atime: t,
                 ctime: t,
@@ -378,7 +376,7 @@ impl Driver {
                 vec![
                     dentries::add_entry(
                         parent_ino,
-                        &dentries::Entry::new(name, ino, Kind::Directory),
+                        &dentries::Entry::new(name, ino),
                     ),
                     dentries::create(view, parent_ino, ino),
                     inode::create(&inode),
@@ -458,7 +456,7 @@ impl Driver {
         _rdev: u32,
     ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(&mut connection).await?;
+        let ino = self.ino_counter.next(ino::Regular, &mut connection).await?;
 
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
@@ -487,7 +485,6 @@ impl Driver {
             let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             let inode = Inode {
                 ino,
-                kind: inode::Kind::Regular,
                 parent: parent_ino,
                 atime: t,
                 ctime: t,
@@ -509,7 +506,7 @@ impl Driver {
                     inode::update_stats_and_size(&parent),
                     dentries::add_entry(
                         parent_ino,
-                        &dentries::Entry::new(name, ino, Kind::Regular),
+                        &dentries::Entry::new(name, ino),
                     ),
                     inode::create(&inode),
                 ],
@@ -736,7 +733,7 @@ impl Driver {
         /* Checks if target is a dir and empty. If it is the case, we have
         to delete it */
         match &target {
-            Some(target) if target.kind == inode::Kind::Directory && target.size == 0 => {
+            Some(target) if ino::kind(target.ino) == ino::Directory && target.size == 0 => {
                 let target_entry = target_entry.unwrap();
                 let target_dentry = target_entry.into_dentry();
 
@@ -784,7 +781,7 @@ impl Driver {
         let ino = entry.ino;
         let dentry_to_remove = entry.into_dentry();
         let new_name = new_name.canonicalize(view);
-        let new_dentry = &dentries::Entry::new(new_name, ino, inode.kind);
+        let new_dentry = &dentries::Entry::new(new_name, ino);
 
         tx.update(
             self.cfg.bucket,
@@ -856,7 +853,7 @@ impl Driver {
                 inode::update_stats_and_size(&parent),
                 dentries::add_entry(
                     new_parent_ino,
-                    &dentries::Entry::new(new_name, ino, Kind::Regular),
+                    &dentries::Entry::new(new_name, ino),
                 ),
                 inode::incr_link_count(ino, 1),
             ],
@@ -891,7 +888,7 @@ impl Driver {
         link: String,
     ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(&mut connection).await?;
+        let ino = self.ino_counter.next(ino::Symlink, &mut connection).await?;
 
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
@@ -923,7 +920,6 @@ impl Driver {
         let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let inode = inode::Inode {
             ino,
-            kind: inode::Kind::Symlink,
             parent: parent_ino,
             atime: t,
             ctime: t,
@@ -943,7 +939,7 @@ impl Driver {
             vec![
                 inode::create(&inode),
                 inode::update_stats_and_size(&parent),
-                dentries::add_entry(parent_ino, &dentries::Entry::new(name, ino, Kind::Symlink)),
+                dentries::add_entry(parent_ino, &dentries::Entry::new(name, ino)),
                 symlink::create(ino, link),
             ],
         )
@@ -970,7 +966,7 @@ impl Driver {
             };
 
             let must_be_removed =
-                (inode.kind == inode::Kind::Directory && inode.nlink <= 1) || inode.nlink == 0;
+                (ino::kind(ino) == ino::Directory && inode.nlink <= 1) || inode.nlink == 0;
 
             if must_be_removed {
                 tx.update(
@@ -983,7 +979,7 @@ impl Driver {
                 )
                 .await?;
 
-                if inode.kind == inode::Kind::Regular {
+                if ino::kind(ino) == ino::Regular {
                     /* At this point we should be (locally) the only one
                     seeing this file, don't bother locking up the pages */
                     pages.remove(&mut tx, ino, 0..inode.size).await?;

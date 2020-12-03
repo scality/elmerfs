@@ -7,7 +7,9 @@ const MAIN_BUCKET: Bucket = Bucket::new(0);
 
 fn main() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .add_directive("async_io::reactor=error".parse().unwrap())
+        .add_directive("polling=error".parse().unwrap());
 
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()

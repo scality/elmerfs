@@ -1,26 +1,9 @@
 use crate::key::{KeyWriter, Ty};
+use crate::driver::ino;
 use antidotec::RawIdent;
-use fuse::{FileAttr, FileType};
+use fuse::FileAttr;
 use std::mem;
-use std::{convert::TryFrom, time::Duration};
-
-#[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub enum Kind {
-    Regular = 0,
-    Directory = 1,
-    Symlink = 2,
-}
-
-impl Kind {
-    pub fn to_file_type(self) -> FileType {
-        match self {
-            Kind::Regular => FileType::RegularFile,
-            Kind::Directory => FileType::Directory,
-            Kind::Symlink => FileType::Symlink,
-        }
-    }
-}
+use std::time::Duration;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Owner {
@@ -44,26 +27,9 @@ impl Into<u64> for Owner {
     }
 }
 
-#[derive(Debug)]
-pub struct InvalidKindByte;
-
-impl TryFrom<u8> for Kind {
-    type Error = InvalidKindByte;
-
-    fn try_from(x: u8) -> Result<Kind, Self::Error> {
-        match x {
-            0 => Ok(Kind::Regular),
-            1 => Ok(Kind::Directory),
-            2 => Ok(Kind::Symlink),
-            _ => Err(InvalidKindByte),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Inode {
     pub ino: u64,
-    pub kind: Kind,
     pub parent: u64,
     pub atime: Duration,
     pub ctime: Duration,
@@ -88,7 +54,7 @@ impl Inode {
             mtime: timespec_from_duration(self.mtime),
             ctime: timespec_from_duration(self.ctime),
             crtime: timespec_from_duration(self.atime),
-            kind: self.kind.to_file_type(),
+            kind: ino::file_type(self.ino),
             perm: self.mode as u16,
             nlink: self.nlink as u32,
             uid: self.owner.uid,
@@ -103,7 +69,6 @@ impl Inode {
 #[repr(u8)]
 enum Field {
     Struct = 0,
-    Kind = 1,
     Parent = 2,
     Atime = 3,
     Ctime = 4,
@@ -159,7 +124,6 @@ pub use ops::*;
 mod ops {
     use super::{key, Field, Inode, Owner};
     use antidotec::{counter, lwwreg, rrmap, ReadQuery, ReadReply, UpdateQuery};
-    use std::convert::TryFrom;
 
     pub fn read(ino: u64) -> ReadQuery {
         rrmap::get(key(ino))
@@ -169,7 +133,6 @@ mod ops {
         let key = key(inode.ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_u8(key.field(Field::Kind), inode.kind as u8))
             .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
             .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
@@ -228,8 +191,6 @@ mod ops {
         let mut map = reply.rrmap(index)?;
         let key = key(ino);
 
-        let kind_byte =
-            lwwreg::read_u8(&map.remove(&key.field(Field::Kind)).unwrap().into_lwwreg());
         let parent = map.remove(&key.field(Field::Parent)).unwrap().into_lwwreg();
         let atime = map.remove(&key.field(Field::Atime)).unwrap().into_lwwreg();
         let ctime = map.remove(&key.field(Field::Ctime)).unwrap().into_lwwreg();
@@ -239,12 +200,10 @@ mod ops {
         let size = map.remove(&key.field(Field::Size)).unwrap().into_lwwreg();
         let nlink = map.remove(&key.field(Field::NLink)).unwrap().into_counter();
 
-        let kind = TryFrom::try_from(kind_byte).expect("invalid code byte");
         let owner = Owner::from(lwwreg::read_u64(&owner));
 
         Some(Inode {
             ino,
-            kind,
             parent: lwwreg::read_u64(&parent),
             atime: lwwreg::read_duration(&atime),
             ctime: lwwreg::read_duration(&ctime),
