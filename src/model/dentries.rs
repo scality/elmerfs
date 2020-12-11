@@ -84,7 +84,7 @@ pub use ops::*;
 
 mod ops {
     use super::{Entry, Key};
-    use crate::view::{Name, View};
+    use crate::view::View;
     use antidotec::{rwset, ReadQuery, ReadReply, UpdateQuery};
 
     pub fn read(ino: u64) -> ReadQuery {
@@ -103,13 +103,8 @@ mod ops {
         Some(entries)
     }
 
-    pub fn create(view: View, parent_ino: u64, ino: u64) -> UpdateQuery {
-        let dot = Entry::new(Name::new(".", view), ino);
-        let dotdot = Entry::new(Name::new("..", view), parent_ino);
-
+    pub fn create(_view: View, _parent_ino: u64, ino: u64) -> UpdateQuery {
         rwset::insert(Key::new(ino))
-            .add(dot.into_bytes())
-            .add(dotdot.into_bytes())
             .build()
     }
 

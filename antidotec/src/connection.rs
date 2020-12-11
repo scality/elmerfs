@@ -867,9 +867,9 @@ pub mod crdts {
 }
 
 #[macro_export]
-macro_rules! chain {
-    ($head:expr, ($tail:expr),+) => {
-        std::iter::once($head).chain(chain!($($tail),+))
+macro_rules! reads {
+    ($head:expr, $($tail:expr),+) => {
+        std::iter::once($head).chain(reads!($($tail),*))
     };
     ($item:expr) => {
         std::iter::once($item)
@@ -877,15 +877,11 @@ macro_rules! chain {
 }
 
 #[macro_export]
-macro_rules! reads {
-    ($($item:expr),*) => {
-        $crate::chain!($($item),*)
-    };
-}
-
-#[macro_export]
 macro_rules! updates {
-    ($($item:expr),*) => {
-        $crate::chain!($($item),*)
+    ($head:expr, $($tail:expr),+) => {
+        std::iter::once($head).chain(updates!($($tail),*))
+    };
+    ($item:expr) => {
+        std::iter::once($item)
     };
 }

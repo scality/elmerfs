@@ -1,21 +1,16 @@
+use crate::driver::ino;
 use crate::driver::pool::ConnectionPool;
 use crate::driver::{Config, Result, ENOENT};
-use crate::key::Bucket;
-use crate::model::{
-    dentries,
-    inode,
-};
-use crate::driver::ino;
+use crate::model::{dentries, inode};
+use crate::time;
 use crate::view::View;
 use crate::view::{Name, NameRef};
-use antidotec::{Transaction};
+use antidotec::{reads, updates, Transaction};
+use nix::unistd;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::iter;
-use std::sync::Arc;
-use async_std::task;
 use std::str;
-use nix::unistd;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(super) struct DirDriver {
@@ -34,16 +29,24 @@ impl DirDriver {
         tx: &mut Transaction<'_>,
         ino: u64,
     ) -> Result<DirView> {
-        let mut reply = tx.read(self.cfg.bucket, iter::once(dentries::read(ino))).await?;
-        let entries = dentries::decode(&mut reply, 0).ok_or(ENOENT)?;
+        let mut reply = tx
+            .read(
+                self.cfg.bucket,
+                reads!(inode::read(ino), dentries::read(ino)),
+            )
+            .await?;
 
+        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
         Ok(self.view(view, tx, entries, ino).await?)
     }
 
-    pub(super) async fn view(&self, view: View, tx: &mut Transaction<'_>,
-                             mut entries: Vec<dentries::Entry>,
-                             ino: u64) -> Result<DirView>
-    {
+    pub(super) async fn view(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        mut entries: Vec<dentries::Entry>,
+        ino: u64,
+    ) -> Result<DirView> {
         entries.sort();
 
         /* When loading a directory, we have a series of cleanup to do:
@@ -58,27 +61,30 @@ impl DirDriver {
         from the same transaction. */
         let mut entries_to_purge = Vec::new();
         self.collect_directory_duplicates(&entries[..], &mut entries_to_purge);
-        tracing::debug!(?entries_to_purge, "duplicates.");
 
         self.check_directory_parent_ino(tx, ino, &entries[..], &mut entries_to_purge)
             .await?;
-        tracing::debug!(?entries_to_purge, "invalid parent ino.");
 
         entries_to_purge.sort();
         entries_to_purge.dedup_by(|lhs, rhs| lhs.idx == rhs.idx);
 
-        tracing::debug!(?entries, ?entries_to_purge);
+        tracing::debug!(?entries_to_purge);
         let view = if !entries_to_purge.is_empty() {
-            let entries: Arc<[dentries::Entry]> = Arc::from(entries);
             let entries_to_purge = entries_to_purge;
 
-            let cleaned_entries = self.clean_loaded_entries(entries.clone(), &entries_to_purge[..]);
-            self.schedule_purge(ino, entries, entries_to_purge);
+            let cleaned_entries = self.clean_loaded_entries(&entries[..], &entries_to_purge[..]);
+
+            let mut reply = tx.read(self.cfg.bucket, reads!(inode::read(ino))).await?;
+            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+
+            self.purge(tx, ino, &inode, &entries[..], entries_to_purge)
+                .await?;
 
             self.load_dir_view(view, cleaned_entries)
         } else {
             self.load_dir_view(view, entries)
         };
+
         Ok(view)
     }
 
@@ -118,7 +124,7 @@ impl DirDriver {
             .enumerate()
             .filter(|(_, e)| ino::kind(e.ino) == ino::Directory && !Self::is_dot(&e.name.prefix));
 
-        let mut attrs = tx
+        let mut children = tx
             .read(
                 self.cfg.bucket,
                 directories.clone().map(|(_, d)| inode::read(d.ino)),
@@ -126,9 +132,10 @@ impl DirDriver {
             .await?;
 
         for (query_idx, (idx, entry)) in directories.enumerate() {
-            let attr = inode::decode(entry.ino, &mut attrs, query_idx).ok_or(ENOENT)?;
-            if attr.parent != parent_ino {
-                tracing::debug!(?attr, parent_ino, "invalid parent_ino");
+            let child_inode = inode::decode(entry.ino, &mut children, query_idx).ok_or(ENOENT)?;
+
+            if child_inode.dotdot != Some(parent_ino) {
+                tracing::debug!(?child_inode, parent_ino, "invalid parent_ino");
 
                 invalid.push(PurgeEntry {
                     idx,
@@ -142,55 +149,61 @@ impl DirDriver {
 
     fn clean_loaded_entries(
         &self,
-        entries: Arc<[dentries::Entry]>,
+        entries: &[dentries::Entry],
         purged: &[PurgeEntry],
     ) -> Vec<dentries::Entry> {
         let mut purged = purged.iter().peekable();
 
-        entries.iter().cloned().enumerate().filter_map(|(idx, e)| {
-            if ino::kind(e.ino) != ino::Directory {
-                return Some(e);
-            }
-
-            match purged.peek() {
-                Some(purged_entry) if purged_entry.idx == idx => {
-                    purged.next();
-                    None
+        entries
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter_map(|(idx, e)| {
+                if ino::kind(e.ino) != ino::Directory {
+                    return Some(e);
                 }
-                _ => Some(e),
-            }
-        }).collect()
+
+                match purged.peek() {
+                    Some(purged_entry) if purged_entry.idx == idx => {
+                        purged.next();
+                        None
+                    }
+                    _ => Some(e),
+                }
+            })
+            .collect()
     }
 
-    fn schedule_purge(&self, parent_ino: u64, entries: Arc<[dentries::Entry]>, purged: Vec<PurgeEntry>) {
-        #[tracing::instrument(skip(bucket, pool))]
-        async fn purge(
-            bucket: Bucket,
-            pool: Arc<ConnectionPool>,
-            entries: Arc<[dentries::Entry]>,
-            parent_ino: u64,
-            purge_entry: PurgeEntry,
-        ) -> Result<()> {
-            let mut connection = pool.acquire().await?;
-            let mut tx = connection.transaction().await?;
-
-            let entry = &entries[purge_entry.idx];
-            tx.update(bucket, iter::once(dentries::remove_entry(parent_ino, entry))).await?;
-            tx.commit().await?;
-
-            Ok(())
-        }
+    #[tracing::instrument(skip(tx))]
+    async fn purge(
+        &self,
+        tx: &mut Transaction<'_>,
+        parent_ino: u64,
+        parent_inode: &inode::Inode,
+        entries: &[dentries::Entry],
+        purged: Vec<PurgeEntry>,
+    ) -> Result<()> {
+        let ts = time::now();
 
         for purged in purged {
-            let bucket = self.cfg.bucket;
-            let pool = self.pool.clone();
+            let entry = &entries[purged.idx];
+            let old_link = parent_inode
+                .links
+                .find(purged.ino, &entry.name)
+                .unwrap()
+                .clone();
 
-            let entries = entries.clone();
-
-            /* We don't bother at handling the result, they will be logged and
-               retried the next time the directory will be reloaded */
-            task::spawn(purge(bucket, pool, entries, parent_ino, purged));
+            tx.update(
+                self.cfg.bucket,
+                updates!(
+                    inode::remove_link(ts, entry.ino, old_link),
+                    dentries::remove_entry(parent_ino, entry)
+                ),
+            )
+            .await?;
         }
+
+        Ok(())
     }
 
     fn load_dir_view(&self, view: View, sorted_entries: Vec<dentries::Entry>) -> DirView {
@@ -385,9 +398,8 @@ impl<'a> Iterator for Iter<'a> {
         let entry = self.entries.next()?;
         let entry_list = self.by_name[&entry.prefix];
 
-        let show_alias = ((entry_list.head == entry_list.tail || entry.view == self.view)
-            && self.listing_flavor == ListingFlavor::Partial)
-            || DirDriver::is_dot(&*entry.prefix);
+        let show_alias = (entry_list.head == entry_list.tail || entry.view == self.view)
+            && self.listing_flavor == ListingFlavor::Partial;
 
         let entry = if show_alias {
             Ok(EntryRef {
