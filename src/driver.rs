@@ -342,8 +342,6 @@ impl Driver {
             });
         }
 
-        tracing::error!(?mapped_entries);
-
         tx.commit().await?;
         Ok(mapped_entries)
     }
