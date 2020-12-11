@@ -5,8 +5,15 @@ use nix::unistd;
 pub const REF_SEP: &str = ":";
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(C)]
 pub struct View {
     pub uid: u32,
+}
+
+impl View {
+    pub fn root() -> Self {
+        Self { uid: 0 }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

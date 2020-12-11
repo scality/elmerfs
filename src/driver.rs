@@ -4,6 +4,8 @@ mod lock;
 mod page;
 mod pool;
 
+use crate::time;
+
 pub use self::pool::AddressBook;
 
 use self::dir::DirDriver;
@@ -13,29 +15,30 @@ use self::page::PageWriter;
 use self::pool::ConnectionPool;
 use crate::key::Bucket;
 use crate::model::{
-    inode::{self, Inode, Owner},
-    symlink,
     dentries,
+    inode::{self, Owner},
+    symlink,
 };
-use crate::view::{NameRef, View};
-use antidotec::{self, Connection, Transaction, TransactionLocks};
+use crate::view::{Name, NameRef, View};
+use antidotec::{self, reads, updates, Connection, Transaction, TransactionLocks};
 use async_std::sync::Arc;
 use async_std::task;
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thiserror::Error;
 
 pub use self::dir::ListingFlavor;
 
-const ROOT_INO: u64 = 1;
-const MAX_CONNECTIONS: usize = 32;
-const PAGE_SIZE: u64 = 64 * 1024;
+pub(crate) const ROOT_INO: u64 = 1;
+pub(crate) const MAX_CONNECTIONS: usize = 32;
+pub(crate) const PAGE_SIZE: u64 = 64 * 1024;
 
 const ENOENT: Error = Error::Sys(Errno::ENOENT);
-
-
+const EINVAL: Error = Error::Sys(Errno::EINVAL);
+const EEXIST: Error = Error::Sys(Errno::EEXIST);
+const ENOTEMPTY: Error = Error::Sys(Errno::ENOTEMPTY);
 
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
@@ -134,6 +137,8 @@ impl Driver {
 
     #[tracing::instrument(skip(connection))]
     pub(crate) async fn make_root(cfg: &Config, connection: &mut Connection) -> Result<()> {
+        let ts = time::now();
+
         let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ROOT_INO)] }).await?;
 
         match Self::attr_of(cfg, &mut tx, ROOT_INO).await {
@@ -145,29 +150,28 @@ impl Driver {
             Err(error) => return Err(error),
         };
 
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let root_inode = Inode {
+        let links = [
+            inode::Link::new(ROOT_INO, Name::new(".", View::root())),
+            inode::Link::new(ROOT_INO, Name::new("..", View::root())),
+        ];
+        let root = inode::CreateDesc {
             ino: ROOT_INO,
-            parent: 1,
-            atime: t,
-            ctime: t,
-            mtime: t,
             owner: Owner { uid: 0, gid: 0 },
-            mode: 0o777,
-            size: 0,
-            nlink: 3,
+            links: links.iter().cloned(),
+            size: PAGE_SIZE,
+            mode: 0o755,
+            dotdot: Some(ROOT_INO),
         };
-
         tx.update(
             cfg.bucket,
-            vec![
-                inode::create(&root_inode),
-                dentries::create(View { uid: 0 }, ROOT_INO, ROOT_INO),
-            ],
+            updates!(
+                inode::create(ts, root),
+                dentries::create(View { uid: 0 }, ROOT_INO, ROOT_INO)
+            ),
         )
         .await?;
-        tx.commit().await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -231,9 +235,9 @@ impl Driver {
                 }
 
                 inode.size = new_size;
-                inode::update_stats_and_size(&inode)
+                inode::update_stats_with_size(ino, &inode)
             } else {
-                inode::update_stats(&inode)
+                inode::update_stats(ino, &inode)
             };
 
             tx.update(self.cfg.bucket, std::iter::once(update)).await?;
@@ -242,7 +246,7 @@ impl Driver {
         };
 
         tx.commit().await?;
-        Ok(inode.attr())
+        Ok(inode.attr(ino))
     }
 
     #[tracing::instrument(skip(self))]
@@ -259,19 +263,21 @@ impl Driver {
         .await?;
 
         let entries = self.dirs.load(view, &mut tx, parent_ino).await?;
-        let attrs = match entries.get(&name) {
+        let attr = match entries.get(&name) {
             Some(entry) => Self::attr_of(&self.cfg, &mut tx, entry.ino).await,
-            None => Err(Error::Sys(Errno::ENOENT)),
+            None => Err(ENOENT),
         };
 
         tx.commit().await?;
-        attrs
+        attr
     }
 
     async fn attr_of(cfg: &Config, tx: &mut Transaction<'_>, ino: u64) -> Result<FileAttr> {
         let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
+
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-        Ok(inode.attr())
+
+        Ok(inode.attr(ino))
     }
 
     #[tracing::instrument(skip(self))]
@@ -295,25 +301,51 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { shared: [dentries::key(ino)] }).await?;
 
-        let entries = {
-            let entries = self.dirs.load(view, &mut tx, ino).await?;
+        let mut reply = tx
+            .read(
+                self.cfg.bucket,
+                reads!(inode::read(ino), dentries::read(ino)),
+            )
+            .await?;
 
-            let mut mapped_entries = Vec::with_capacity(entries.len());
-            for entry in entries.iter_from(self.cfg.listing_flavor, offset as usize) {
-                let entry = entry?;
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
+        let entries = self.dirs.view(view, &mut tx, entries, ino).await?;
 
-                mapped_entries.push(ReadDirEntry {
-                    name: entry.name.into_owned(),
-                    ino: entry.ino,
-                    kind: ino::file_type(ino)
-                });
-            }
+        let mut mapped_entries = Vec::with_capacity((offset < 2) as usize * 2 + entries.len());
 
-            mapped_entries
-        };
+        if offset < 1 {
+            mapped_entries.push(ReadDirEntry {
+                name: ".".into(),
+                ino,
+                kind: ino::file_type(ino),
+            });
+        }
+
+        if offset < 2 {
+            let dotdot = inode.dotdot.unwrap();
+            mapped_entries.push(ReadDirEntry {
+                name: "..".into(),
+                ino: dotdot,
+                kind: ino::file_type(dotdot),
+            });
+        }
+
+        let offset = offset.saturating_sub(2);
+        for entry in entries.iter_from(self.cfg.listing_flavor, offset as usize) {
+            let entry = entry?;
+
+            mapped_entries.push(ReadDirEntry {
+                name: entry.name.into_owned(),
+                ino: entry.ino,
+                kind: ino::file_type(entry.ino),
+            });
+        }
+
+        tracing::error!(?mapped_entries);
 
         tx.commit().await?;
-        Ok(entries)
+        Ok(mapped_entries)
     }
 
     #[tracing::instrument(skip(self))]
@@ -325,8 +357,13 @@ impl Driver {
         parent_ino: u64,
         name: NameRef,
     ) -> Result<FileAttr> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(ino::Directory, &mut connection).await?;
+        let ino = self
+            .ino_counter
+            .next(ino::Directory, &mut connection)
+            .await?;
 
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
@@ -336,60 +373,65 @@ impl Driver {
         })
         .await?;
 
-        let attr = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
-                )
-                .await?;
-
-            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
-            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
-
-            if entries.contains_key(&name) {
-                return Err(Error::Sys(Errno::EEXIST));
-            }
-
-            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let inode = Inode {
-                ino,
-                parent: parent_ino,
-                atime: t,
-                ctime: t,
-                mtime: t,
-                owner,
-                mode,
-                size: 0,
-                nlink: 2,
-            };
-            parent_inode.mtime = t;
-            parent_inode.atime = t;
-            parent_inode.size += 1;
-
-            let attr = inode.attr();
-
-            let name = name.canonicalize(view);
-            tx.update(
-                self.cfg.bucket,
-                vec![
-                    dentries::add_entry(
-                        parent_ino,
-                        &dentries::Entry::new(name, ino),
-                    ),
-                    dentries::create(view, parent_ino, ino),
-                    inode::create(&inode),
-                    inode::update_stats_and_size(&parent_inode),
-                ],
-            )
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
 
-            attr
+        /* 1. Check if the entry doesn't already exists. */
+        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
+        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+        if entries.contains_key(&name) {
+            return Err(EEXIST);
+        }
+
+        /* 2. We are good from our point of view, create the entry.
+        It doesn't say that someone is also trying to create
+        the same entry, but we have exclusivness with our view_id. */
+        let name = name.canonicalize(view);
+        let links = [
+            inode::Link::new(parent_ino, name.clone()),
+            inode::Link::new(ino, Name::new(".", view)),
+        ];
+        let dotdot_link = inode::Link::new(ino, Name::new("..", view));
+        let desc = inode::CreateDesc {
+            ino,
+            links: links.iter().cloned(),
+            mode,
+            size: PAGE_SIZE,
+            owner,
+            dotdot: Some(parent_ino),
         };
+        let dentry = dentries::Entry::new(name, ino);
+
+        tx.update(
+            self.cfg.bucket,
+            updates!(
+                inode::create(ts, desc),
+                dentries::add_entry(parent_ino, &dentry),
+                inode::add_link(ts, parent_ino, dotdot_link),
+                dentries::create(view, parent_ino, ino)
+            ),
+        )
+        .await?;
 
         tx.commit().await?;
-        Ok(attr)
+
+        Ok(FileAttr {
+            atime: time::timespec(ts),
+            ctime: time::timespec(ts),
+            mtime: time::timespec(ts),
+            crtime: time::timespec(ts),
+            blocks: 1,
+            rdev: 0,
+            size: PAGE_SIZE,
+            ino,
+            gid: owner.gid,
+            uid: owner.uid,
+            perm: mode as u16,
+            kind: FileType::Directory,
+            flags: 0,
+            nlink: 2,
+        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -399,49 +441,59 @@ impl Driver {
         parent_ino: u64,
         name: NameRef,
     ) -> Result<()> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
-            exclusive: [
-                inode::key(parent_ino),
-                dentries::key(parent_ino)
-            ]
+            exclusive: [inode::key(parent_ino), dentries::key(parent_ino)]
         })
         .await?;
 
-        let ino = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
-                )
-                .await?;
-
-            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
-            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
-            let entry = entries.get(&name).ok_or(ENOENT)?;
-
-            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            parent_inode.atime = t;
-            parent_inode.mtime = t;
-            parent_inode.size = parent_inode.size.saturating_sub(1);
-
-            let dentry = entry.into_dentry();
-            tx.update(
+        let mut reply = tx
+            .read(
                 self.cfg.bucket,
-                vec![
-                    inode::decr_link_count(entry.ino, 1),
-                    dentries::remove_entry(parent_ino, &dentry),
-                    inode::update_stats_and_size(&parent_inode),
-                ],
+                reads!(inode::read(parent_ino), dentries::read(parent_ino)),
             )
             .await?;
 
-            entry.ino
-        };
+        let parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+        let parent_entries = dentries::decode(&mut reply, 1).unwrap_or_default();
+        let parent_entries = self.dirs.view(view, &mut tx, parent_entries, parent_ino).await?;
+        let entry = parent_entries.get(&name).ok_or(ENOENT)?;
+
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(inode::read(entry.ino), dentries::read(entry.ino)))
+            .await?;
+        let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
+        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
+        let entries = self.dirs.view(view, &mut tx, entries, entry.ino).await?;
+
+        if entries.len() > 0 {
+            return Err(ENOTEMPTY);
+        }
+
+        let dentry_to_remove = entry.into_dentry();
+        let old_link = inode
+            .links
+            .find(parent_ino, &dentry_to_remove.name)
+            .unwrap();
+
+        let dotdot = Name::new("..", dentry_to_remove.name.view);
+        let old_dotdot_link = parent_inode.links.find(entry.ino, &dotdot).unwrap();
+
+        tx.update(
+            self.cfg.bucket,
+            updates!(
+                dentries::remove_entry(parent_ino, &dentry_to_remove),
+                inode::remove_link(ts, parent_ino, old_dotdot_link.clone()),
+                inode::unlink_from_parent(ts, entry.ino, old_link.clone())
+            ),
+        )
+        .await?;
 
         tx.commit().await?;
-        self.schedule_delete(ino);
+
+        self.schedule_delete(entry.ino);
         Ok(())
     }
 
@@ -455,6 +507,8 @@ impl Driver {
         name: NameRef,
         _rdev: u32,
     ) -> Result<FileAttr> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
         let ino = self.ino_counter.next(ino::Regular, &mut connection).await?;
 
@@ -466,62 +520,60 @@ impl Driver {
         })
         .await?;
 
-        let attr = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
-                )
-                .await?;
-
-            let mut parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
-            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
-
-            if entries.contains_key(&name) {
-                return Err(Error::Sys(Errno::EEXIST));
-            }
-
-            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let inode = Inode {
-                ino,
-                parent: parent_ino,
-                atime: t,
-                ctime: t,
-                mtime: t,
-                owner,
-                mode,
-                size: 0,
-                nlink: 1,
-            };
-            parent.mtime = t;
-            parent.ctime = t;
-            parent.size += 1;
-
-            let attr = inode.attr();
-            let name = name.canonicalize(view);
-            tx.update(
-                self.cfg.bucket,
-                vec![
-                    inode::update_stats_and_size(&parent),
-                    dentries::add_entry(
-                        parent_ino,
-                        &dentries::Entry::new(name, ino),
-                    ),
-                    inode::create(&inode),
-                ],
-            )
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
 
-            attr
+        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
+        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+        if entries.contains_key(&name) {
+            return Err(EEXIST);
+        }
+
+        let name = name.canonicalize(view);
+        let links = [inode::Link::new(parent_ino, name.clone())];
+        let inode = inode::CreateDesc {
+            ino,
+            links: links.iter().cloned(),
+            mode,
+            owner,
+            size: 0,
+            dotdot: None,
         };
+        tx.update(
+            self.cfg.bucket,
+            vec![
+                inode::create(ts, inode),
+                inode::touch(ts, parent_ino),
+                dentries::add_entry(parent_ino, &dentries::Entry::new(name, ino)),
+            ],
+        )
+        .await?;
 
         tx.commit().await?;
-        Ok(attr)
+
+        Ok(FileAttr {
+            atime: time::timespec(ts),
+            ctime: time::timespec(ts),
+            mtime: time::timespec(ts),
+            crtime: time::timespec(ts),
+            blocks: 1,
+            rdev: 0,
+            size: 0,
+            ino,
+            gid: owner.gid,
+            uid: owner.uid,
+            perm: mode as u16,
+            kind: FileType::RegularFile,
+            flags: 0,
+            nlink: 1,
+        })
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn unlink(&self, view: View, parent_ino: u64, name: NameRef) -> Result<()> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
@@ -531,39 +583,40 @@ impl Driver {
         })
         .await?;
 
-        let ino = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
-                )
-                .await?;
-
-            let mut parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
-            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
-            let entry = entries.get(&name).ok_or(ENOENT)?;
-
-            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            parent_inode.mtime = t;
-            parent_inode.ctime = t;
-            parent_inode.size -= 1;
-
-            let dentry = entry.into_dentry();
-            tx.update(
-                self.cfg.bucket,
-                vec![
-                    dentries::remove_entry(parent_ino, &dentry),
-                    inode::decr_link_count(entry.ino, 1),
-                ],
-            )
+        /* 1. Get the entry to unlink. */
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
 
-            entry.ino
-        };
+        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
+        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+        let entry = entries.get(&name).ok_or(ENOENT)?;
+        let dentry_to_remove = entry.into_dentry();
+
+        /* 2. Get the inode to remove the link with the view that it was
+        created from. */
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(inode::read(entry.ino)))
+            .await?;
+
+        let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
+        let link = inode
+            .links
+            .find(parent_ino, &dentry_to_remove.name)
+            .cloned()
+            .ok_or(ENOENT)?;
+
+        tx.update(
+            self.cfg.bucket,
+            updates!(
+                dentries::remove_entry(parent_ino, &dentry_to_remove),
+                inode::remove_link(ts, entry.ino, link)
+            ),
+        )
+        .await?;
 
         tx.commit().await?;
-        self.schedule_delete(ino);
+        self.schedule_delete(entry.ino);
         Ok(())
     }
 
@@ -595,6 +648,8 @@ impl Driver {
     }
 
     pub(crate) async fn write_nolock(&self, ino: u64, bytes: &[u8], offset: u64) -> Result<()> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
@@ -605,17 +660,13 @@ impl Driver {
 
         let wrote_above_size = (offset + bytes.len() as u64).saturating_sub(inode.size);
 
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        inode.atime = t;
-        inode.mtime = t;
-
         let update = if wrote_above_size > 0 {
             inode.size += wrote_above_size;
 
             tracing::debug!(extended = inode.size);
-            inode::update_stats_and_size(&inode)
+            inode::update_stats_with_size(ino, &inode)
         } else {
-            inode::update_stats(&inode)
+            inode::touch(ts, ino)
         };
 
         tx.update(self.cfg.bucket, std::iter::once(update)).await?;
@@ -645,7 +696,7 @@ impl Driver {
         let read_end = (offset + len as u64).min(inode.size);
 
         if offset > inode.size {
-            return Err(Error::Sys(Errno::EINVAL));
+            return Err(EINVAL);
         }
 
         let truncated_len = read_end - offset;
@@ -672,7 +723,7 @@ impl Driver {
         new_name: NameRef,
     ) -> Result<()> {
         let parents_to_lock = self
-            .up_until_common_ancestor(view, parent_ino, new_parent_ino)
+            .up_until_common_ancestor(parent_ino, new_parent_ino)
             .await?;
         tracing::trace!(?parents_to_lock);
 
@@ -687,115 +738,307 @@ impl Driver {
             })
             .await?;
 
-        let (mut parent, mut new_parent, parent_entries, new_parent_entries) = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![
-                        inode::read(parent_ino),
-                        inode::read(new_parent_ino),
-                        dentries::read(parent_ino),
-                        dentries::read(new_parent_ino),
-                    ],
-                )
-                .await?;
-
-            (
-                inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?,
-                inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?,
-                dentries::decode(&mut reply, 2).ok_or(ENOENT)?,
-                dentries::decode(&mut reply, 3).ok_or(ENOENT)?,
+        /* 1. Fetch the source and destination dir entries, this is used
+        to determine the kind of rename that we are dealing with. */
+        let mut reply = tx
+            .read(
+                self.cfg.bucket,
+                reads!(dentries::read(parent_ino), dentries::read(new_parent_ino)),
             )
-        };
-
-        let parent_entries = self.dirs.view(view, &mut tx, parent_entries, parent_ino).await?;
-        let new_parent_entries = self
-            .dirs
-            .view(view, &mut tx, new_parent_entries, new_parent_ino)
             .await?;
 
-        let entry = parent_entries.get(&name).ok_or(ENOENT)?;
-        let target_entry = new_parent_entries.get(&new_name);
+        let parent_entries = self
+            .dirs
+            .view(
+                view,
+                &mut tx,
+                dentries::decode(&mut reply, 0).unwrap_or_default(),
+                parent_ino,
+            )
+            .await?;
 
-        let (mut inode, target) = {
-            let reads = match target_entry {
-                Some(target_entry) => vec![inode::read(entry.ino), inode::read(target_entry.ino)],
-                None => vec![inode::read(entry.ino)],
-            };
-            let mut reply = tx.read(self.cfg.bucket, reads).await?;
+        let new_parent_entries = self
+            .dirs
+            .view(
+                view,
+                &mut tx,
+                dentries::decode(&mut reply, 1).unwrap_or_default(),
+                new_parent_ino,
+            )
+            .await?;
 
-            let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
-            let target = target_entry.and_then(|e| inode::decode(e.ino, &mut reply, 1));
+        let entry = parent_entries.get(&name).cloned().ok_or(ENOENT)?;
 
-            (inode, target)
+        let state = RenameState {
+            entry: entry.clone(),
+            parent_ino,
+            new_parent_ino,
+            new_name,
+            new_parent_entries,
         };
 
-        /* Checks if target is a dir and empty. If it is the case, we have
-        to delete it */
-        match &target {
-            Some(target) if ino::kind(target.ino) == ino::Directory && target.size == 0 => {
-                let target_entry = target_entry.unwrap();
-                let target_dentry = target_entry.into_dentry();
-
-                tx.update(
-                    self.cfg.bucket,
-                    vec![
-                        inode::remove(target_entry.ino),
-                        dentries::remove(target_entry.ino),
-                        dentries::remove_entry(new_parent_ino, &target_dentry),
-                    ],
-                )
-                .await?;
+        match ino::kind(entry.ino) {
+            ino::Directory => {
+                self.rename_dir(view, &mut tx, state).await?;
             }
-            Some(target) if target.nlink == 1 => {
-                let target_entry = target_entry.unwrap();
-                let target_dentry = target_entry.into_dentry();
-
-                tx.update(
-                    self.cfg.bucket,
-                    vec![
-                        inode::remove(target.ino),
-                        dentries::remove_entry(new_parent_ino, &target_dentry),
-                        symlink::remove(target.ino),
-                    ],
-                )
-                .await?;
+            _ => {
+                self.rename_file(view, &mut tx, state).await?;
             }
-            _ => {}
         }
 
-        /* At this point we are sure that target does not exists
-        and we are ready to perform the rename */
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        new_parent.size += 1;
-        new_parent.atime = t;
-        new_parent.mtime = t;
+        tx.commit().await?;
+        Ok(())
+    }
 
-        parent.size -= 1;
-        parent.atime = t;
-        parent.mtime = t;
+    async fn rename_file(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        state: RenameState,
+    ) -> Result<()> {
+        let target_entry = state.new_parent_entries.get(&state.new_name).cloned();
 
-        inode.atime = t;
-        inode.parent = new_parent_ino;
+        match target_entry {
+            Some(entry) => self.rename_file_to_occupied(view, tx, state, entry).await,
+            None => self.rename_file_to_vacant(view, tx, state).await,
+        }
+    }
 
-        let ino = entry.ino;
-        let dentry_to_remove = entry.into_dentry();
-        let new_name = new_name.canonicalize(view);
-        let new_dentry = &dentries::Entry::new(new_name, ino);
+    async fn rename_file_to_vacant(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        state: RenameState,
+    ) -> Result<()> {
+        let ts = time::now();
+
+        let ino = state.entry.ino;
+        let mut reply = tx.read(self.cfg.bucket, reads!(inode::read(ino))).await?;
+
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+
+        let new_name = state.new_name.canonicalize(view);
+        let dentry_to_remove = state.entry.into_dentry();
+        let dentry_to_add = dentries::Entry::new(new_name.clone(), state.entry.ino);
+
+        let old_link = inode
+            .links
+            .find(state.parent_ino, &dentry_to_remove.name)
+            .cloned()
+            .unwrap();
+        let new_link = inode::Link::new(state.new_parent_ino, dentry_to_add.name.clone());
 
         tx.update(
             self.cfg.bucket,
-            vec![
-                inode::update_stats_and_size(&parent),
-                inode::update_stats_and_size(&new_parent),
-                inode::update_stats(&inode),
-                dentries::remove_entry(parent_ino, &dentry_to_remove),
-                dentries::add_entry(new_parent_ino, new_dentry),
-            ],
+            updates!(
+                dentries::remove_entry(state.parent_ino, &dentry_to_remove),
+                dentries::add_entry(state.new_parent_ino, &dentry_to_add),
+                inode::remove_link(ts, ino, old_link),
+                inode::add_link(ts, ino, new_link)
+            ),
         )
         .await?;
 
-        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn rename_file_to_occupied(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        state: RenameState,
+        target: dir::EntryView,
+    ) -> Result<()> {
+        let ts = time::now();
+
+        /* Don't allow overwrite of directory. */
+        if ino::kind(target.ino) == ino::Directory {
+            return Err(EEXIST);
+        }
+
+        /* 1. Read the target inode to remove the link in the target directory. */
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(inode::read(target.ino)))
+            .await?;
+        let target_inode = inode::decode(target.ino, &mut reply, 0).ok_or(ENOENT)?;
+
+        let dentry_to_remove = target.into_dentry();
+        let target_nlink = target_inode.links.nlink();
+        if target_nlink > 1 {
+            let link = target_inode
+                .links
+                .find(state.new_parent_ino, &dentry_to_remove.name)
+                .cloned()
+                .unwrap();
+
+            tx.update(
+                self.cfg.bucket,
+                updates!(
+                    inode::remove_link(ts, target.ino, link),
+                    dentries::remove_entry(state.new_parent_ino, &dentry_to_remove)
+                ),
+            )
+            .await?;
+        } else {
+            tx.update(
+                self.cfg.bucket,
+                updates!(
+                    inode::remove(target.ino),
+                    symlink::remove(target.ino),
+                    dentries::remove_entry(state.new_parent_ino, &dentry_to_remove)
+                ),
+            )
+            .await?;
+        }
+
+        self.rename_file_to_vacant(view, tx, state).await
+    }
+
+    async fn rename_dir(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        state: RenameState,
+    ) -> Result<()> {
+        let target_entry = state.new_parent_entries.get(&state.new_name).cloned();
+        match target_entry {
+            Some(entry) => self.rename_dir_to_occupied(view, tx, state, entry).await,
+            None => self.rename_dir_to_vacant(view, tx, state).await,
+        }
+    }
+
+    async fn rename_dir_to_occupied(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        state: RenameState,
+        target: dir::EntryView,
+    ) -> Result<()> {
+        let ts = time::now();
+
+        /* Only rename to empty directories are accepted. */
+        if ino::kind(target.ino) != ino::Directory {
+            return Err(EEXIST);
+        }
+
+        /* 1. Fetch target dentries to check if the destination is empty. */
+        let mut reply = tx
+            .read(
+                self.cfg.bucket,
+                reads!(
+                    inode::read(state.new_parent_ino),
+                    dentries::read(target.ino)
+                ),
+            )
+            .await?;
+
+        let new_parent_inode = inode::decode(state.new_parent_ino, &mut reply, 0).ok_or(ENOENT)?;
+
+        /* dotdot link must have the same view as the found dentry */
+        let target_dentry = target.into_dentry();
+        let dotdot = Name::new("..", target_dentry.name.view);
+        let old_dotdot_link = new_parent_inode
+            .links
+            .find(target.ino, &dotdot)
+            .unwrap()
+            .clone();
+
+        let target_entries = self
+            .dirs
+            .view(
+                view,
+                tx,
+                dentries::decode(&mut reply, 1).unwrap_or_default(),
+                target.ino,
+            )
+            .await?;
+
+        if target_entries.len() > 0 {
+            return Err(ENOTEMPTY);
+        }
+
+        /* 2. The target directory is empty, remove it before putting,
+        the new directory. */
+
+        tx.update(
+            self.cfg.bucket,
+            updates!(
+                inode::remove(target.ino),
+                dentries::remove(target.ino),
+                inode::remove_link(ts, state.new_parent_ino, old_dotdot_link)
+            ),
+        )
+        .await?;
+
+        /* 3. Perform the rename as if the direcotry didn't exists. */
+        self.rename_dir_to_vacant(view, tx, state).await
+    }
+
+    async fn rename_dir_to_vacant(
+        &self,
+        view: View,
+        tx: &mut Transaction<'_>,
+        state: RenameState,
+    ) -> Result<()> {
+        let ts = time::now();
+
+        let ino = state.entry.ino;
+        let mut reply = tx
+            .read(
+                self.cfg.bucket,
+                reads!(inode::read(state.entry.ino), inode::read(state.parent_ino)),
+            )
+            .await?;
+
+        /*
+        Moving a directory implies a few things:
+            - We need to remove the .. link of the old parent.
+            - We need to add the .. of the new parent.
+            - We need to remove the dentry of from old parent.
+            - We need to add the dentry of in the new parent.
+            - We need to remove the old .. dentry of the old parent.
+            - We need to add a new .. dentry of the new parent. */
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+        let parent_inode = inode::decode(state.parent_ino, &mut reply, 1).ok_or(ENOENT)?;
+
+        let old_dentry = state.entry.into_dentry();
+        let old_dotdot = Name::new("..", old_dentry.name.view);
+        let old_link = inode
+            .links
+            .find(state.parent_ino, &old_dentry.name)
+            .unwrap();
+        let old_dotdot_link = parent_inode.links.find(ino, &old_dotdot).unwrap();
+
+        let new_name = state.new_name.canonicalize(view);
+        let new_dotdot = Name::new("..", new_name.view);
+        let new_dentry = dentries::Entry::new(new_name.clone(), state.entry.ino);
+        let new_dotdot_link = inode::Link::new(ino, new_dotdot);
+        let new_link = inode::Link::new(state.new_parent_ino, new_name);
+
+        /* Antidote doesn't always like multiple updates of the same object
+        inside an operation, let's split them in multiple calls: first
+        we delete the old entries, then we create the new ones. We are
+        still inside a unique transaction, we shoud be safe. */
+        tx.update(
+            self.cfg.bucket,
+            updates!(
+                dentries::remove_entry(state.parent_ino, &old_dentry),
+                inode::unlink_from_parent(ts, ino, old_link.clone()),
+                inode::remove_link(ts, state.parent_ino, old_dotdot_link.clone())
+            ),
+        )
+        .await?;
+
+        tx.update(
+            self.cfg.bucket,
+            updates!(
+                dentries::add_entry(state.new_parent_ino, &new_dentry),
+                inode::link_to_parent(ts, ino, state.new_parent_ino, new_link),
+                inode::add_link(ts, state.new_parent_ino, new_dotdot_link)
+            ),
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -807,6 +1050,8 @@ impl Driver {
         new_parent_ino: u64,
         new_name: NameRef,
     ) -> Result<FileAttr> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
             exclusive: [
@@ -817,52 +1062,47 @@ impl Driver {
         })
         .await?;
 
-        let (mut inode, mut parent, entries) = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![
-                        inode::read(ino),
-                        inode::read(new_parent_ino),
-                        dentries::read(new_parent_ino),
-                    ],
-                )
-                .await?;
+        /* 1. Check if an entry exist with the same name. */
+        let mut reply = tx
+            .read(
+                self.cfg.bucket,
+                reads!(inode::read(ino), dentries::read(new_parent_ino)),
+            )
+            .await?;
 
-            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-            let parent = inode::decode(new_parent_ino, &mut reply, 1).ok_or(ENOENT)?;
-            let entries = dentries::decode(&mut reply, 2).ok_or(ENOENT)?;
-            let entries = self.dirs.view(view, &mut tx, entries, new_parent_ino).await?;
-
-            (inode, parent, entries)
-        };
-
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
+        let entries = self
+            .dirs
+            .view(view, &mut tx, entries, new_parent_ino)
+            .await?;
         if entries.get(&new_name).is_some() {
-            return Err(Error::Sys(Errno::EEXIST));
+            return Err(EEXIST);
         }
 
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        parent.mtime = t;
-        parent.atime = t;
-        parent.size += 1;
-
+        /* 2. We are good, create the entry */
         let new_name = new_name.canonicalize(view);
+        let new_dentry = dentries::Entry::new(new_name.clone(), ino);
+        let new_link = inode::Link::new(new_parent_ino, new_name);
+
         tx.update(
             self.cfg.bucket,
-            vec![
-                inode::update_stats_and_size(&parent),
-                dentries::add_entry(
-                    new_parent_ino,
-                    &dentries::Entry::new(new_name, ino),
-                ),
-                inode::incr_link_count(ino, 1),
-            ],
+            updates!(
+                inode::touch(ts, new_parent_ino),
+                dentries::add_entry(new_parent_ino, &new_dentry),
+                inode::add_link(ts, ino, new_link)
+            ),
         )
         .await?;
 
-        inode.nlink += 1;
         tx.commit().await?;
-        Ok(inode.attr())
+
+        let old_attr = inode.attr(ino);
+        Ok(FileAttr {
+            nlink: old_attr.nlink + 1, /* The link that we just created */
+            atime: time::timespec(ts),
+            ..old_attr
+        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -870,7 +1110,7 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { shared: [symlink::key(ino)] }).await?;
 
-        let mut reply = tx.read(self.cfg.bucket, vec![symlink::read(ino)]).await?;
+        let mut reply = tx.read(self.cfg.bucket, reads!(symlink::read(ino))).await?;
 
         let link = symlink::decode(&mut reply, 0).ok_or(ENOENT)?;
 
@@ -887,6 +1127,8 @@ impl Driver {
         name: NameRef,
         link: String,
     ) -> Result<FileAttr> {
+        let ts = time::now();
+
         let mut connection = self.pool.acquire().await?;
         let ino = self.ino_counter.next(ino::Symlink, &mut connection).await?;
 
@@ -898,55 +1140,59 @@ impl Driver {
         })
         .await?;
 
-        let (mut parent, entries) = {
-            let mut reply = tx
-                .read(
-                    self.cfg.bucket,
-                    vec![inode::read(parent_ino), dentries::read(parent_ino)],
-                )
-                .await?;
+        let symlink_size = link.len() as u64;
 
-            let parent = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-            let entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
-            let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
-
-            (parent, entries)
-        };
-
+        /* 1. Check if the entry exists. */
+        let mut reply = tx
+            .read(self.cfg.bucket, vec![dentries::read(parent_ino)])
+            .await?;
+        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
+        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
         if entries.contains_key(&name) {
-            return Err(Error::Sys(Errno::EEXIST));
+            return Err(EEXIST);
         }
 
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let inode = inode::Inode {
+        /* 2. We are good, create the entry. */
+        let name = name.canonicalize(view);
+        let links = [inode::Link::new(parent_ino, name.clone())];
+        let dentry = dentries::Entry::new(name, ino);
+        let inode = inode::CreateDesc {
             ino,
-            parent: parent_ino,
-            atime: t,
-            ctime: t,
-            mtime: t,
+            links: links.iter().cloned(),
             owner,
             mode: 0o644,
-            size: link.len() as u64,
-            nlink: 1,
+            size: symlink_size,
+            dotdot: None,
         };
-        parent.size += 1;
-        parent.mtime = t;
-        parent.atime = t;
-
-        let name = name.canonicalize(view);
         tx.update(
             self.cfg.bucket,
-            vec![
-                inode::create(&inode),
-                inode::update_stats_and_size(&parent),
-                dentries::add_entry(parent_ino, &dentries::Entry::new(name, ino)),
-                symlink::create(ino, link),
+            updates![
+                inode::create(ts, inode),
+                inode::touch(ts, parent_ino),
+                dentries::add_entry(parent_ino, &dentry),
+                symlink::create(ino, link)
             ],
         )
         .await?;
 
         tx.commit().await?;
-        Ok(inode.attr())
+
+        Ok(FileAttr {
+            atime: time::timespec(ts),
+            ctime: time::timespec(ts),
+            mtime: time::timespec(ts),
+            crtime: time::timespec(ts),
+            blocks: ((symlink_size - 1) / PAGE_SIZE + 1) as u64,
+            rdev: 0,
+            size: symlink_size,
+            ino,
+            gid: owner.gid,
+            uid: owner.uid,
+            perm: 0o644,
+            kind: FileType::Symlink,
+            flags: 0,
+            nlink: 1,
+        })
     }
 
     fn schedule_delete(&self, ino: u64) {
@@ -960,22 +1206,22 @@ impl Driver {
             let mut connection = pool.acquire().await?;
             let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
-            let inode = {
-                let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
-                inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?
-            };
+            let mut reply = tx.read(cfg.bucket, reads![inode::read(ino)]).await?;
+            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
+            let nlink = inode.links.nlink();
             let must_be_removed =
-                (ino::kind(ino) == ino::Directory && inode.nlink <= 1) || inode.nlink == 0;
+                (ino::kind(ino) == ino::Directory && nlink == 1 && inode.dotdot == None)
+                    || nlink == 0;
 
             if must_be_removed {
                 tx.update(
                     cfg.bucket,
-                    vec![
+                    updates!(
                         inode::remove(ino),
                         dentries::remove(ino),
-                        symlink::remove(ino),
-                    ],
+                        symlink::remove(ino)
+                    ),
                 )
                 .await?;
 
@@ -998,14 +1244,11 @@ impl Driver {
 
     pub async fn up_until_common_ancestor(
         &self,
-        view: View,
         mut lhs_parent: u64,
         mut rhs_parent: u64,
     ) -> Result<Vec<u64>> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.transaction().await?;
-
-        let dotdot = NameRef::Partial("..".into());
 
         let mut parents = Vec::with_capacity(1);
         while lhs_parent != rhs_parent {
@@ -1015,18 +1258,15 @@ impl Driver {
             let mut reply = tx
                 .read(
                     self.cfg.bucket,
-                    vec![dentries::read(lhs_parent), dentries::read(rhs_parent)],
+                    reads!(inode::read(lhs_parent), inode::read(rhs_parent)),
                 )
                 .await?;
 
-            let lhs_entries = dentries::decode(&mut reply, 0).ok_or(ENOENT)?;
-            let lhs_entries = self.dirs.view(view, &mut tx, lhs_entries, lhs_parent).await?;
+            let lhs_inode = inode::decode(lhs_parent, &mut reply, 0).ok_or(ENOENT)?;
+            let rhs_inode = inode::decode(rhs_parent, &mut reply, 1).ok_or(ENOENT)?;
 
-            let rhs_entries = dentries::decode(&mut reply, 1).ok_or(ENOENT)?;
-            let rhs_entries = self.dirs.view(view, &mut tx, rhs_entries, rhs_parent).await?;
-
-            lhs_parent = lhs_entries.get(&dotdot).unwrap().ino;
-            rhs_parent = rhs_entries.get(&dotdot).unwrap().ino;
+            lhs_parent = lhs_inode.dotdot.ok_or(ENOENT)?;
+            rhs_parent = rhs_inode.dotdot.ok_or(ENOENT)?;
         }
         assert_eq!(lhs_parent, rhs_parent);
         parents.push(lhs_parent);
@@ -1037,8 +1277,17 @@ impl Driver {
 }
 
 #[derive(Debug)]
+
 pub(crate) struct ReadDirEntry {
     pub(crate) ino: u64,
     pub(crate) kind: FileType,
     pub(crate) name: String,
+}
+
+struct RenameState {
+    parent_ino: u64,
+    new_parent_ino: u64,
+    new_name: NameRef,
+    entry: dir::EntryView,
+    new_parent_entries: dir::DirView,
 }

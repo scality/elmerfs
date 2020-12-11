@@ -3,6 +3,7 @@ mod fs;
 mod key;
 mod model;
 mod view;
+mod time;
 
 use crate::driver::Driver;
 use crate::fs::Elmerfs;

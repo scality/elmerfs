@@ -1,7 +1,10 @@
-use crate::key::{KeyWriter, Ty};
 use crate::driver::ino;
+use crate::key::{KeyWriter, Ty};
+use crate::view::{Name, View};
 use antidotec::RawIdent;
 use fuse::FileAttr;
+use std::collections::HashSet;
+use std::convert::TryInto;
 use std::mem;
 use std::time::Duration;
 
@@ -27,36 +30,98 @@ impl Into<u64> for Owner {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct Link {
+    pub parent_ino: u64,
+    pub name: Name,
+}
+
+impl Link {
+    pub fn new(parent_ino: u64, name: Name) -> Self {
+        Self { parent_ino, name }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        self.to_bytes(&mut buffer);
+        buffer
+    }
+
+    fn to_bytes(&self, content: &mut Vec<u8>) {
+        content.reserve(self.byte_len());
+
+        content.extend_from_slice(&self.parent_ino.to_le_bytes()[..]);
+        content.extend_from_slice(&self.name.view.uid.to_le_bytes()[..]);
+        content.extend_from_slice(&self.name.prefix.as_bytes());
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let (parent_ino, bytes) = bytes.split_at(mem::size_of::<u64>());
+        let (view, prefix) = bytes.split_at(mem::size_of::<u32>());
+
+        let view = View {
+            uid: u32::from_le_bytes(view.try_into().unwrap()),
+        };
+        let prefix = String::from_utf8(prefix.into()).unwrap();
+        let parent_ino = u64::from_le_bytes(parent_ino.try_into().unwrap());
+
+        Self {
+            parent_ino,
+            name: Name::new(prefix, view)
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+            mem::size_of::<u64>()
+            + mem::size_of::<View>()
+            + self.name.prefix.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Links {
+    links: HashSet<Link>,
+}
+
+impl Links {
+    pub fn nlink(&self) -> u32 {
+        self.links.len() as u32
+    }
+
+    pub fn find(&self, parent_ino: u64, name: &Name) -> Option<&Link> {
+        self.links.iter().find(|l| l.parent_ino == parent_ino && l.name == *name)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Inode {
-    pub ino: u64,
-    pub parent: u64,
     pub atime: Duration,
     pub ctime: Duration,
     pub mtime: Duration,
     pub owner: Owner,
     pub mode: u32,
     pub size: u64,
-    pub nlink: u64,
+    pub links: Links,
+    pub dotdot: Option<u64>,
 }
 
 impl Inode {
-    pub fn attr(&self) -> FileAttr {
+    pub fn attr(&self, ino: u64) -> FileAttr {
         let timespec_from_duration = |duration: Duration| {
             time::Timespec::new(duration.as_secs() as i64, duration.subsec_nanos() as i32)
         };
 
         FileAttr {
-            ino: self.ino,
+            ino,
             size: self.size,
-            blocks: 0,
+            blocks: self.size / crate::driver::PAGE_SIZE,
             atime: timespec_from_duration(self.atime),
             mtime: timespec_from_duration(self.mtime),
             ctime: timespec_from_duration(self.ctime),
             crtime: timespec_from_duration(self.atime),
-            kind: ino::file_type(self.ino),
+            kind: ino::file_type(ino),
             perm: self.mode as u16,
-            nlink: self.nlink as u32,
+            nlink: self.links.nlink(),
             uid: self.owner.uid,
             gid: self.owner.gid,
             rdev: 0,
@@ -68,35 +133,31 @@ impl Inode {
 #[derive(Debug, Copy, Clone)]
 #[repr(u8)]
 enum Field {
-    Struct = 0,
-    Parent = 2,
-    Atime = 3,
-    Ctime = 4,
-    Mtime = 5,
-    Owner = 6,
-    Mode = 7,
-    Size = 8,
-    NLink = 9,
+    Atime = 1,
+    Ctime = 2,
+    Mtime = 3,
+    Owner = 4,
+    Mode = 5,
+    Size = 6,
+    Links = 7,
+    DotDot = 8,
 }
 
 #[derive(Debug, Copy, Clone)]
 pub struct Key {
     ino: u64,
-    field: Field,
+    field: Option<Field>,
 }
 
 impl Key {
     fn new(ino: u64) -> Self {
-        Key {
-            ino,
-            field: Field::Struct,
-        }
+        Key { ino, field: None }
     }
 
     fn field(self, field: Field) -> RawIdent {
         Key {
             ino: self.ino,
-            field,
+            field: Some(field),
         }
         .into()
     }
@@ -114,7 +175,7 @@ impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
         KeyWriter::with_capacity(Ty::Inode, Self::byte_len())
             .write_u64(self.ino)
-            .write_u8(self.field as u8)
+            .write_u8(self.field.map(|f| f as u8).unwrap_or(0))
             .into()
     }
 }
@@ -122,46 +183,104 @@ impl Into<RawIdent> for Key {
 pub use ops::*;
 
 mod ops {
-    use super::{key, Field, Inode, Owner};
-    use antidotec::{counter, lwwreg, rrmap, ReadQuery, ReadReply, UpdateQuery};
+    use super::{key, Field, Inode, Key, Link, Links, Owner};
+    use antidotec::{lwwreg, rrmap, rwset, ReadQuery, ReadReply, UpdateQuery};
+    use std::time::Duration;
 
     pub fn read(ino: u64) -> ReadQuery {
         rrmap::get(key(ino))
     }
 
-    pub fn create(inode: &Inode) -> UpdateQuery {
-        let key = key(inode.ino);
+    pub struct CreateDesc<T> {
+        pub ino: u64,
+        pub owner: Owner,
+        pub mode: u32,
+        pub size: u64,
+        pub links: T,
+        pub dotdot: Option<u64>,
+    }
+
+    pub fn create<T>(ts: Duration, desc: CreateDesc<T>) -> UpdateQuery
+        where T: IntoIterator<Item=Link>
+    {
+        let key = key(desc.ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
+            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), ts))
+            .push(lwwreg::set_u64(key.field(Field::Owner), desc.owner.into()))
+            .push(lwwreg::set_u32(key.field(Field::Mode), desc.mode))
+            .push(lwwreg::set_u64(key.field(Field::Size), desc.size))
+            .push(lwwreg::set_u64(key.field(Field::DotDot), desc.dotdot.unwrap_or(0)))
+            .push(links_add(key, desc.links.into_iter()))
+            .build()
+    }
+
+    pub fn add_link(ts: Duration, ino: u64, link: Link) -> UpdateQuery {
+        let key = key(ino);
+
+        rrmap::update(key)
+            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(links_add(key, std::iter::once(link)))
+            .build()
+    }
+
+    pub fn remove_link(ts: Duration, ino: u64, link: Link) -> UpdateQuery {
+        let key = key(ino);
+
+        rrmap::update(key)
+            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(links_remove(key, std::iter::once(link)))
+            .build()
+    }
+
+    pub fn link_to_parent(ts: Duration, ino: u64, parent_ino: u64, link: Link) -> UpdateQuery {
+        let key = key(ino);
+
+        rrmap::update(key)
+            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_u64(key.field(Field::DotDot), parent_ino))
+            .push(links_add(key, std::iter::once(link)))
+            .build()
+    }
+
+    pub fn unlink_from_parent(ts: Duration, ino: u64, link: Link) -> UpdateQuery {
+        let key = key(ino);
+
+        rrmap::update(key)
+            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_u64(key.field(Field::DotDot), 0))
+            .push(links_remove(key, std::iter::once(link)))
+            .build()
+    }
+
+    pub fn touch(ts: Duration, ino: u64) -> UpdateQuery {
+        let key = key(ino);
+
+        rrmap::update(key)
+            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), ts))
+            .build()
+    }
+
+    pub fn update_stats(ino: u64, inode: &Inode) -> UpdateQuery {
+        let key = key(ino);
+
+        rrmap::update(key)
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
             .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
             .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
             .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
             .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
             .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
-            .push(counter::inc(key.field(Field::NLink), inode.nlink as i32))
             .build()
     }
 
-    pub fn update_stats(inode: &Inode) -> UpdateQuery {
-        let key = key(inode.ino);
+    pub fn update_stats_with_size(ino: u64, inode: &Inode) -> UpdateQuery {
+        let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
-            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
-            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
-            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
-            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
-            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
-            .build()
-    }
-
-    pub fn update_stats_and_size(inode: &Inode) -> UpdateQuery {
-        let key = key(inode.ino);
-
-        rrmap::update(key)
-            .push(lwwreg::set_u64(key.field(Field::Parent), inode.parent))
             .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
             .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
             .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
@@ -171,47 +290,60 @@ mod ops {
             .build()
     }
 
-    pub fn incr_link_count(ino: u64, amount: u32) -> UpdateQuery {
-        let key = key(ino);
+    fn links_add(key: Key, links: impl IntoIterator<Item = Link>) -> UpdateQuery {
+        let mut adds = rwset::insert(key.field(Field::Links));
+        for link in links {
+            adds = adds.add(link.into_bytes());
+        }
 
-        rrmap::update(key)
-            .push(counter::inc(key.field(Field::NLink), amount as i32))
-            .build()
+        adds.build()
     }
 
-    pub fn decr_link_count(ino: u64, amount: u32) -> UpdateQuery {
-        let key = key(ino);
+    fn links_remove(key: Key, links: impl IntoIterator<Item = Link>) -> UpdateQuery {
+        let mut removes = rwset::remove(key.field(Field::Links));
+        for link in links {
+            removes = removes.remove(link.into_bytes());
+        }
 
-        rrmap::update(key)
-            .push(counter::inc(key.field(Field::NLink), -(amount as i32)))
-            .build()
+        removes.build()
     }
 
     pub fn decode(ino: u64, reply: &mut ReadReply, index: usize) -> Option<Inode> {
         let mut map = reply.rrmap(index)?;
         let key = key(ino);
 
-        let parent = map.remove(&key.field(Field::Parent)).unwrap().into_lwwreg();
         let atime = map.remove(&key.field(Field::Atime)).unwrap().into_lwwreg();
         let ctime = map.remove(&key.field(Field::Ctime)).unwrap().into_lwwreg();
         let mtime = map.remove(&key.field(Field::Mtime)).unwrap().into_lwwreg();
         let owner = map.remove(&key.field(Field::Owner)).unwrap().into_lwwreg();
         let mode = map.remove(&key.field(Field::Mode)).unwrap().into_lwwreg();
         let size = map.remove(&key.field(Field::Size)).unwrap().into_lwwreg();
-        let nlink = map.remove(&key.field(Field::NLink)).unwrap().into_counter();
+        let dotdot = map.remove(&key.field(Field::DotDot)).unwrap().into_lwwreg();
+
+        let encoded_links = map.remove(&key.field(Field::Links)).unwrap().into_rwset();
+        let links = encoded_links
+            .into_iter()
+            .map(|encoded| Link::from_bytes(&encoded[..]))
+            .collect();
 
         let owner = Owner::from(lwwreg::read_u64(&owner));
 
+        let dotdot = lwwreg::read_u64(&dotdot);
+        let dotdot = if dotdot != 0 {
+            Some(dotdot)
+        } else {
+            None
+        };
+
         Some(Inode {
-            ino,
-            parent: lwwreg::read_u64(&parent),
             atime: lwwreg::read_duration(&atime),
             ctime: lwwreg::read_duration(&ctime),
             mtime: lwwreg::read_duration(&mtime),
             owner,
             mode: lwwreg::read_u32(&mode),
             size: lwwreg::read_u64(&size),
-            nlink: nlink as u64,
+            links: Links { links },
+            dotdot,
         })
     }
 
