@@ -262,7 +262,9 @@ impl Driver {
         })
         .await?;
 
-        let entries = self.dirs.load(view, &mut tx, parent_ino).await?;
+        let mut reply = tx.read(self.cfg.bucket, reads!(dentries::read(parent_ino))).await?;
+
+        let entries = self.dirs.decode_view(view, &mut tx, parent_ino, &mut reply, 0).await?;
         let attr = match entries.get(&name) {
             Some(entry) => Self::attr_of(&self.cfg, &mut tx, entry.ino).await,
             None => Err(ENOENT),
@@ -309,8 +311,7 @@ impl Driver {
             .await?;
 
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
-        let entries = self.dirs.view(view, &mut tx, entries, ino).await?;
+        let entries = self.dirs.decode_view(view, &mut tx, ino, &mut reply, 1).await?;
 
         let mut mapped_entries = Vec::with_capacity((offset < 2) as usize * 2 + entries.len());
 
@@ -376,8 +377,10 @@ impl Driver {
             .await?;
 
         /* 1. Check if the entry doesn't already exists. */
-        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
-        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
+            .await?;
         if entries.contains_key(&name) {
             return Err(EEXIST);
         }
@@ -455,16 +458,23 @@ impl Driver {
             .await?;
 
         let parent_inode = inode::decode(parent_ino, &mut reply, 0).ok_or(ENOENT)?;
-        let parent_entries = dentries::decode(&mut reply, 1).unwrap_or_default();
-        let parent_entries = self.dirs.view(view, &mut tx, parent_entries, parent_ino).await?;
+        let parent_entries = self
+            .dirs
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 1)
+            .await?;
         let entry = parent_entries.get(&name).ok_or(ENOENT)?;
 
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(inode::read(entry.ino), dentries::read(entry.ino)))
+            .read(
+                self.cfg.bucket,
+                reads!(inode::read(entry.ino), dentries::read(entry.ino)),
+            )
             .await?;
         let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
-        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
-        let entries = self.dirs.view(view, &mut tx, entries, entry.ino).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, entry.ino, &mut reply, 1)
+            .await?;
 
         if entries.len() > 0 {
             return Err(ENOTEMPTY);
@@ -522,8 +532,10 @@ impl Driver {
             .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
 
-        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
-        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
+            .await?;
         if entries.contains_key(&name) {
             return Err(EEXIST);
         }
@@ -586,8 +598,10 @@ impl Driver {
             .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
 
-        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
-        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
+            .await?;
         let entry = entries.get(&name).ok_or(ENOENT)?;
         let dentry_to_remove = entry.into_dentry();
 
@@ -747,22 +761,12 @@ impl Driver {
 
         let parent_entries = self
             .dirs
-            .view(
-                view,
-                &mut tx,
-                dentries::decode(&mut reply, 0).unwrap_or_default(),
-                parent_ino,
-            )
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
             .await?;
 
         let new_parent_entries = self
             .dirs
-            .view(
-                view,
-                &mut tx,
-                dentries::decode(&mut reply, 1).unwrap_or_default(),
-                new_parent_ino,
-            )
+            .decode_view(view, &mut tx, new_parent_ino, &mut reply, 1)
             .await?;
 
         let entry = parent_entries.get(&name).cloned().ok_or(ENOENT)?;
@@ -943,12 +947,7 @@ impl Driver {
 
         let target_entries = self
             .dirs
-            .view(
-                view,
-                tx,
-                dentries::decode(&mut reply, 1).unwrap_or_default(),
-                target.ino,
-            )
+            .decode_view(view, tx, target.ino, &mut reply, 1)
             .await?;
 
         if target_entries.len() > 0 {
@@ -1069,10 +1068,9 @@ impl Driver {
             .await?;
 
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
         let entries = self
             .dirs
-            .view(view, &mut tx, entries, new_parent_ino)
+            .decode_view(view, &mut tx, new_parent_ino, &mut reply, 1)
             .await?;
         if entries.get(&new_name).is_some() {
             return Err(EEXIST);
@@ -1142,10 +1140,11 @@ impl Driver {
 
         /* 1. Check if the entry exists. */
         let mut reply = tx
-            .read(self.cfg.bucket, vec![dentries::read(parent_ino)])
+            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
-        let entries = dentries::decode(&mut reply, 0).unwrap_or_default();
-        let entries = self.dirs.view(view, &mut tx, entries, parent_ino).await?;
+
+        let entries = self.dirs.decode_view(view, &mut tx, parent_ino, &mut reply, 0).await?;
+
         if entries.contains_key(&name) {
             return Err(EEXIST);
         }
