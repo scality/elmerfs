@@ -23,24 +23,19 @@ impl DirDriver {
         Self { cfg, pool }
     }
 
-    pub(super) async fn load(
+    pub(super) async fn decode_view(
         &self,
         view: View,
         tx: &mut Transaction<'_>,
         ino: u64,
+        reply: &mut antidotec::ReadReply,
+        index: usize,
     ) -> Result<DirView> {
-        let mut reply = tx
-            .read(
-                self.cfg.bucket,
-                reads!(inode::read(ino), dentries::read(ino)),
-            )
-            .await?;
-
-        let entries = dentries::decode(&mut reply, 1).unwrap_or_default();
-        Ok(self.view(view, tx, entries, ino).await?)
+        let entries = dentries::decode(reply, index).unwrap_or_default();
+        self.view(view, tx, entries, ino).await
     }
 
-    pub(super) async fn view(
+    async fn view(
         &self,
         view: View,
         tx: &mut Transaction<'_>,
