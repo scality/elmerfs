@@ -90,6 +90,7 @@ impl DirDriver {
     ) {
         let mut previous_ino = 0; /* 0 is an ino number that cannot appear. */
 
+        tracing::debug!(?sorted_entries, "sorted");
         let directories = sorted_entries
             .iter()
             .enumerate()
@@ -185,17 +186,20 @@ impl DirDriver {
             let old_link = parent_inode
                 .links
                 .find(purged.ino, &entry.name)
-                .unwrap()
-                .clone();
+                .cloned();
 
-            tx.update(
-                self.cfg.bucket,
-                updates!(
-                    inode::remove_link(ts, entry.ino, old_link),
-                    dentries::remove_entry(parent_ino, entry)
-                ),
-            )
-            .await?;
+            if old_link.is_none() {
+                tracing::warn!(?parent_inode, ?entry, "found an entry that wasn't referenced in parent inode.");
+            } else {
+                tx.update(
+                    self.cfg.bucket,
+                    updates!(
+                        inode::remove_link(ts, entry.ino, old_link.unwrap()),
+                        dentries::remove_entry(parent_ino, entry)
+                    ),
+                )
+                .await?;
+            }
         }
 
         Ok(())

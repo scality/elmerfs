@@ -22,7 +22,6 @@ use crate::model::{
 use crate::view::{Name, NameRef, View};
 use antidotec::{self, reads, updates, Connection, Transaction, TransactionLocks};
 use async_std::sync::Arc;
-use async_std::task;
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
@@ -467,13 +466,13 @@ impl Driver {
         let mut reply = tx
             .read(
                 self.cfg.bucket,
-                reads!(inode::read(entry.ino), dentries::read(entry.ino)),
+                reads!(dentries::read(entry.ino)),
             )
             .await?;
-        let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
+
         let entries = self
             .dirs
-            .decode_view(view, &mut tx, entry.ino, &mut reply, 1)
+            .decode_view(view, &mut tx, entry.ino, &mut reply, 0)
             .await?;
 
         if entries.len() > 0 {
@@ -481,11 +480,6 @@ impl Driver {
         }
 
         let dentry_to_remove = entry.into_dentry();
-        let old_link = inode
-            .links
-            .find(parent_ino, &dentry_to_remove.name)
-            .unwrap();
-
         let dotdot = Name::new("..", dentry_to_remove.name.view);
         let old_dotdot_link = parent_inode.links.find(entry.ino, &dotdot).unwrap();
 
@@ -494,14 +488,13 @@ impl Driver {
             updates!(
                 dentries::remove_entry(parent_ino, &dentry_to_remove),
                 inode::remove_link(ts, parent_ino, old_dotdot_link.clone()),
-                inode::unlink_from_parent(ts, entry.ino, old_link.clone())
+                inode::remove(entry.ino),
+                dentries::remove(entry.ino)
             ),
         )
         .await?;
 
         tx.commit().await?;
-
-        self.schedule_delete(entry.ino);
         Ok(())
     }
 
@@ -627,8 +620,18 @@ impl Driver {
         )
         .await?;
 
+        if inode.links.nlink() - 1 == 0 {
+            tx.update(self.cfg.bucket, updates!(
+                inode::remove(entry.ino),
+                symlink::remove(entry.ino)
+            )).await?;
+
+            if inode.size > 0 {
+                self.pages.remove(&mut tx, entry.ino, 0..inode.size).await?;
+            }
+        }
+
         tx.commit().await?;
-        self.schedule_delete(entry.ino);
         Ok(())
     }
 
@@ -1190,53 +1193,6 @@ impl Driver {
             flags: 0,
             nlink: 1,
         })
-    }
-
-    fn schedule_delete(&self, ino: u64) {
-        #[tracing::instrument(skip(cfg, pool))]
-        async fn delete_later(
-            cfg: Config,
-            pool: Arc<ConnectionPool>,
-            pages: PageWriter,
-            ino: u64,
-        ) -> Result<bool> {
-            let mut connection = pool.acquire().await?;
-            let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ino)] }).await?;
-
-            let mut reply = tx.read(cfg.bucket, reads![inode::read(ino)]).await?;
-            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-
-            let nlink = inode.links.nlink();
-            let must_be_removed =
-                (ino::kind(ino) == ino::Directory && nlink == 1 && inode.dotdot == None)
-                    || nlink == 0;
-
-            if must_be_removed {
-                tx.update(
-                    cfg.bucket,
-                    updates!(
-                        inode::remove(ino),
-                        dentries::remove(ino),
-                        symlink::remove(ino)
-                    ),
-                )
-                .await?;
-
-                if ino::kind(ino) == ino::Regular {
-                    /* At this point we should be (locally) the only one
-                    seeing this file, don't bother locking up the pages */
-                    pages.remove(&mut tx, ino, 0..inode.size).await?;
-                }
-            }
-
-            tx.commit().await?;
-            Ok(must_be_removed)
-        }
-
-        let cfg = self.cfg.clone();
-        let pool = self.pool.clone();
-        let pages = self.pages;
-        task::spawn(delete_later(cfg, pool, pages, ino));
     }
 
     pub async fn up_until_common_ancestor(
