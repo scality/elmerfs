@@ -41,6 +41,7 @@ impl PageWriter {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, tx, content))]
     async fn write_page(
         &self,
         tx: &mut Transaction<'_>,

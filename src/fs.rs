@@ -1,6 +1,6 @@
-use crate::driver::Driver;
-use crate::view::View;
+use crate::driver::{Driver, DriverError};
 use crate::model::inode::Owner;
+use crate::view::View;
 use async_std::{sync::Arc, task};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
@@ -8,6 +8,10 @@ use std::ffi::OsStr;
 use std::path::Path;
 use time::Timespec;
 use tracing_futures::Instrument;
+use std::time::Duration;
+
+const ATTEMPTS_ON_ABORTED: u16 = 160;
+const ATTEMPTS_WAIT_MS: u16 = 500;
 
 macro_rules! function {
     () => {{
@@ -56,33 +60,44 @@ macro_rules! session {
         let (uid, gid) = ($req.uid(), $req.gid());
 
         let task = async move {
-            let result = $op.await;
+            let mut final_result = None;
+            for _ in 0..ATTEMPTS_ON_ABORTED {
+                let result = $op.await;
 
-            if result.is_ok() {
-                let result: Result<_, ()> = Ok(()); /* omit the content */
-                tracing::info!(?result);
-            } else {
                 match &result {
-                    Err(crate::driver::Error::Sys(Errno::ENOENT)) => {}
-                    result => {
-                        tracing::error!(?result);
+                    Err(DriverError::Sys(Errno::ENOENT)) => {
+                        final_result = Some(result);
+                        break;
+                    }
+                    Err(error) if error.should_retry() => {
+                        tracing::debug!(?error, "retrying aborted.");
+                    },
+                    _ => {
+                        final_result = Some(result);
+                        break;
                     }
                 }
+
+                // Exponential backoff would be way better in term of system
+                // stress. But this is good for now.
+                task::sleep(Duration::from_millis(ATTEMPTS_WAIT_MS as u64))
+                    .await;
             };
 
-            match result {
-                Ok($ok) => {
+
+            match final_result {
+                Some(Ok($ok)) => {
                     $resp
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     match error {
-                        crate::driver::Error::Sys(errno) => {
+                        DriverError::Sys(errno) => {
                             $reply.error(errno as libc::c_int);
                         },
-                        crate::driver::Error::Antidote(_) => {
+                        DriverError::Antidote(_) => {
                             $reply.error(Errno::EIO as libc::c_int);
                         }
-                        crate::driver::Error::Nix(error) => {
+                        DriverError::Nix(error) => {
                             match error {
                                 nix::Error::Sys(errno) => {
                                     $reply.error(errno as libc::c_int);
@@ -93,6 +108,10 @@ macro_rules! session {
                             }
                         }
                     }
+                },
+                None => {
+                    tracing::error!("no more attempts. Dropping...");
+                    $reply.error(Errno::EIO as libc::c_int);
                 }
             }
         };
@@ -115,7 +134,7 @@ pub struct Elmerfs {
 
 impl Elmerfs {
     fn view(&self, req: &Request) -> View {
-        self.forced_view.unwrap_or(View { uid: req.uid()})
+        self.forced_view.unwrap_or(View { uid: req.uid() })
     }
 }
 
@@ -178,7 +197,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.lookup(view, parent, name), attrs => {
+        session!(req, reply, driver.lookup(view, parent, &name), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -200,7 +219,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.mkdir(view, owner, mode, parent_ino, name), attrs => {
+        session!(req, reply, driver.mkdir(view, owner, mode, parent_ino, &name), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -211,7 +230,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.rmdir(view, parent, name), _ => {
+        session!(req, reply, driver.rmdir(view, parent, &name), _ => {
             reply.ok();
         });
     }
@@ -233,7 +252,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.mknod(view, owner, mode, parent, name, rdev), attrs => {
+        session!(req, reply, driver.mknod(view, owner, mode, parent, &name, rdev), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -244,7 +263,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.unlink(view, parent, name), _ => {
+        session!(req, reply, driver.unlink(view, parent, &name), _ => {
             reply.ok();
         });
     }
@@ -369,7 +388,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.rename(view, parent, name, newparent, newname), _ => {
+        session!(req, reply, driver.rename(view, parent, &name, newparent, &newname), _ => {
             reply.ok();
         });
     }
@@ -386,7 +405,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.link(view, ino, newparent, newname), attrs => {
+        session!(req, reply, driver.link(view, ino, newparent, &newname), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });
@@ -410,7 +429,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.symlink(view, parent, owner, name, link), attrs => {
+        session!(req, reply, driver.symlink(view, parent, owner, &name, &link), attrs => {
             let generation = 0;
             reply.entry(&ttl(), &attrs, generation);
         });

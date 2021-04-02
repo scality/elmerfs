@@ -20,7 +20,7 @@ use crate::model::{
     symlink,
 };
 use crate::view::{Name, NameRef, View};
-use antidotec::{self, reads, updates, Connection, Transaction, TransactionLocks};
+use antidotec::{self, reads, updates, Connection, Error, Transaction, TransactionLocks};
 use async_std::sync::Arc;
 use fuse::*;
 use nix::errno::Errno;
@@ -32,12 +32,12 @@ pub use self::dir::ListingFlavor;
 
 pub(crate) const ROOT_INO: u64 = 1;
 pub(crate) const MAX_CONNECTIONS: usize = 32;
-pub(crate) const PAGE_SIZE: u64 = 64 * 1024;
+pub(crate) const PAGE_SIZE: u64 = 16 * 1024 * 1024;
 
-const ENOENT: Error = Error::Sys(Errno::ENOENT);
-const EINVAL: Error = Error::Sys(Errno::EINVAL);
-const EEXIST: Error = Error::Sys(Errno::EEXIST);
-const ENOTEMPTY: Error = Error::Sys(Errno::ENOTEMPTY);
+const ENOENT: DriverError = DriverError::Sys(Errno::ENOENT);
+const EINVAL: DriverError = DriverError::Sys(Errno::EINVAL);
+const EEXIST: DriverError = DriverError::Sys(Errno::EEXIST);
+const ENOTEMPTY: DriverError = DriverError::Sys(Errno::ENOTEMPTY);
 
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
@@ -68,17 +68,27 @@ macro_rules! transaction {
 }
 
 #[derive(Error, Debug)]
-pub(crate) enum Error {
+pub(crate) enum DriverError {
     #[error("driver replied with: {0}")]
     Sys(Errno),
 
     #[error("io error with antidote: {0}")]
-    Antidote(#[from] antidotec::Error),
+    Antidote(#[from] Error),
 
     #[error("internal syscall failed: {0}")]
     Nix(#[from] nix::Error),
 }
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+
+impl DriverError {
+    pub fn should_retry(&self) -> bool {
+        match self {
+            Self::Antidote(Error::Antidote(antidotec::AntidoteError::Aborted)) => true,
+            _ => false,
+        }
+    }
+}
+
+pub(crate) type Result<T> = std::result::Result<T, DriverError>;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -145,7 +155,7 @@ impl Driver {
                 tx.commit().await?;
                 return Ok(());
             }
-            Err(Error::Sys(Errno::ENOENT)) => {}
+            Err(DriverError::Sys(Errno::ENOENT)) => {}
             Err(error) => return Err(error),
         };
 
@@ -253,7 +263,7 @@ impl Driver {
         &self,
         view: View,
         parent_ino: u64,
-        name: NameRef,
+        name: &NameRef,
     ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, {
@@ -261,9 +271,14 @@ impl Driver {
         })
         .await?;
 
-        let mut reply = tx.read(self.cfg.bucket, reads!(dentries::read(parent_ino))).await?;
+        let mut reply = tx
+            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
+            .await?;
 
-        let entries = self.dirs.decode_view(view, &mut tx, parent_ino, &mut reply, 0).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
+            .await?;
         let attr = match entries.get(&name) {
             Some(entry) => Self::attr_of(&self.cfg, &mut tx, entry.ino).await,
             None => Err(ENOENT),
@@ -310,7 +325,10 @@ impl Driver {
             .await?;
 
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-        let entries = self.dirs.decode_view(view, &mut tx, ino, &mut reply, 1).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, ino, &mut reply, 1)
+            .await?;
 
         let mut mapped_entries = Vec::with_capacity((offset < 2) as usize * 2 + entries.len());
 
@@ -353,7 +371,7 @@ impl Driver {
         owner: Owner,
         mode: u32,
         parent_ino: u64,
-        name: NameRef,
+        name: &NameRef,
     ) -> Result<FileAttr> {
         let ts = time::now();
 
@@ -387,7 +405,7 @@ impl Driver {
         /* 2. We are good from our point of view, create the entry.
         It doesn't say that someone is also trying to create
         the same entry, but we have exclusivness with our view_id. */
-        let name = name.canonicalize(view);
+        let name = name.clone().canonicalize(view);
         let links = [
             inode::Link::new(parent_ino, name.clone()),
             inode::Link::new(ino, Name::new(".", view)),
@@ -436,10 +454,10 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn rmdir(
-        self: Arc<Driver>,
+        &self,
         view: View,
         parent_ino: u64,
-        name: NameRef,
+        name: &NameRef,
     ) -> Result<()> {
         let ts = time::now();
 
@@ -464,10 +482,7 @@ impl Driver {
         let entry = parent_entries.get(&name).ok_or(ENOENT)?;
 
         let mut reply = tx
-            .read(
-                self.cfg.bucket,
-                reads!(dentries::read(entry.ino)),
-            )
+            .read(self.cfg.bucket, reads!(dentries::read(entry.ino)))
             .await?;
 
         let entries = self
@@ -505,7 +520,7 @@ impl Driver {
         owner: Owner,
         mode: u32,
         parent_ino: u64,
-        name: NameRef,
+        name: &NameRef,
         _rdev: u32,
     ) -> Result<FileAttr> {
         let ts = time::now();
@@ -533,7 +548,7 @@ impl Driver {
             return Err(EEXIST);
         }
 
-        let name = name.canonicalize(view);
+        let name = name.clone().canonicalize(view);
         let links = [inode::Link::new(parent_ino, name.clone())];
         let inode = inode::CreateDesc {
             ino,
@@ -574,7 +589,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn unlink(&self, view: View, parent_ino: u64, name: NameRef) -> Result<()> {
+    pub(crate) async fn unlink(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -621,10 +636,11 @@ impl Driver {
         .await?;
 
         if inode.links.nlink() - 1 == 0 {
-            tx.update(self.cfg.bucket, updates!(
-                inode::remove(entry.ino),
-                symlink::remove(entry.ino)
-            )).await?;
+            tx.update(
+                self.cfg.bucket,
+                updates!(inode::remove(entry.ino), symlink::remove(entry.ino)),
+            )
+            .await?;
 
             if inode.size > 0 {
                 self.pages.remove(&mut tx, entry.ino, 0..inode.size).await?;
@@ -733,9 +749,9 @@ impl Driver {
         &self,
         view: View,
         parent_ino: u64,
-        name: NameRef,
+        name: &NameRef,
         new_parent_ino: u64,
-        new_name: NameRef,
+        new_name: &NameRef,
     ) -> Result<()> {
         let parents_to_lock = self
             .up_until_common_ancestor(parent_ino, new_parent_ino)
@@ -778,7 +794,7 @@ impl Driver {
             entry: entry.clone(),
             parent_ino,
             new_parent_ino,
-            new_name,
+            new_name: new_name.clone(),
             new_parent_entries,
         };
 
@@ -1048,7 +1064,7 @@ impl Driver {
         view: View,
         ino: u64,
         new_parent_ino: u64,
-        new_name: NameRef,
+        new_name: &NameRef,
     ) -> Result<FileAttr> {
         let ts = time::now();
 
@@ -1080,7 +1096,7 @@ impl Driver {
         }
 
         /* 2. We are good, create the entry */
-        let new_name = new_name.canonicalize(view);
+        let new_name = new_name.clone().canonicalize(view);
         let new_dentry = dentries::Entry::new(new_name.clone(), ino);
         let new_link = inode::Link::new(new_parent_ino, new_name);
 
@@ -1123,8 +1139,8 @@ impl Driver {
         view: View,
         parent_ino: u64,
         owner: Owner,
-        name: NameRef,
-        link: String,
+        name: &NameRef,
+        link: &str,
     ) -> Result<FileAttr> {
         let ts = time::now();
 
@@ -1146,14 +1162,17 @@ impl Driver {
             .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
             .await?;
 
-        let entries = self.dirs.decode_view(view, &mut tx, parent_ino, &mut reply, 0).await?;
+        let entries = self
+            .dirs
+            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
+            .await?;
 
         if entries.contains_key(&name) {
             return Err(EEXIST);
         }
 
         /* 2. We are good, create the entry. */
-        let name = name.canonicalize(view);
+        let name = name.clone().canonicalize(view);
         let links = [inode::Link::new(parent_ino, name.clone())];
         let dentry = dentries::Entry::new(name, ino);
         let inode = inode::CreateDesc {
@@ -1170,7 +1189,7 @@ impl Driver {
                 inode::create(ts, inode),
                 inode::touch(ts, parent_ino),
                 dentries::add_entry(parent_ino, &dentry),
-                symlink::create(ino, link)
+                symlink::create(ino, link.into())
             ],
         )
         .await?;
