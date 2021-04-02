@@ -86,6 +86,7 @@ impl Connection {
         self.transaction_with_locks(TransactionLocks::new()).await
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn transaction_with_locks(
         &mut self,
         locks: TransactionLocks,
@@ -197,6 +198,7 @@ pub struct Transaction<'a> {
 }
 
 impl Transaction<'_> {
+    #[tracing::instrument(skip(self))]
     pub async fn commit(mut self) -> Result<(), Error> {
         let mut message = ApbCommitTransaction::new();
         message.set_transaction_descriptor(self.txid.clone());
@@ -212,6 +214,7 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn read(
         &mut self,
         bucket: impl Into<RawIdent>,
@@ -249,6 +252,7 @@ impl Transaction<'_> {
         })
     }
 
+    #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn update(
         &mut self,
         bucket: impl Into<RawIdent>,
