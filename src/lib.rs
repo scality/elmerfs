@@ -1,5 +1,3 @@
-#![type_length_limit="1531804"]
-
 mod driver;
 mod fs;
 mod key;

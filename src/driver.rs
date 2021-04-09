@@ -692,8 +692,16 @@ impl Driver {
     pub(crate) async fn release(&self, view: View, ino: u64, fh: FileHandle) -> Result<()> {
         let mut wg = self.write_gatherer.lock().await;
         let buffer = wg.release(fh);
-        let buffer = buffer.lock().await;
-        assert!(buffer.is_empty());
+        let mut buffer = buffer.lock().await;
+
+        match buffer.gathered_so_far() {
+            Some((offset, bytes)) => {
+                self.write_sync(ino, bytes, offset).await?;
+                buffer.reset();
+            },
+            None => {}
+        }
+
         Ok(())
     }
 

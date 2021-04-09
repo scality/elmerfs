@@ -1,11 +1,10 @@
 use self::crdts::Crdt;
 use crate::protos::{antidote::*, ApbMessage, ApbMessageCode, MessageCodeError};
-use async_std::io::BufReader;
 use async_std::{
     io::{self, prelude::*},
     net::TcpStream,
 };
-use protobuf::{CodedOutputStream, Message, ProtobufError};
+use protobuf::{CodedOutputStream, ProtobufError};
 use std::convert::TryInto;
 use std::mem;
 use std::{convert::TryFrom, u32};
@@ -156,7 +155,8 @@ impl Connection {
             n += self.stream.read(&mut self.scratchpad[n..]).await?;
         }
 
-        let message_site_bytes = self.scratchpad[..MESSAGE_SIZE_BYTES].try_into().unwrap();
+        let message_site_bytes = self.scratchpad[..MESSAGE_SIZE_BYTES]
+                                     .try_into().unwrap();
         let message_size = u32::from_be_bytes(message_site_bytes) as usize;
 
         let payload_size = message_size + MESSAGE_SIZE_BYTES;
