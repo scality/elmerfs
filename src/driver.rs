@@ -32,7 +32,7 @@ pub use self::dir::ListingFlavor;
 
 pub(crate) const ROOT_INO: u64 = 1;
 pub(crate) const MAX_CONNECTIONS: usize = 32;
-pub(crate) const PAGE_SIZE: u64 = 16 * 1024 * 1024;
+pub(crate) const PAGE_SIZE: u64 = 64 * 1024;
 
 const ENOENT: DriverError = DriverError::Sys(Errno::ENOENT);
 const EINVAL: DriverError = DriverError::Sys(Errno::EINVAL);
