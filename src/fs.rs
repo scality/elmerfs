@@ -1,4 +1,4 @@
-use crate::driver::{Driver, DriverError};
+use crate::driver::{Driver, BufferHandle, DriverError};
 use crate::model::inode::Owner;
 use crate::view::View;
 use async_std::{sync::Arc, task};
@@ -303,11 +303,10 @@ impl Filesystem for Elmerfs {
 
     fn open(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         let driver = self.driver.clone();
-        let view = self.view(req);
 
-        session!(req, reply, driver.open(view, ino), _ => {
+        session!(req, reply, driver.open(ino), fh => {
             let flags = 0;
-            reply.opened(ino, flags);
+            reply.opened(fh.0, flags);
         });
     }
 
@@ -315,7 +314,7 @@ impl Filesystem for Elmerfs {
         &mut self,
         req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
@@ -323,8 +322,27 @@ impl Filesystem for Elmerfs {
     ) {
         let driver = self.driver.clone();
         let view = self.view(req);
+        let fh = BufferHandle(fh);
 
-        session!(req, reply, driver.release(view, ino), _ => {
+        session!(req, reply, driver.release(view, ino, fh), _ => {
+            reply.ok();
+        });
+    }
+
+    fn flush(&mut self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let driver = self.driver.clone();
+        let fh = BufferHandle(fh);
+
+        session!(req, reply, driver.flush(ino, fh), _ => {
+            reply.ok();
+        });
+    }
+
+    fn fsync(&mut self, req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        let driver = self.driver.clone();
+        let fh = BufferHandle(fh);
+
+        session!(req, reply, driver.fsync(ino, fh), _ => {
             reply.ok();
         });
     }
@@ -333,7 +351,7 @@ impl Filesystem for Elmerfs {
         &mut self,
         req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _flags: u32,
@@ -343,12 +361,12 @@ impl Filesystem for Elmerfs {
             reply.error(Errno::EINVAL as libc::c_int);
             return;
         }
+        let fh = BufferHandle(fh);
         let offset = offset as u64;
         let driver = self.driver.clone();
-        let view = self.view(req);
         let data = Vec::from(data);
 
-        session!(req, reply, driver.write(view, ino, &data, offset), _ => {
+        session!(req, reply, driver.write(ino, fh, &data, offset), _ => {
             reply.written(data.len() as u32);
         });
     }
@@ -357,7 +375,7 @@ impl Filesystem for Elmerfs {
         &mut self,
         req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         reply: ReplyData,
@@ -366,10 +384,11 @@ impl Filesystem for Elmerfs {
             reply.error(Errno::EINVAL as libc::c_int);
             return;
         }
+        let fh = BufferHandle(fh);
         let offset = offset as u64;
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.read(ino, offset, size), data => {
+        session!(req, reply, driver.read(ino, fh, offset, size), data => {
             reply.data(&data);
         });
     }

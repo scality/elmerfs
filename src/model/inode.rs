@@ -320,7 +320,7 @@ mod ops {
         let size = map.remove(&key.field(Field::Size)).unwrap().into_lwwreg();
         let dotdot = map.remove(&key.field(Field::DotDot)).unwrap().into_lwwreg();
 
-        let encoded_links = map.remove(&key.field(Field::Links)).unwrap().into_rwset();
+        let encoded_links = map.remove(&key.field(Field::Links))?.into_rwset();
         let links = encoded_links
             .into_iter()
             .map(|encoded| Link::from_bytes(&encoded[..]))
