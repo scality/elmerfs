@@ -1,7 +1,7 @@
 use crate::driver::ino;
 use crate::key::{KeyWriter, Ty};
 use crate::view::{Name, View};
-use antidotec::RawIdent;
+use antidotec::{Bytes, RawIdent};
 use fuse::FileAttr;
 use std::collections::HashSet;
 use std::convert::TryInto;
@@ -41,10 +41,10 @@ impl Link {
         Self { parent_ino, name }
     }
 
-    fn into_bytes(self) -> Vec<u8> {
+    fn into_bytes(self) -> Bytes {
         let mut buffer = Vec::new();
         self.to_bytes(&mut buffer);
-        buffer
+        Bytes::from(buffer)
     }
 
     fn to_bytes(&self, content: &mut Vec<u8>) {
@@ -67,14 +67,12 @@ impl Link {
 
         Self {
             parent_ino,
-            name: Name::new(prefix, view)
+            name: Name::new(prefix, view),
         }
     }
 
     fn byte_len(&self) -> usize {
-            mem::size_of::<u64>()
-            + mem::size_of::<View>()
-            + self.name.prefix.len()
+        mem::size_of::<u64>() + mem::size_of::<View>() + self.name.prefix.len()
     }
 }
 
@@ -89,7 +87,9 @@ impl Links {
     }
 
     pub fn find(&self, parent_ino: u64, name: &Name) -> Option<&Link> {
-        self.links.iter().find(|l| l.parent_ino == parent_ino && l.name == *name)
+        self.links
+            .iter()
+            .find(|l| l.parent_ino == parent_ino && l.name == *name)
     }
 }
 
@@ -201,7 +201,8 @@ mod ops {
     }
 
     pub fn create<T>(ts: Duration, desc: CreateDesc<T>) -> UpdateQuery
-        where T: IntoIterator<Item=Link>
+    where
+        T: IntoIterator<Item = Link>,
     {
         let key = key(desc.ino);
 
@@ -212,7 +213,10 @@ mod ops {
             .push(lwwreg::set_u64(key.field(Field::Owner), desc.owner.into()))
             .push(lwwreg::set_u32(key.field(Field::Mode), desc.mode))
             .push(lwwreg::set_u64(key.field(Field::Size), desc.size))
-            .push(lwwreg::set_u64(key.field(Field::DotDot), desc.dotdot.unwrap_or(0)))
+            .push(lwwreg::set_u64(
+                key.field(Field::DotDot),
+                desc.dotdot.unwrap_or(0),
+            ))
             .push(links_add(key, desc.links.into_iter()))
             .build()
     }
@@ -329,11 +333,7 @@ mod ops {
         let owner = Owner::from(lwwreg::read_u64(&owner));
 
         let dotdot = lwwreg::read_u64(&dotdot);
-        let dotdot = if dotdot != 0 {
-            Some(dotdot)
-        } else {
-            None
-        };
+        let dotdot = if dotdot != 0 { Some(dotdot) } else { None };
 
         Some(Inode {
             atime: lwwreg::read_duration(&atime),

@@ -1,6 +1,6 @@
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
-use antidotec::{lwwreg, RawIdent, Transaction};
+use antidotec::{lwwreg, Bytes, RawIdent, Transaction};
 use std::ops::Range;
 
 #[derive(Debug, Copy, Clone)]
@@ -57,7 +57,7 @@ impl PageWriter {
         let page = Key::new(ino, page);
         let mut page_content = {
             let mut reply = tx.read(self.bucket, vec![lwwreg::get(page)]).await?;
-            reply.lwwreg(0).unwrap_or_default()
+            reply.lwwreg(0).unwrap_or_default().to_vec()
         };
 
         let previous_len = page_content.len();
@@ -70,8 +70,11 @@ impl PageWriter {
         }
 
         page_content[write_range.start as usize..write_range.end as usize].copy_from_slice(content);
-        tx.update(self.bucket, vec![lwwreg::set(page, page_content)])
-            .await?;
+        tx.update(
+            self.bucket,
+            vec![lwwreg::set(page, Bytes::from(page_content))],
+        )
+        .await?;
 
         Ok(())
     }
@@ -86,7 +89,7 @@ impl PageWriter {
         let mut page = extent_start;
         let writes = content.chunks_exact(self.page_size as usize).map(|chunk| {
             assert!(chunk.len() == self.page_size as usize);
-            let write = lwwreg::set(Key::new(ino, page), chunk.into());
+            let write = lwwreg::set(Key::new(ino, page), Bytes::copy_from_slice(chunk));
             page += 1;
 
             write
@@ -227,7 +230,7 @@ impl PageWriter {
             lwwreg::set(page_key, content)
         };
 
-        let removes = remaining_pages.map(|p| lwwreg::set(Key::new(ino, p), Vec::new()));
+        let removes = remaining_pages.map(|p| lwwreg::set(Key::new(ino, p), Bytes::new()));
 
         let updates = std::iter::once(content_tail).chain(removes);
         tx.update(self.bucket, updates).await?;

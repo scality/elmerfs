@@ -4,12 +4,12 @@ use async_std::{
     io::{self, prelude::*},
     net::TcpStream,
 };
+pub use prost::bytes::Bytes;
 use prost::{DecodeError, EncodeError, Message};
 use std::convert::TryInto;
 use std::mem;
 use std::{convert::TryFrom, u32};
 use thiserror::Error;
-pub use prost::bytes::Bytes;
 
 #[derive(Debug, Error)]
 pub enum AntidoteError {
@@ -103,19 +103,18 @@ impl Connection {
             properties: Some(ApbTxnProperties {
                 exclusive_locks: locks.exclusive,
                 shared_locks: locks.shared,
-                .. ApbTxnProperties::default()
+                ..ApbTxnProperties::default()
             }),
-            .. ApbStartTransaction::default()
+            ..ApbStartTransaction::default()
         };
         self.send(transaction).await?;
         let response = checkr!(self.recv::<ApbStartTransactionResp>().await?);
 
         Ok(Transaction {
             connection: self,
-            txid: response.transaction_descriptor.unwrap()
+            txid: response.transaction_descriptor.unwrap(),
         })
     }
-
 
     #[inline]
     async fn send<P>(&mut self, request: P) -> Result<(), Error>
@@ -160,8 +159,7 @@ impl Connection {
             n += self.stream.read(&mut self.scratchpad[n..]).await?;
         }
 
-        let message_site_bytes = self.scratchpad[..MESSAGE_SIZE_BYTES]
-                                     .try_into().unwrap();
+        let message_site_bytes = self.scratchpad[..MESSAGE_SIZE_BYTES].try_into().unwrap();
         let message_size = u32::from_be_bytes(message_site_bytes) as usize;
 
         let payload_size = message_size + MESSAGE_SIZE_BYTES;
@@ -249,9 +247,9 @@ impl Transaction<'_> {
         let bound_objects: Vec<_> = queries
             .into_iter()
             .map(|q| ApbBoundObject {
-                    bucket: bucket.clone(),
-                    r#type: q.ty as i32,
-                    key: q.key
+                bucket: bucket.clone(),
+                r#type: q.ty as i32,
+                key: q.key,
             })
             .collect();
 
@@ -284,14 +282,13 @@ impl Transaction<'_> {
     ) -> Result<(), Error> {
         let bucket = bucket.into();
 
-
         let updates: Vec<_> = queries
             .into_iter()
             .map(|q| ApbUpdateOp {
                 boundobject: ApbBoundObject {
                     bucket: bucket.clone(),
                     r#type: q.ty as i32,
-                    key: q.key
+                    key: q.key,
                 },
                 operation: q.update,
             })
@@ -303,7 +300,7 @@ impl Transaction<'_> {
 
         let message = ApbUpdateObjects {
             transaction_descriptor: self.txid.clone(),
-            updates
+            updates,
         };
         self.connection.send(message).await?;
         checkr!(self.connection.recv::<ApbOperationResp>().await?);
@@ -437,9 +434,7 @@ pub struct UpdateQuery {
 }
 
 pub mod counter {
-    use super::{
-        ApbCounterUpdate, ApbUpdateOperation, CrdtType, RawIdent, ReadQuery, UpdateQuery,
-    };
+    use super::{ApbCounterUpdate, ApbUpdateOperation, CrdtType, RawIdent, ReadQuery, UpdateQuery};
 
     pub type Counter = i32;
 
@@ -466,8 +461,8 @@ pub mod counter {
 }
 
 pub mod lwwreg {
-    use prost::bytes::Bytes;
     use super::{ApbRegUpdate, ApbUpdateOperation, CrdtType, RawIdent, ReadQuery, UpdateQuery};
+    use prost::bytes::Bytes;
 
     pub type LwwReg = Bytes;
 
@@ -483,9 +478,7 @@ pub mod lwwreg {
             key: key.into(),
             ty: CrdtType::Lwwreg,
             update: ApbUpdateOperation {
-                regop: Some(ApbRegUpdate {
-                    value
-                }),
+                regop: Some(ApbRegUpdate { value }),
                 ..ApbUpdateOperation::default()
             },
         }
@@ -515,9 +508,7 @@ pub mod mvreg {
             key: key.into(),
             ty: CrdtType::Mvreg,
             update: ApbUpdateOperation {
-                regop: Some(ApbRegUpdate {
-                    value
-                }),
+                regop: Some(ApbRegUpdate { value }),
                 ..ApbUpdateOperation::default()
             },
         }
@@ -557,7 +548,7 @@ pub mod gmap {
             self.updates.push(ApbMapNestedUpdate {
                 key: ApbMapKey {
                     r#type: query.ty as i32,
-                    key: query.key
+                    key: query.key,
                 },
                 update: query.update,
                 ..ApbMapNestedUpdate::default()
@@ -616,9 +607,9 @@ pub mod rrmap {
             self.updates.push(ApbMapNestedUpdate {
                 key: ApbMapKey {
                     r#type: query.ty as i32,
-                    key: query.key
+                    key: query.key,
                 },
-                update: query.update
+                update: query.update,
             });
             self
         }
@@ -626,7 +617,7 @@ pub mod rrmap {
         pub fn remove_mvreg(mut self, ident: impl Into<RawIdent>) -> Self {
             self.removed.push(ApbMapKey {
                 r#type: CrdtType::Mvreg as i32,
-                key: ident.into()
+                key: ident.into(),
             });
             self
         }
@@ -634,7 +625,7 @@ pub mod rrmap {
         pub fn remove_rwset(mut self, ident: impl Into<RawIdent>) -> Self {
             self.removed.push(ApbMapKey {
                 r#type: CrdtType::Rwset as i32,
-                key: ident.into()
+                key: ident.into(),
             });
             self
         }
@@ -682,11 +673,11 @@ pub mod rrmap {
 }
 
 pub mod rwset {
-    use prost::bytes::Bytes;
     use super::{
-        ApbCrdtReset, ApbSetUpdate, apb_set_update::SetOpType, ApbUpdateOperation, CrdtType,
+        apb_set_update::SetOpType, ApbCrdtReset, ApbSetUpdate, ApbUpdateOperation, CrdtType,
         RawIdent, ReadQuery, UpdateQuery,
     };
+    use prost::bytes::Bytes;
     use std::collections::HashSet;
     pub type RwSet = HashSet<Bytes>;
 
@@ -722,7 +713,7 @@ pub mod rwset {
                         ..ApbSetUpdate::default()
                     }),
                     ..ApbUpdateOperation::default()
-                }
+                },
             }
         }
     }
@@ -756,7 +747,7 @@ pub mod rwset {
                         ..ApbSetUpdate::default()
                     }),
                     ..ApbUpdateOperation::default()
-                }
+                },
             }
         }
     }
@@ -870,10 +861,7 @@ pub mod crdts {
                 let map_key = entry.key;
                 let ty = Self::ty_from_i32(map_key.r#type).expect("crdt type");
 
-                map.insert(
-                    map_key.key,
-                    Self::from_read(ty, entry.value),
-                );
+                map.insert(map_key.key, Self::from_read(ty, entry.value));
             }
 
             map
@@ -892,7 +880,7 @@ pub mod crdts {
                 13 => Some(CrdtType::FlagEw),
                 14 => Some(CrdtType::FlagDw),
                 15 => Some(CrdtType::Bcounter),
-                _ => None
+                _ => None,
             }
         }
     }

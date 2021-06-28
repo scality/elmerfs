@@ -1,6 +1,6 @@
 use crate::key::{KeyWriter, Ty};
 use crate::view::{Name, View};
-use antidotec::RawIdent;
+use antidotec::{Bytes, RawIdent};
 use std::convert::TryInto;
 use std::mem::size_of;
 
@@ -38,10 +38,10 @@ impl Entry {
         Self { name, ino }
     }
 
-    fn into_bytes(&self) -> Vec<u8> {
+    fn into_bytes(&self) -> Bytes {
         let mut buffer = Vec::new();
         self.to_bytes(&mut buffer);
-        buffer
+        Bytes::from(buffer)
     }
 
     fn to_bytes(&self, content: &mut Vec<u8>) {
@@ -104,8 +104,7 @@ mod ops {
     }
 
     pub fn create(_view: View, _parent_ino: u64, ino: u64) -> UpdateQuery {
-        rwset::insert(Key::new(ino))
-            .build()
+        rwset::insert(Key::new(ino)).build()
     }
 
     pub fn remove(ino: u64) -> UpdateQuery {

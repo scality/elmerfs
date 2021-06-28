@@ -1,4 +1,4 @@
-use antidotec::RawIdent;
+use antidotec::{Bytes, RawIdent};
 use std::mem;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -45,7 +45,7 @@ impl KeyWriter {
 
 impl Into<RawIdent> for KeyWriter {
     fn into(self) -> RawIdent {
-        self.buffer
+        Bytes::from(self.buffer)
     }
 }
 
