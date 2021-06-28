@@ -1,6 +1,3 @@
-[submodule "antidotec/3rdparty/antidotepb"]
-	path = antidotec/3rdparty/antidotepb
-	url = https://github.com/AntidoteDB/antidote_pb_codec.git
 [submodule "3rdparty/antidote-tools"]
 	path = 3rdparty/antidote-tools
 	url = https://github.com/lplit/antidote-tools
