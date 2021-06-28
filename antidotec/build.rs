@@ -1,10 +1,6 @@
-use protobuf_codegen_pure as protobuf;
-
-fn main() {
-    protobuf::Codegen::new()
-        .out_dir("src/protos")
-        .inputs(&["3rdparty/antidotepb/proto/antidote.proto"])
-        .include("3rdparty/antidotepb/proto")
-        .run()
-        .expect("protobuf codegen failed");
+fn main() -> Result<(), std::io::Error> {
+    let mut config = prost_build::Config::new();
+    config.bytes(&[".antidote"]);
+    config.compile_protos(&["src/protos/antidote.proto"], &["src/protos"])?;
+    Ok(())
 }

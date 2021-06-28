@@ -7,13 +7,13 @@ edition = "2018"
 build = "build.rs"
 
 [dependencies]
-protobuf = "2.14"
-async-std = "1.0"
+prost = "0.7"
+async-std = { version = "1.6", features = ["unstable"] }
 thiserror = "1.0"
 tracing = "0.1"
 
 [build-dependencies]
-protobuf-codegen-pure = "2.3"
+prost-build = { version = "0.7" }
 
 [dependencies.tracing-futures]
 version = "0.2"

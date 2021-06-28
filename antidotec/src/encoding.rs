@@ -1,4 +1,6 @@
 pub mod lwwreg {
+    use prost::bytes::Bytes;
+
     use crate::connection::{lwwreg::*, RawIdent, UpdateQuery};
     use std::time::Duration;
     use std::{mem, u32, u64};
@@ -12,7 +14,8 @@ pub mod lwwreg {
     }
 
     pub fn set_u16(key: impl Into<RawIdent>, x: u16) -> UpdateQuery {
-        set(key, (&x.to_le_bytes()[..]).into())
+        let bytes = &x.to_le_bytes()[..];
+        set(key, Bytes::copy_from_slice(bytes))
     }
 
     pub fn read_u16(reg: &[u8]) -> u16 {
@@ -24,11 +27,13 @@ pub mod lwwreg {
     }
 
     pub fn set_u32(key: impl Into<RawIdent>, x: u32) -> UpdateQuery {
-        set(key, (&x.to_le_bytes()[..]).into())
+        let bytes = &x.to_le_bytes()[..];
+        set(key, Bytes::copy_from_slice(bytes))
     }
 
     pub fn set_u64(key: impl Into<RawIdent>, x: u64) -> UpdateQuery {
-        set(key, (&x.to_le_bytes()[..]).into())
+        let bytes = &x.to_le_bytes()[..];
+        set(key, Bytes::copy_from_slice(bytes))
     }
 
     pub fn read_u64(reg: &[u8]) -> u64 {
@@ -40,7 +45,7 @@ pub mod lwwreg {
     }
 
     pub fn set_u8(key: impl Into<RawIdent>, x: u8) -> UpdateQuery {
-        set(key, vec![x])
+        set(key, Bytes::copy_from_slice(&[x]))
     }
 
     pub fn read_u8(reg: &[u8]) -> u8 {
@@ -54,7 +59,7 @@ pub mod lwwreg {
         buffer.extend_from_slice(&duration.as_secs().to_le_bytes());
         buffer.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
 
-        set(key, buffer)
+        set(key, Bytes::from(buffer))
     }
 
     pub fn read_duration(reg: &[u8]) -> Duration {
@@ -68,9 +73,11 @@ pub mod lwwreg {
 }
 
 pub mod mvreg {
+    use prost::bytes::Bytes;
     use crate::connection::{mvreg::*, RawIdent, UpdateQuery};
 
     pub fn set_u64(key: impl Into<RawIdent>, x: u64) -> UpdateQuery {
-        set(key, (x.to_le_bytes())[..].into())
+        let bytes = &(x.to_le_bytes())[..];
+        set(key,  Bytes::copy_from_slice(bytes))
     }
 }

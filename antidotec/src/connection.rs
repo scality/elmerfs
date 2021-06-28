@@ -4,11 +4,12 @@ use async_std::{
     io::{self, prelude::*},
     net::TcpStream,
 };
-use protobuf::{CodedOutputStream, ProtobufError};
+use prost::{DecodeError, EncodeError, Message};
 use std::convert::TryInto;
 use std::mem;
 use std::{convert::TryFrom, u32};
 use thiserror::Error;
+pub use prost::bytes::Bytes;
 
 #[derive(Debug, Error)]
 pub enum AntidoteError {
@@ -37,8 +38,10 @@ impl From<u32> for AntidoteError {
 pub enum Error {
     #[error("couldn't write or read from the connection")]
     Io(#[from] io::Error),
-    #[error("failed to write or read protobuf message")]
-    Protobuf(#[from] ProtobufError),
+    #[error("failed to write protobuf message")]
+    ProtobufEncode(#[from] EncodeError),
+    #[error("failed to read protobuf message")]
+    ProtobufDecode(#[from] DecodeError),
     #[error("unexpected message code, expected: {expected}, found: {found}")]
     CodeMismatch { expected: u8, found: u8 },
     #[error("received message code is not known")]
@@ -49,13 +52,13 @@ pub enum Error {
     AntidoteErrResp(AntidoteError, String),
 }
 
-type TxId = Vec<u8>;
+type TxId = Bytes;
 
 macro_rules! checkr {
     ($resp:expr) => {{
         let resp = $resp;
-        if !resp.get_success() {
-            let errcode = resp.get_errorcode();
+        if !resp.success {
+            let errcode = resp.errorcode.unwrap();
             return Err(Error::Antidote(AntidoteError::from(errcode)));
         }
 
@@ -96,32 +99,34 @@ impl Connection {
             tracing::warn!(?error, "aborting dangling transaction");
         }
 
-        let mut transaction = ApbStartTransaction::new();
-
-        let mut properties = ApbTxnProperties::default();
-        properties.set_exclusive_locks(protobuf::RepeatedField::from_vec(locks.exclusive));
-        properties.set_shared_locks(protobuf::RepeatedField::from_vec(locks.shared));
-
-        transaction.set_properties(properties);
-
+        let transaction = ApbStartTransaction {
+            properties: Some(ApbTxnProperties {
+                exclusive_locks: locks.exclusive,
+                shared_locks: locks.shared,
+                .. ApbTxnProperties::default()
+            }),
+            .. ApbStartTransaction::default()
+        };
         self.send(transaction).await?;
         let response = checkr!(self.recv::<ApbStartTransactionResp>().await?);
 
         Ok(Transaction {
             connection: self,
-            txid: Vec::from(response.get_transaction_descriptor()),
+            txid: response.transaction_descriptor.unwrap()
         })
     }
 
+
+    #[inline]
     async fn send<P>(&mut self, request: P) -> Result<(), Error>
     where
         P: ApbMessage,
     {
         const HEADER_SIZE: u32 = 5;
-        let message_size = request.compute_size();
+        let message_size = request.encoded_len();
         let code = P::code();
 
-        let payload_size = message_size + HEADER_SIZE;
+        let payload_size = (message_size as u32) + HEADER_SIZE;
         if self.scratchpad.len() < payload_size as usize {
             self.scratchpad.resize(payload_size as usize, 0);
         }
@@ -131,9 +136,8 @@ impl Connection {
             header[0..4].copy_from_slice(&(message_size + 1).to_be_bytes());
             header[4] = code as u8;
 
-            let mut os = CodedOutputStream::bytes(&mut payload[..message_size as usize]);
-            request.write_to(&mut os)?;
-            os.flush()?;
+            let mut command = &mut payload[..message_size as usize];
+            request.encode(&mut command)?;
         }
 
         self.stream
@@ -142,9 +146,10 @@ impl Connection {
         Ok(())
     }
 
+    #[inline]
     async fn recv<R>(&mut self) -> Result<R, Error>
     where
-        R: ApbMessage,
+        R: Default + ApbMessage,
     {
         const MESSAGE_SIZE_BYTES: usize = 4;
 
@@ -172,11 +177,11 @@ impl Connection {
         let message_bytes = &self.scratchpad[MESSAGE_SIZE_BYTES..payload_size];
         let code = ApbMessageCode::try_from(message_bytes[0])?;
         if code == ApbMessageCode::ApbErrorResp {
-            let msg: ApbErrorResp = protobuf::parse_from_bytes(&self.scratchpad[1..])?;
+            let msg: ApbErrorResp = ApbErrorResp::decode(&self.scratchpad[1..])?;
 
             return Err(Error::AntidoteErrResp(
-                AntidoteError::from(msg.get_errcode()),
-                String::from_utf8_lossy(msg.get_errmsg()).into(),
+                AntidoteError::from(msg.errcode),
+                String::from_utf8_lossy(&msg.errmsg[..]).into(),
             ));
         }
 
@@ -187,7 +192,7 @@ impl Connection {
             });
         }
 
-        Ok(protobuf::parse_from_bytes(&message_bytes[1..])?)
+        Ok(R::decode(&message_bytes[1..])?)
     }
 
     async fn abort_pending_transaction(&mut self) -> Result<(), Error> {
@@ -197,8 +202,9 @@ impl Connection {
         };
 
         tracing::warn!(?txid, "aborting");
-        let mut message = ApbAbortTransaction::new();
-        message.set_transaction_descriptor(txid);
+        let message = ApbAbortTransaction {
+            transaction_descriptor: txid,
+        };
 
         self.send(message).await?;
         self.recv::<ApbOperationResp>().await?;
@@ -218,14 +224,14 @@ pub struct Transaction<'a> {
 impl Transaction<'_> {
     #[tracing::instrument(skip(self))]
     pub async fn commit(mut self) -> Result<(), Error> {
-        let mut message = ApbCommitTransaction::new();
-        message.set_transaction_descriptor(self.txid.clone());
+        let mut message = ApbCommitTransaction::default();
+        message.transaction_descriptor = self.txid.clone();
 
         self.connection.send(message).await?;
         let result = self.connection.recv::<ApbCommitResp>().await;
 
         /* Don't drop to avoid calling abort */
-        self.txid = Vec::new();
+        self.txid = TxId::new();
         mem::forget(self);
 
         checkr!(result?);
@@ -240,18 +246,12 @@ impl Transaction<'_> {
     ) -> Result<ReadReply, Error> {
         let bucket = bucket.into();
 
-        let mut message = ApbReadObjects::new();
-        message.set_transaction_descriptor(self.txid.clone());
-
         let bound_objects: Vec<_> = queries
             .into_iter()
-            .map(|q| {
-                let mut bound = ApbBoundObject::new();
-                bound.set_bucket(bucket.clone());
-                bound.set_field_type(q.ty);
-                bound.set_key(q.key);
-
-                bound
+            .map(|q| ApbBoundObject {
+                    bucket: bucket.clone(),
+                    r#type: q.ty as i32,
+                    key: q.key
             })
             .collect();
 
@@ -261,14 +261,18 @@ impl Transaction<'_> {
             });
         }
 
-        message.set_boundobjects(protobuf::RepeatedField::from(bound_objects));
-
+        let message = ApbReadObjects {
+            transaction_descriptor: self.txid.clone(),
+            boundobjects: bound_objects,
+            ..ApbReadObjects::default()
+        };
         self.connection.send(message).await?;
-        let mut response: ApbReadObjectsResp =
+
+        let response: ApbReadObjectsResp =
             checkr!(self.connection.recv::<ApbReadObjectsResp>().await?);
 
         Ok(ReadReply {
-            objects: response.take_objects().into_iter().map(Some).collect(),
+            objects: response.objects.into_iter().map(Some).collect(),
         })
     }
 
@@ -280,31 +284,27 @@ impl Transaction<'_> {
     ) -> Result<(), Error> {
         let bucket = bucket.into();
 
-        let mut message = ApbUpdateObjects::new();
-        message.set_transaction_descriptor(self.txid.clone());
 
-        let bound_objects: Vec<_> = queries
+        let updates: Vec<_> = queries
             .into_iter()
-            .map(|q| {
-                let mut bound = ApbBoundObject::new();
-                bound.set_bucket(bucket.clone());
-                bound.set_field_type(q.ty);
-                bound.set_key(q.key);
-
-                let mut op = ApbUpdateOp::new();
-                op.set_boundobject(bound);
-                op.set_operation(q.update);
-
-                op
+            .map(|q| ApbUpdateOp {
+                boundobject: ApbBoundObject {
+                    bucket: bucket.clone(),
+                    r#type: q.ty as i32,
+                    key: q.key
+                },
+                operation: q.update,
             })
             .collect();
 
-        if bound_objects.is_empty() {
+        if updates.is_empty() {
             return Ok(());
         }
 
-        message.set_updates(protobuf::RepeatedField::from(bound_objects));
-
+        let message = ApbUpdateObjects {
+            transaction_descriptor: self.txid.clone(),
+            updates
+        };
         self.connection.send(message).await?;
         checkr!(self.connection.recv::<ApbOperationResp>().await?);
 
@@ -318,7 +318,7 @@ impl Drop for Transaction<'_> {
         assert!(!self.txid.is_empty());
 
         tracing::warn!(?self.txid, "dropped, will be aborted");
-        self.connection.dropped = Some(mem::replace(&mut self.txid, Vec::new()));
+        self.connection.dropped = Some(self.txid.clone());
     }
 }
 
@@ -354,12 +354,11 @@ impl TransactionLocks {
     }
 }
 
-pub type RawIdent = Vec<u8>;
-pub type RawIdentSlice<'a> = &'a [u8];
+pub type RawIdent = Bytes;
 
 pub struct ReadQuery {
     key: RawIdent,
-    ty: CRDT_type,
+    ty: CrdtType,
 }
 
 pub struct ReadReply {
@@ -368,13 +367,13 @@ pub struct ReadReply {
 
 impl ReadReply {
     pub fn counter(&mut self, index: usize) -> crdts::Counter {
-        self.object(CRDT_type::COUNTER, index)
+        self.object(CrdtType::Counter, index)
             .unwrap()
             .into_counter()
     }
 
     pub fn lwwreg(&mut self, index: usize) -> Option<crdts::LwwReg> {
-        let reg = self.object(CRDT_type::LWWREG, index).unwrap().into_lwwreg();
+        let reg = self.object(CrdtType::Lwwreg, index).unwrap().into_lwwreg();
 
         if !reg.is_empty() {
             Some(reg)
@@ -384,7 +383,7 @@ impl ReadReply {
     }
 
     pub fn mvreg(&mut self, index: usize) -> Option<crdts::MvReg> {
-        let reg = self.object(CRDT_type::MVREG, index).unwrap().into_mvreg();
+        let reg = self.object(CrdtType::Mvreg, index).unwrap().into_mvreg();
 
         if !reg.is_empty() {
             Some(reg)
@@ -394,7 +393,7 @@ impl ReadReply {
     }
 
     pub fn gmap(&mut self, index: usize) -> Option<crdts::GMap> {
-        let gmap = self.object(CRDT_type::GMAP, index).unwrap().into_gmap();
+        let gmap = self.object(CrdtType::Gmap, index).unwrap().into_gmap();
 
         if gmap.is_empty() {
             None
@@ -404,7 +403,7 @@ impl ReadReply {
     }
 
     pub fn rrmap(&mut self, index: usize) -> Option<crdts::RrMap> {
-        let rrmap = self.object(CRDT_type::RRMAP, index).unwrap().into_rrmap();
+        let rrmap = self.object(CrdtType::Rrmap, index).unwrap().into_rrmap();
 
         if rrmap.is_empty() {
             None
@@ -414,7 +413,7 @@ impl ReadReply {
     }
 
     pub fn rwset(&mut self, index: usize) -> Option<crdts::RwSet> {
-        let rwset = self.object(CRDT_type::RWSET, index).unwrap().into_rwset();
+        let rwset = self.object(CrdtType::Rwset, index).unwrap().into_rwset();
 
         if rwset.is_empty() {
             None
@@ -423,7 +422,7 @@ impl ReadReply {
         }
     }
 
-    fn object(&mut self, ty: CRDT_type, index: usize) -> Option<Crdt> {
+    fn object(&mut self, ty: CrdtType, index: usize) -> Option<Crdt> {
         match self.objects.get_mut(index) {
             Some(slot) => slot.take().map(|o| Crdt::from_read(ty, o)),
             None => None,
@@ -433,13 +432,13 @@ impl ReadReply {
 
 pub struct UpdateQuery {
     key: RawIdent,
-    ty: CRDT_type,
+    ty: CrdtType,
     update: ApbUpdateOperation,
 }
 
 pub mod counter {
     use super::{
-        ApbCounterUpdate, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
+        ApbCounterUpdate, ApbUpdateOperation, CrdtType, RawIdent, ReadQuery, UpdateQuery,
     };
 
     pub type Counter = i32;
@@ -447,48 +446,48 @@ pub mod counter {
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
-            ty: CRDT_type::COUNTER,
+            ty: CrdtType::Counter,
         }
     }
 
     pub fn inc(key: impl Into<RawIdent>, value: Counter) -> UpdateQuery {
-        let mut inc = ApbCounterUpdate::new();
-        inc.set_inc(value as i64);
-
-        let mut update = ApbUpdateOperation::new();
-        update.set_counterop(inc);
-
+        let update = ApbUpdateOperation {
+            counterop: Some(ApbCounterUpdate {
+                inc: Some(value as i64),
+            }),
+            ..ApbUpdateOperation::default()
+        };
         UpdateQuery {
             key: key.into(),
-            ty: CRDT_type::COUNTER,
+            ty: CrdtType::Counter,
             update,
         }
     }
 }
 
 pub mod lwwreg {
-    use super::{ApbRegUpdate, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery};
+    use prost::bytes::Bytes;
+    use super::{ApbRegUpdate, ApbUpdateOperation, CrdtType, RawIdent, ReadQuery, UpdateQuery};
 
-    pub type LwwReg = Vec<u8>;
+    pub type LwwReg = Bytes;
 
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
-            ty: CRDT_type::LWWREG,
+            ty: CrdtType::Lwwreg,
         }
     }
 
-    pub fn set(key: impl Into<RawIdent>, value: Vec<u8>) -> UpdateQuery {
-        let mut set = ApbRegUpdate::new();
-        set.set_value(value);
-
-        let mut update = ApbUpdateOperation::new();
-        update.set_regop(set);
-
+    pub fn set(key: impl Into<RawIdent>, value: Bytes) -> UpdateQuery {
         UpdateQuery {
             key: key.into(),
-            ty: CRDT_type::LWWREG,
-            update,
+            ty: CrdtType::Lwwreg,
+            update: ApbUpdateOperation {
+                regop: Some(ApbRegUpdate {
+                    value
+                }),
+                ..ApbUpdateOperation::default()
+            },
         }
     }
 
@@ -496,41 +495,42 @@ pub mod lwwreg {
 }
 
 pub mod mvreg {
+    use prost::bytes::Bytes;
+
     use super::{
-        ApbCrdtReset, ApbRegUpdate, ApbUpdateOperation, CRDT_type, RawIdent, ReadQuery, UpdateQuery,
+        ApbCrdtReset, ApbRegUpdate, ApbUpdateOperation, CrdtType, RawIdent, ReadQuery, UpdateQuery,
     };
 
-    pub type MvReg = Vec<Vec<u8>>;
+    pub type MvReg = Vec<Bytes>;
 
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
-            ty: CRDT_type::MVREG,
+            ty: CrdtType::Mvreg,
         }
     }
 
-    pub fn set(key: impl Into<RawIdent>, reg: Vec<u8>) -> UpdateQuery {
-        let mut set = ApbRegUpdate::new();
-        set.set_value(reg);
-
-        let mut update = ApbUpdateOperation::new();
-        update.set_regop(set);
-
+    pub fn set(key: impl Into<RawIdent>, value: Bytes) -> UpdateQuery {
         UpdateQuery {
             key: key.into(),
-            ty: CRDT_type::MVREG,
-            update,
+            ty: CrdtType::Mvreg,
+            update: ApbUpdateOperation {
+                regop: Some(ApbRegUpdate {
+                    value
+                }),
+                ..ApbUpdateOperation::default()
+            },
         }
     }
 
     pub fn reset(key: impl Into<RawIdent>) -> UpdateQuery {
-        let mut update = ApbUpdateOperation::new();
-        update.set_resetop(ApbCrdtReset::new());
-
         UpdateQuery {
             key: key.into(),
-            ty: CRDT_type::MVREG,
-            update,
+            ty: CrdtType::Mvreg,
+            update: ApbUpdateOperation {
+                resetop: Some(ApbCrdtReset::default()),
+                ..ApbUpdateOperation::default()
+            },
         }
     }
 
@@ -540,7 +540,7 @@ pub mod mvreg {
 pub mod gmap {
     use super::crdts::Crdt;
     use super::{
-        ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type, RawIdent,
+        ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CrdtType, RawIdent,
         ReadQuery, UpdateQuery,
     };
     use std::collections::HashMap;
@@ -554,29 +554,28 @@ pub mod gmap {
 
     impl UpdateBuilder {
         pub fn push(mut self, query: UpdateQuery) -> Self {
-            let mut nested = ApbMapNestedUpdate::new();
-            let mut key = ApbMapKey::new();
-            key.set_field_type(query.ty);
-            key.set_key(query.key);
-
-            nested.set_update(query.update);
-            nested.set_key(key);
-
-            self.updates.push(nested);
+            self.updates.push(ApbMapNestedUpdate {
+                key: ApbMapKey {
+                    r#type: query.ty as i32,
+                    key: query.key
+                },
+                update: query.update,
+                ..ApbMapNestedUpdate::default()
+            });
             self
         }
 
         pub fn build(self) -> UpdateQuery {
-            let mut updates = ApbMapUpdate::new();
-            updates.set_updates(protobuf::RepeatedField::from(self.updates));
-
-            let mut update = ApbUpdateOperation::new();
-            update.set_mapop(updates);
-
             UpdateQuery {
                 key: self.key,
-                update,
-                ty: CRDT_type::GMAP,
+                ty: CrdtType::Gmap,
+                update: ApbUpdateOperation {
+                    mapop: Some(ApbMapUpdate {
+                        updates: self.updates,
+                        ..ApbMapUpdate::default()
+                    }),
+                    ..ApbUpdateOperation::default()
+                },
             }
         }
     }
@@ -591,7 +590,7 @@ pub mod gmap {
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
-            ty: CRDT_type::GMAP,
+            ty: CrdtType::Gmap,
         }
     }
 }
@@ -599,7 +598,7 @@ pub mod gmap {
 pub mod rrmap {
     use super::crdts::Crdt;
     use super::{
-        ApbCrdtReset, ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CRDT_type,
+        ApbCrdtReset, ApbMapKey, ApbMapNestedUpdate, ApbMapUpdate, ApbUpdateOperation, CrdtType,
         RawIdent, ReadQuery, UpdateQuery,
     };
     use std::collections::HashMap;
@@ -614,60 +613,55 @@ pub mod rrmap {
 
     impl UpdateBuilder {
         pub fn push(mut self, query: UpdateQuery) -> Self {
-            let mut nested = ApbMapNestedUpdate::new();
-            let mut key = ApbMapKey::new();
-            key.set_field_type(query.ty);
-            key.set_key(query.key);
-
-            nested.set_update(query.update);
-            nested.set_key(key);
-
-            self.updates.push(nested);
+            self.updates.push(ApbMapNestedUpdate {
+                key: ApbMapKey {
+                    r#type: query.ty as i32,
+                    key: query.key
+                },
+                update: query.update
+            });
             self
         }
 
         pub fn remove_mvreg(mut self, ident: impl Into<RawIdent>) -> Self {
-            let mut key = ApbMapKey::new();
-            key.set_field_type(CRDT_type::MVREG);
-            key.set_key(ident.into());
-
-            self.removed.push(key);
+            self.removed.push(ApbMapKey {
+                r#type: CrdtType::Mvreg as i32,
+                key: ident.into()
+            });
             self
         }
 
         pub fn remove_rwset(mut self, ident: impl Into<RawIdent>) -> Self {
-            let mut key = ApbMapKey::new();
-            key.set_field_type(CRDT_type::RWSET);
-            key.set_key(ident.into());
-
-            self.removed.push(key);
+            self.removed.push(ApbMapKey {
+                r#type: CrdtType::Rwset as i32,
+                key: ident.into()
+            });
             self
         }
 
         pub fn build(self) -> UpdateQuery {
-            let mut updates = ApbMapUpdate::new();
-            updates.set_updates(protobuf::RepeatedField::from(self.updates));
-            updates.set_removedKeys(protobuf::RepeatedField::from(self.removed));
-
-            let mut update = ApbUpdateOperation::new();
-            update.set_mapop(updates);
-
             UpdateQuery {
                 key: self.key,
-                update,
-                ty: CRDT_type::RRMAP,
+                ty: CrdtType::Rrmap,
+                update: ApbUpdateOperation {
+                    mapop: Some(ApbMapUpdate {
+                        updates: self.updates,
+                        removed_keys: self.removed,
+                    }),
+                    ..ApbUpdateOperation::default()
+                },
             }
         }
     }
 
     pub fn reset(key: impl Into<RawIdent>) -> UpdateQuery {
-        let mut update = ApbUpdateOperation::new();
-        update.set_resetop(ApbCrdtReset::new());
-
         UpdateQuery {
             key: key.into(),
-            ty: CRDT_type::RRMAP,
-            update,
+            ty: CrdtType::Rrmap,
+            update: ApbUpdateOperation {
+                resetop: Some(ApbCrdtReset::default()),
+                ..ApbUpdateOperation::default()
+            },
         }
     }
 
@@ -682,52 +676,53 @@ pub mod rrmap {
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
-            ty: CRDT_type::RRMAP,
+            ty: CrdtType::Rrmap,
         }
     }
 }
 
 pub mod rwset {
+    use prost::bytes::Bytes;
     use super::{
-        ApbCrdtReset, ApbSetUpdate, ApbSetUpdate_SetOpType, ApbUpdateOperation, CRDT_type,
+        ApbCrdtReset, ApbSetUpdate, apb_set_update::SetOpType, ApbUpdateOperation, CrdtType,
         RawIdent, ReadQuery, UpdateQuery,
     };
     use std::collections::HashSet;
-    pub type RwSet = HashSet<Vec<u8>>;
+    pub type RwSet = HashSet<Bytes>;
 
     pub fn reset(key: impl Into<RawIdent>) -> UpdateQuery {
-        let mut update = ApbUpdateOperation::new();
-        update.set_resetop(ApbCrdtReset::new());
-
         UpdateQuery {
             key: key.into(),
-            ty: CRDT_type::RWSET,
-            update,
+            ty: CrdtType::Rwset,
+            update: ApbUpdateOperation {
+                resetop: Some(ApbCrdtReset::default()),
+                ..ApbUpdateOperation::default()
+            },
         }
     }
     pub struct InsertBuilder {
         key: RawIdent,
-        inserts: Vec<Vec<u8>>,
+        inserts: Vec<Bytes>,
     }
 
     impl InsertBuilder {
-        pub fn add(mut self, value: Vec<u8>) -> Self {
+        pub fn add(mut self, value: Bytes) -> Self {
             self.inserts.push(value);
             self
         }
 
         pub fn build(self) -> UpdateQuery {
-            let mut updates = ApbSetUpdate::new();
-            updates.set_optype(ApbSetUpdate_SetOpType::ADD);
-            updates.set_adds(protobuf::RepeatedField::from(self.inserts));
-
-            let mut update = ApbUpdateOperation::new();
-            update.set_setop(updates);
-
             UpdateQuery {
                 key: self.key,
-                update,
-                ty: CRDT_type::RWSET,
+                ty: CrdtType::Rwset,
+                update: ApbUpdateOperation {
+                    setop: Some(ApbSetUpdate {
+                        optype: SetOpType::Add as i32,
+                        adds: self.inserts,
+                        ..ApbSetUpdate::default()
+                    }),
+                    ..ApbUpdateOperation::default()
+                }
             }
         }
     }
@@ -741,27 +736,27 @@ pub mod rwset {
 
     pub struct RemoveBuilder {
         key: RawIdent,
-        inserts: Vec<Vec<u8>>,
+        removes: Vec<RawIdent>,
     }
 
     impl RemoveBuilder {
-        pub fn remove(mut self, value: Vec<u8>) -> Self {
-            self.inserts.push(value);
+        pub fn remove(mut self, key: RawIdent) -> Self {
+            self.removes.push(key);
             self
         }
 
         pub fn build(self) -> UpdateQuery {
-            let mut updates = ApbSetUpdate::new();
-            updates.set_optype(ApbSetUpdate_SetOpType::REMOVE);
-            updates.set_rems(protobuf::RepeatedField::from(self.inserts));
-
-            let mut update = ApbUpdateOperation::new();
-            update.set_setop(updates);
-
             UpdateQuery {
                 key: self.key,
-                update,
-                ty: CRDT_type::RWSET,
+                ty: CrdtType::Rwset,
+                update: ApbUpdateOperation {
+                    setop: Some(ApbSetUpdate {
+                        optype: SetOpType::Remove as i32,
+                        rems: self.removes,
+                        ..ApbSetUpdate::default()
+                    }),
+                    ..ApbUpdateOperation::default()
+                }
             }
         }
     }
@@ -769,24 +764,26 @@ pub mod rwset {
     pub fn remove(key: impl Into<RawIdent>) -> RemoveBuilder {
         RemoveBuilder {
             key: key.into(),
-            inserts: Vec::new(),
+            removes: Vec::new(),
         }
     }
 
     pub fn get(key: impl Into<RawIdent>) -> ReadQuery {
         ReadQuery {
             key: key.into(),
-            ty: CRDT_type::RWSET,
+            ty: CrdtType::Rwset,
         }
     }
 }
 
 pub mod crdts {
+    use prost::bytes::Bytes;
+
     pub use super::{
         counter::Counter, gmap::GMap, lwwreg::LwwReg, mvreg::MvReg, rrmap::RrMap, rwset::RwSet,
         RawIdent,
     };
-    use super::{ApbReadObjectResp, CRDT_type};
+    use super::{ApbReadObjectResp, CrdtType};
     use std::collections::{HashMap, HashSet};
 
     #[derive(Debug)]
@@ -846,46 +843,57 @@ pub mod crdts {
             panic!("expected {}, found: {:#?}", name, self)
         }
 
-        pub(super) fn from_read(ty: CRDT_type, mut read: ApbReadObjectResp) -> Self {
+        pub(super) fn from_read(ty: CrdtType, mut read: ApbReadObjectResp) -> Self {
             use Crdt::*;
 
             match ty {
-                CRDT_type::COUNTER => Counter(read.take_counter().get_value()),
-                CRDT_type::LWWREG => LwwReg(read.take_reg().take_value()),
-                CRDT_type::MVREG => MvReg(read.take_mvreg().take_values().into_vec()),
-                CRDT_type::GMAP => GMap(Self::map(read)),
-                CRDT_type::RRMAP => RrMap(Self::map(read)),
-                CRDT_type::RWSET => RwSet(Self::set(read)),
+                CrdtType::Counter => Counter(read.counter.take().unwrap().value),
+                CrdtType::Lwwreg => LwwReg(read.reg.take().unwrap().value),
+                CrdtType::Mvreg => MvReg(read.mvreg.take().unwrap().values),
+                CrdtType::Gmap => GMap(Self::map(read)),
+                CrdtType::Rrmap => RrMap(Self::map(read)),
+                CrdtType::Rwset => RwSet(Self::set(read)),
                 _ => unimplemented!(),
             }
         }
 
-        fn set(mut read: ApbReadObjectResp) -> HashSet<Vec<u8>> {
-            let entries = read.take_set().take_value();
-            let mut output = HashSet::new();
-
-            for entry in entries.into_vec() {
-                output.insert(entry);
-            }
-
-            output
+        fn set(mut read: ApbReadObjectResp) -> HashSet<Bytes> {
+            let entries = read.set.take().unwrap().value;
+            entries.into_iter().collect()
         }
 
         fn map(mut read: ApbReadObjectResp) -> HashMap<RawIdent, Crdt> {
-            let entries = read.take_map().take_entries();
+            let entries = read.map.take().unwrap().entries;
 
             let mut map = HashMap::with_capacity(entries.len());
-            for mut entry in entries.into_iter() {
-                let mut entry_key = entry.take_key();
-                let key = entry_key.take_key();
+            for entry in entries {
+                let map_key = entry.key;
+                let ty = Self::ty_from_i32(map_key.r#type).expect("crdt type");
 
                 map.insert(
-                    key,
-                    Self::from_read(entry_key.get_field_type(), entry.take_value()),
+                    map_key.key,
+                    Self::from_read(ty, entry.value),
                 );
             }
 
             map
+        }
+
+        fn ty_from_i32(i: i32) -> Option<CrdtType> {
+            match i {
+                3 => Some(CrdtType::Counter),
+                4 => Some(CrdtType::Orset),
+                5 => Some(CrdtType::Lwwreg),
+                6 => Some(CrdtType::Mvreg),
+                8 => Some(CrdtType::Gmap),
+                10 => Some(CrdtType::Rwset),
+                11 => Some(CrdtType::Rrmap),
+                12 => Some(CrdtType::Fatcounter),
+                13 => Some(CrdtType::FlagEw),
+                14 => Some(CrdtType::FlagDw),
+                15 => Some(CrdtType::Bcounter),
+                _ => None
+            }
         }
     }
 }

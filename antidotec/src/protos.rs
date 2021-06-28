@@ -37,7 +37,7 @@ macro_rules! apb_messages {
             )*
         }
 
-        pub trait ApbMessage: protobuf::Message {
+        pub trait ApbMessage: prost::Message {
             fn code() -> ApbMessageCode;
         }
 
@@ -92,8 +92,8 @@ apb_messages! {
     ApbReadObjectsResp = 126,
     ApbCommitResp = 127,
     ApbStaticReadObjectsResp = 128,
-    ApbCreateDC = 129,
-    ApbCreateDCResp = 130,
+    ApbCreateDc = 129,
+    ApbCreateDcResp = 130,
     ApbConnectToDCs = 131,
     ApbConnectToDCsResp = 132,
     ApbGetConnectionDescriptor = 133,
