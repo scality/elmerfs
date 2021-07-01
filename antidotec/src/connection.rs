@@ -132,7 +132,7 @@ impl Connection {
 
         {
             let (header, payload) = self.scratchpad.split_at_mut(HEADER_SIZE as usize);
-            header[0..4].copy_from_slice(&(message_size + 1).to_be_bytes());
+            header[0..4].copy_from_slice(&(message_size as u32 + 1).to_be_bytes());
             header[4] = code as u8;
 
             let mut command = &mut payload[..message_size as usize];
