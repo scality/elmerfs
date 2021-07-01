@@ -748,7 +748,7 @@ impl Driver {
         offset: u64,
     ) -> Result<()> {
         let byte_range = offset..(offset + bytes.len() as u64);
-        let lock = self.page_locks.lock(ino, byte_range).await;
+        let lock = self.page_locks.wlock(ino, byte_range).await;
 
         let result = self.write_sync_nolock(ino, bytes, offset).await;
 
@@ -792,7 +792,7 @@ impl Driver {
         self.fsync(ino, fh).await?;
 
         let byte_range = offset..(offset + len as u64);
-        let lock = self.page_locks.lock(ino, byte_range).await;
+        let lock = self.page_locks.rlock(ino, byte_range).await;
 
         let result = self.read_nolock(ino, offset, len).await;
 

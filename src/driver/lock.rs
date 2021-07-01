@@ -1,11 +1,38 @@
 use async_std::sync::{Condvar, Mutex};
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum OpKind {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeOp {
+    range: Range<u64>,
+    kind: OpKind,
+}
+
+impl RangeOp {
+    #[inline]
+    fn conflicts_with(&self, other: &RangeOp) -> bool {
+        if self.range.start < other.range.end && other.range.start < self.range.end {
+            match (self.kind, other.kind) {
+                (OpKind::Read, OpKind::Read) => false,
+                (OpKind::Write, _) | (_, OpKind::Write) => true,
+            }
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RangeLock {
-    used_ranges: Vec<Range<u64>>,
+    used_ranges: Vec<RangeOp>,
     range_signal: Arc<Condvar>,
 }
 
@@ -23,8 +50,22 @@ impl PageLocks {
         }
     }
 
-    pub async fn lock(&self, ino: u64, byte_range: Range<u64>) -> RangeGuard {
+
+    pub fn rlock<'s>(&'s self, ino: u64, byte_range: Range<u64>) -> impl Future<Output=RangeGuard> + 's {
+        self.lock(ino, OpKind::Read, byte_range)
+    }
+
+    pub fn wlock<'s>(&'s self, ino: u64, byte_range: Range<u64>) -> impl Future<Output=RangeGuard> + 's {
+        self.lock(ino, OpKind::Write, byte_range)
+    }
+
+    #[inline]
+    async fn lock(&self, ino: u64, kind: OpKind, byte_range: Range<u64>) -> RangeGuard {
         let requested_pages = self.page_range(&byte_range);
+        let requested = RangeOp {
+            kind,
+            range: requested_pages,
+        };
 
         let mut by_ino = self.by_ino.lock().await;
         by_ino.entry(ino).or_insert(RangeLock {
@@ -32,33 +73,33 @@ impl PageLocks {
             range_signal: Arc::new(Condvar::new()),
         });
 
-        while Self::intersection_position(&by_ino[&ino].used_ranges[..], &requested_pages).is_some()
+        while (&by_ino[&ino].used_ranges[..].iter().position(|used| used.conflicts_with(&requested))).is_some()
         {
             let range_lock = &by_ino[&ino];
 
-            tracing::debug!(?range_lock, ?requested_pages, "page contention");
+            tracing::debug!(?range_lock, ?requested, "page contention");
             let cond = range_lock.range_signal.clone();
             by_ino = cond.wait(by_ino).await;
         }
 
         let range_lock = by_ino.get_mut(&ino).unwrap();
 
-        range_lock.used_ranges.push(requested_pages.clone());
+        range_lock.used_ranges.push(requested.clone());
         RangeGuard {
             ino,
-            pages: requested_pages,
+            used: requested,
         }
     }
 
     pub async fn unlock(&self, guard: RangeGuard) {
         let ino = guard.ino;
-        let pages = guard.pages.clone();
+        let released = guard.used.clone();
         std::mem::forget(guard);
 
         let mut by_ino = self.by_ino.lock().await;
         let range_lock = by_ino.get_mut(&ino).unwrap();
 
-        let index = Self::intersection_position(&range_lock.used_ranges[..], &pages).unwrap();
+        let index = range_lock.used_ranges.iter().position(|used| used == &released).unwrap();
         range_lock.used_ranges.swap_remove(index);
         range_lock.range_signal.notify_all();
 
@@ -74,21 +115,11 @@ impl PageLocks {
 
         first..(last + 1)
     }
-
-    fn intersection_position(ranges: &[Range<u64>], range: &Range<u64>) -> Option<usize> {
-        for (i, current) in ranges.iter().enumerate() {
-            if current.start < range.end && range.start < current.end {
-                return Some(i);
-            }
-        }
-
-        None
-    }
 }
 
 pub struct RangeGuard {
     ino: u64,
-    pages: Range<u64>,
+    used: RangeOp,
 }
 
 impl Drop for RangeGuard {
