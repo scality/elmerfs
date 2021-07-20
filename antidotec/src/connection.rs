@@ -4,7 +4,7 @@ use async_std::{
     io::{self, prelude::*},
     net::TcpStream,
 };
-pub use prost::bytes::Bytes;
+pub use prost::bytes::{Bytes, BytesMut, BufMut};
 use prost::{DecodeError, EncodeError, Message};
 use std::convert::TryInto;
 use std::mem;
@@ -52,7 +52,7 @@ pub enum Error {
     AntidoteErrResp(AntidoteError, String),
 }
 
-type TxId = Bytes;
+pub type TxId = Bytes;
 
 macro_rules! checkr {
     ($resp:expr) => {{
@@ -69,7 +69,6 @@ macro_rules! checkr {
 #[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
-    scratchpad: Vec<u8>,
     dropped: Option<TxId>,
 }
 
@@ -80,7 +79,6 @@ impl Connection {
 
         Ok(Self {
             stream,
-            scratchpad: Vec::with_capacity(128 * 1024),
             dropped: None,
         })
     }
@@ -110,10 +108,7 @@ impl Connection {
         self.send(transaction).await?;
         let response = checkr!(self.recv::<ApbStartTransactionResp>().await?);
 
-        Ok(Transaction {
-            connection: self,
-            txid: response.transaction_descriptor.unwrap(),
-        })
+        Ok(Transaction::from_raw(response.transaction_descriptor.unwrap(), self))
     }
 
     #[inline]
@@ -126,21 +121,15 @@ impl Connection {
         let code = P::code();
 
         let payload_size = (message_size as u32) + HEADER_SIZE;
-        if self.scratchpad.len() < payload_size as usize {
-            self.scratchpad.resize(payload_size as usize, 0);
-        }
-
+        let mut buffer = BytesMut::with_capacity(payload_size as usize);
         {
-            let (header, payload) = self.scratchpad.split_at_mut(HEADER_SIZE as usize);
-            header[0..4].copy_from_slice(&(message_size as u32 + 1).to_be_bytes());
-            header[4] = code as u8;
-
-            let mut command = &mut payload[..message_size as usize];
-            request.encode(&mut command)?;
+            buffer.put_slice(&(message_size as u32 + 1).to_be_bytes());
+            buffer.put_u8(code as u8);
+            request.encode(&mut buffer)?;
         }
 
         self.stream
-            .write_all(&self.scratchpad[..payload_size as usize])
+            .write_all(&buffer[..payload_size as usize])
             .await?;
         Ok(())
     }
@@ -151,31 +140,34 @@ impl Connection {
         R: Default + ApbMessage,
     {
         const MESSAGE_SIZE_BYTES: usize = 4;
+        const BASE_MESSAGE_SIZE: usize = 65*1024;
 
-        assert!(self.scratchpad.len() >= MESSAGE_SIZE_BYTES);
         let mut n = 0;
-
+        let mut buffer = BytesMut::with_capacity(BASE_MESSAGE_SIZE);
+        buffer.resize(BASE_MESSAGE_SIZE, 0);
         while n < MESSAGE_SIZE_BYTES {
-            n += self.stream.read(&mut self.scratchpad[n..]).await?;
+            n += self.stream.read(&mut buffer[n..]).await?;
         }
 
-        let message_site_bytes = self.scratchpad[..MESSAGE_SIZE_BYTES].try_into().unwrap();
+        let message_site_bytes = buffer[..MESSAGE_SIZE_BYTES].try_into().unwrap();
         let message_size = u32::from_be_bytes(message_site_bytes) as usize;
 
         let payload_size = message_size + MESSAGE_SIZE_BYTES;
-        if payload_size > self.scratchpad.len() {
-            self.scratchpad.resize(payload_size as usize, 0);
+        if payload_size > buffer.len() {
+            buffer.resize(payload_size as usize, 0);
         }
 
         // We may have to read the end of the message.
         while n < payload_size {
-            n += self.stream.read(&mut self.scratchpad[n..]).await?;
+            n += self.stream.read(&mut buffer[n..]).await?;
         }
+        buffer.truncate(payload_size);
 
-        let message_bytes = &self.scratchpad[MESSAGE_SIZE_BYTES..payload_size];
-        let code = ApbMessageCode::try_from(message_bytes[0])?;
+        let code = ApbMessageCode::try_from(buffer[MESSAGE_SIZE_BYTES])?;
+        let message = buffer.split_off(MESSAGE_SIZE_BYTES + 1 /* code byte */).freeze();
+
         if code == ApbMessageCode::ApbErrorResp {
-            let msg: ApbErrorResp = ApbErrorResp::decode(&self.scratchpad[1..])?;
+            let msg: ApbErrorResp = ApbErrorResp::decode(message)?;
 
             return Err(Error::AntidoteErrResp(
                 AntidoteError::from(msg.errcode),
@@ -190,7 +182,7 @@ impl Connection {
             });
         }
 
-        Ok(R::decode(&message_bytes[1..])?)
+        Ok(R::decode(message)?)
     }
 
     async fn abort_pending_transaction(&mut self) -> Result<(), Error> {
@@ -219,7 +211,30 @@ pub struct Transaction<'a> {
     txid: TxId,
 }
 
+impl<'c> Transaction<'c> {
+    pub fn from_raw(txid: TxId, connection: &'c mut Connection) -> Self {
+        Self {
+            connection,
+            txid,
+        }
+    }
+}
+
 impl Transaction<'_> {
+    pub fn dangle(&mut self) {
+        self.txid = TxId::new();
+    }
+
+    pub fn id(&self) -> TxId {
+        self.txid.clone()
+    }
+
+    pub fn into_raw(mut self) -> TxId {
+        let txid = mem::replace(&mut self.txid, TxId::new());
+        mem::forget(self);
+        txid
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn commit(mut self) -> Result<(), Error> {
         let mut message = ApbCommitTransaction::default();
@@ -311,6 +326,10 @@ impl Transaction<'_> {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
+        if self.txid.is_empty() {
+            return;
+        }
+
         assert!(self.connection.dropped.is_none());
         assert!(!self.txid.is_empty());
 

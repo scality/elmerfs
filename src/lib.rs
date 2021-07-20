@@ -4,6 +4,7 @@ mod key;
 mod model;
 mod view;
 mod time;
+mod collections;
 
 use crate::driver::Driver;
 use crate::fs::Elmerfs;
@@ -34,7 +35,11 @@ pub fn run(cfg: Config, forced_view: Option<View>, mountpoint: &OsStr) {
     let driver = task::block_on(Driver::new(cfg)).expect("driver init");
 
     let driver = Arc::new(driver);
-    let options = ["-o", "fsname=rpfs"]
+    let options = [
+        "-o", "fsname=rpfs",
+        "-o", "max_readahead=4804864",
+        "-o", "max_write=4804864",
+    ]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();

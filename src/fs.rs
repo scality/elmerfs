@@ -1,4 +1,4 @@
-use crate::driver::{Driver, BufferHandle, DriverError};
+use crate::driver::{Driver, DriverError};
 use crate::model::inode::Owner;
 use crate::view::View;
 use async_std::{sync::Arc, task};
@@ -61,7 +61,9 @@ macro_rules! session {
 
         let task = async move {
             let mut final_result = None;
-            for _ in 0..ATTEMPTS_ON_ABORTED {
+            for attempt in 0..ATTEMPTS_ON_ABORTED {
+                tracing::debug!(attempt, "attempt");
+
                 let result = $op.await;
 
                 match &result {
@@ -87,6 +89,7 @@ macro_rules! session {
 
             match final_result {
                 Some(Ok($ok)) => {
+                    tracing::debug!("finished.");
                     $resp
                 }
                 Some(Err(error)) => {
@@ -306,7 +309,7 @@ impl Filesystem for Elmerfs {
 
         session!(req, reply, driver.open(ino), fh => {
             let flags = 0;
-            reply.opened(fh.0, flags);
+            reply.opened(fh, flags);
         });
     }
 
@@ -322,7 +325,6 @@ impl Filesystem for Elmerfs {
     ) {
         let driver = self.driver.clone();
         let view = self.view(req);
-        let fh = BufferHandle(fh);
 
         session!(req, reply, driver.release(view, ino, fh), _ => {
             reply.ok();
@@ -331,7 +333,6 @@ impl Filesystem for Elmerfs {
 
     fn flush(&mut self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         let driver = self.driver.clone();
-        let fh = BufferHandle(fh);
 
         session!(req, reply, driver.flush(ino, fh), _ => {
             reply.ok();
@@ -340,7 +341,6 @@ impl Filesystem for Elmerfs {
 
     fn fsync(&mut self, req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         let driver = self.driver.clone();
-        let fh = BufferHandle(fh);
 
         session!(req, reply, driver.fsync(ino, fh), _ => {
             reply.ok();
@@ -361,7 +361,6 @@ impl Filesystem for Elmerfs {
             reply.error(Errno::EINVAL as libc::c_int);
             return;
         }
-        let fh = BufferHandle(fh);
         let offset = offset as u64;
         let driver = self.driver.clone();
         let data = Vec::from(data);
@@ -384,7 +383,6 @@ impl Filesystem for Elmerfs {
             reply.error(Errno::EINVAL as libc::c_int);
             return;
         }
-        let fh = BufferHandle(fh);
         let offset = offset as u64;
         let driver = self.driver.clone();
 

@@ -1,9 +1,10 @@
+mod buffer;
 mod dir;
 pub(crate) mod ino;
 mod lock;
+mod openfile;
 mod page;
 mod pool;
-mod write_gather;
 
 use crate::time;
 
@@ -11,12 +12,12 @@ pub use self::pool::AddressBook;
 
 use self::ino::InoGenerator;
 use self::lock::PageLocks;
-use self::page::PageWriter;
+use self::openfile::{OpenfileRef, Openfiles};
+use self::page::{PageCache, PageWriter};
 use self::pool::ConnectionPool;
-use self::write_gather::WriteGatherer;
 use self::{
+    buffer::{WriteBuffer, WriteCommand},
     dir::DirDriver,
-    write_gather::{WriteBuffer, WriteCommand},
 };
 use crate::key::Bucket;
 use crate::model::{
@@ -29,23 +30,23 @@ use antidotec::{self, reads, updates, Connection, Error, Transaction, Transactio
 use async_std::sync::{Arc, Mutex};
 use fuse::*;
 use nix::errno::Errno;
-use std::time::Duration;
 use std::fmt::Debug;
+use std::time::Duration;
 use thiserror::Error;
 
-pub use self::write_gather::BufferHandle;
 pub use self::dir::ListingFlavor;
 
 pub(crate) const ROOT_INO: u64 = 1;
 pub(crate) const MAX_CONNECTIONS: usize = 32;
 pub(crate) const PAGE_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_OPENFILES: u32 = 1024;
 
 const ENOENT: DriverError = DriverError::Sys(Errno::ENOENT);
 const EINVAL: DriverError = DriverError::Sys(Errno::EINVAL);
 const EEXIST: DriverError = DriverError::Sys(Errno::EEXIST);
 const ENOTEMPTY: DriverError = DriverError::Sys(Errno::ENOTEMPTY);
 
-pub type FileHandle = BufferHandle;
+pub type FileHandle = u64;
 
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
@@ -110,10 +111,10 @@ pub(crate) struct Driver {
     cfg: Config,
     ino_counter: Arc<InoGenerator>,
     pool: Arc<ConnectionPool>,
+    openfiles: Arc<Mutex<Openfiles>>,
     pages: PageWriter,
     page_locks: PageLocks,
     dirs: DirDriver,
-    write_gatherer: Mutex<WriteGatherer>,
 }
 
 impl Driver {
@@ -132,16 +133,15 @@ impl Driver {
         };
 
         let dirs = DirDriver::new(cfg.clone(), pool.clone());
-        let write_gatherer = Mutex::new(WriteGatherer::new());
 
         Ok(Self {
             cfg,
             ino_counter: Arc::new(ino_counter),
             pages,
             pool,
+            openfiles: Arc::new(Mutex::new(Openfiles::new(MAX_OPENFILES))),
             page_locks: PageLocks::new(PAGE_SIZE),
             dirs,
-            write_gatherer,
         })
     }
 
@@ -656,17 +656,23 @@ impl Driver {
         Ok(())
     }
 
-    async fn lookup_write_buffer(&self, fh: FileHandle) -> Arc<Mutex<WriteBuffer>> {
-        let wg = self.write_gatherer.lock().await;
-        wg.lookup(fh)
+    async fn openfile<'c>(
+        &self,
+        fh: FileHandle,
+        connection: &'c mut Connection,
+    ) -> Result<OpenfileRef<'c>> {
+        let openfiles = self.openfiles.lock().await;
+        Ok(openfiles.get(fh, connection))
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn open(&self, ino: u64) -> Result<FileHandle> {
-        let mut wg = self.write_gatherer.lock().await;
-        let handle = wg.reserve(PAGE_SIZE as usize);
+        let mut connection = self.pool.acquire().await?;
 
-        Ok(handle)
+        let mut openfiles = self.openfiles.lock().await;
+        openfiles.open(&mut connection, ino).await?;
+
+        Ok(ino)
     }
 
     pub(crate) async fn flush(&self, ino: u64, fh: FileHandle) -> Result<()> {
@@ -674,15 +680,25 @@ impl Driver {
     }
 
     pub(crate) async fn fsync(&self, ino: u64, fh: FileHandle) -> Result<()> {
-        let buffer = self.lookup_write_buffer(fh).await;
-        let mut buffer = buffer.lock().await;
+        let mut connection = self.pool.acquire().await?;
+        let mut openfile = self.openfile(fh, &mut *connection).await?;
 
+        self.fsync_openfile(ino, &mut openfile).await?;
+
+        Ok(())
+    }
+
+    async fn fsync_openfile(&self, ino: u64, openfile: &mut OpenfileRef<'_>) -> Result<()> {
+        let mut buffer = openfile.write_buffer.lock().await;
         match buffer.gathered_so_far() {
             Some((offset, bytes)) => {
-                self.write_sync(ino, bytes, offset).await?;
+                let mut pages = openfile.pages.lock().await;
+
+                self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, offset)
+                    .await?;
                 buffer.reset();
-            },
-            None => {},
+            }
+            None => {}
         }
 
         Ok(())
@@ -690,16 +706,31 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn release(&self, view: View, ino: u64, fh: FileHandle) -> Result<()> {
-        let mut wg = self.write_gatherer.lock().await;
-        let buffer = wg.release(fh);
-        let mut buffer = buffer.lock().await;
+        let mut connection = self.pool.acquire().await?;
 
-        match buffer.gathered_so_far() {
-            Some((offset, bytes)) => {
-                self.write_sync(ino, bytes, offset).await?;
-                buffer.reset();
-            },
-            None => {}
+        let mut openfiles = self.openfiles.lock().await;
+        if let Some(openfile) = openfiles.close(fh) {
+            let mut tx = Transaction::from_raw(openfile.txid, &mut connection);
+            let mut buffer = openfile.write_buffer.lock().await;
+
+            match buffer.gathered_so_far() {
+                Some((offset, bytes)) => {
+                    let mut pages = openfile.pages.lock().await;
+                    self.write_sync(&mut tx, &mut *pages, ino, bytes, offset)
+                        .await?;
+                    buffer.reset();
+                }
+                None => {}
+            }
+
+            match tx.commit().await {
+                Err(Error::Antidote(antidotec::AntidoteError::Aborted)) => {
+                    /* The inode may have been deleted. In this case, we don't want to retry
+                       the transaction. We simply exit. */
+                    return Err(DriverError::Sys(Errno::EIO));
+                },
+                result => return result.map_err(DriverError::Antidote),
+            }
         }
 
         Ok(())
@@ -713,36 +744,42 @@ impl Driver {
         bytes: &[u8],
         offset: u64,
     ) -> Result<()> {
-        let buffer = self.lookup_write_buffer(fh).await;
-        let mut buffer = buffer.lock().await;
+        let mut connection = self.pool.acquire().await?;
+        let mut openfile = self.openfile(fh, &mut *connection).await?;
+        let mut buffer = openfile.write_buffer.lock().await;
 
         match buffer.try_append(offset, bytes) {
-            WriteCommand::Gathered => {
-                return Ok(());
-            }
+            WriteCommand::Gathered => {}
             WriteCommand::Flush {
                 start_offset,
                 bytes,
             } => {
-                self.write_sync(ino, bytes, start_offset).await?;
+                let mut pages = openfile.pages.lock().await;
+                self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, start_offset)
+                    .await?;
+
                 buffer.reset();
-                return Ok(());
             }
             WriteCommand::Discontiguous => {
-                /* We got dicontiguous range, flush both. */
+                /* We got dicontiguous range, flush both.
+                TODO: This is not really smart, we could simply swap the old buffer with the new one and only
+                flush the oldest. */
+                drop(buffer);
+                self.fsync_openfile(ino, &mut openfile).await?;
 
-                if let Some((offset, bytes)) = buffer.gathered_so_far() {
-                    self.write_sync(ino, bytes, offset).await?;
-                    buffer.reset();
-                }
-
-                self.write_sync(ino, bytes, offset).await
+                let mut pages = openfile.pages.lock().await;
+                self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, offset)
+                    .await?;
             }
         }
+
+        Ok(())
     }
 
     pub(crate) async fn write_sync(
         &self,
+        tx: &mut Transaction<'_>,
+        pages: &mut PageCache,
         ino: u64,
         bytes: &[u8],
         offset: u64,
@@ -750,7 +787,7 @@ impl Driver {
         let byte_range = offset..(offset + bytes.len() as u64);
         let lock = self.page_locks.wlock(ino, byte_range).await;
 
-        let result = self.write_sync_nolock(ino, bytes, offset).await;
+        let result = self.write_sync_nolock(tx, pages, ino, bytes, offset).await;
 
         self.page_locks.unlock(lock).await;
         result
@@ -758,16 +795,15 @@ impl Driver {
 
     pub(crate) async fn write_sync_nolock(
         &self,
+        tx: &mut Transaction<'_>,
+        pages: &mut PageCache,
         ino: u64,
         bytes: &[u8],
         offset: u64,
     ) -> Result<()> {
         let ts = time::now();
 
-        let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
-
-        self.pages.write(&mut tx, ino, offset, bytes).await?;
+        self.pages.write(tx, pages, ino, offset, bytes).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
@@ -783,27 +819,43 @@ impl Driver {
             inode::touch(ts, ino)
         };
 
-        tx.update(self.cfg.bucket, std::iter::once(update)).await?;
-        tx.commit().await?;
+        tx.update(self.cfg.bucket, updates!(update)).await?;
         Ok(())
     }
 
-    pub(crate) async fn read(&self, ino: u64, fh: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>> {
-        self.fsync(ino, fh).await?;
+    pub(crate) async fn read(
+        &self,
+        ino: u64,
+        fh: FileHandle,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>> {
+        let mut connection = self.pool.acquire().await?;
+        let mut openfile = self.openfile(fh, &mut *connection).await?;
+
+        self.fsync_openfile(ino, &mut openfile).await?;
 
         let byte_range = offset..(offset + len as u64);
         let lock = self.page_locks.rlock(ino, byte_range).await;
 
-        let result = self.read_nolock(ino, offset, len).await;
+        let mut pages = openfile.pages.lock().await;
+        let result = self
+            .read_nolock(&mut openfile.tx, &mut *pages, ino, offset, len)
+            .await;
 
         self.page_locks.unlock(lock).await;
         result
     }
 
-    async fn read_nolock(&self, ino: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
+    async fn read_nolock(
+        &self,
+        tx: &mut Transaction<'_>,
+        pages: &mut PageCache,
+        ino: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>> {
         let len = len as usize;
-        let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
@@ -817,7 +869,7 @@ impl Driver {
 
         let truncated_len = read_end - offset;
         self.pages
-            .read(&mut tx, ino, offset, truncated_len, &mut bytes)
+            .read(tx, pages, ino, offset, truncated_len, &mut bytes)
             .await?;
 
         let padding = len.saturating_sub(bytes.len());
@@ -825,7 +877,6 @@ impl Driver {
         bytes.resize(bytes.len() + padding, 0);
         assert!(bytes.len() == len);
 
-        tx.commit().await?;
         Ok(bytes)
     }
 
@@ -1334,7 +1385,6 @@ impl Driver {
 }
 
 #[derive(Debug)]
-
 pub(crate) struct ReadDirEntry {
     pub(crate) ino: u64,
     pub(crate) kind: FileType,
