@@ -22,7 +22,7 @@ impl PageWriter {
         pages: &mut PageCache,
         ino: u64,
         offset: u64,
-        content: &[u8],
+        content: Bytes,
     ) -> Result<()> {
         let byte_range = offset..(offset + content.len() as u64);
 

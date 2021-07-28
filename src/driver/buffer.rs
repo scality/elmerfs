@@ -1,12 +1,15 @@
-pub enum WriteCommand<'b> {
+use antidotec::{Bytes, BytesMut};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteCommand {
     Gathered,
-    Discontiguous,
-    Flush { start_offset: u64, bytes: &'b [u8] },
+    Flush { start_offset: u64, bytes: Bytes },
+    None,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteBuffer {
-    bytes: Vec<u8>,
+    bytes: BytesMut,
     limit: u64,
     start_offset: u64,
 }
@@ -14,7 +17,7 @@ pub struct WriteBuffer {
 impl WriteBuffer {
     pub fn new(limit: u64) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: BytesMut::with_capacity(limit as usize),
             limit,
             start_offset: 0,
         }
@@ -24,8 +27,9 @@ impl WriteBuffer {
         self.bytes.is_empty()
     }
 
-    pub fn try_append(&mut self, offset: u64, payload: &[u8]) -> WriteCommand<'_> {
-        if self.is_empty() {
+    pub fn try_append(&mut self, offset: u64, payload: &[u8]) -> WriteCommand {
+        let was_empty = self.is_empty();
+        if was_empty {
             self.start_offset = offset;
         }
 
@@ -33,13 +37,10 @@ impl WriteBuffer {
         let write_end = offset + payload.len() as u64;
 
         if buffered_end == offset {
-            self.bytes.extend_from_slice(payload);
+            self.bytes.extend_from_slice(&payload);
 
-            if self.bytes.len() as u64 > self.limit {
-                return WriteCommand::Flush {
-                    bytes: &self.bytes[..],
-                    start_offset: self.start_offset,
-                };
+            if !was_empty && self.bytes.len() as u64 > self.limit {
+                return self.flush();
             } else {
                 return WriteCommand::Gathered;
             }
@@ -54,19 +55,25 @@ impl WriteBuffer {
 
         /* Otherwise, we consider the part as being discontiguous and we won't
         gather it. */
-        WriteCommand::Discontiguous
+        let previous_flush = self.flush();
+        let gathered = self.try_append(offset, payload);
+        assert_eq!(gathered, WriteCommand::Gathered);
+
+        previous_flush
     }
 
-    pub fn gathered_so_far(&self) -> Option<(u64, &[u8])> {
-        if self.is_empty() {
-            None
-        } else {
-            Some((self.start_offset, &self.bytes[..]))
+    pub fn flush(&mut self) -> WriteCommand {
+        if self.bytes.is_empty() {
+            return WriteCommand::None;
         }
-    }
 
-    pub fn reset(&mut self) {
-        self.bytes.clear();
+        let written = self.bytes.split().freeze();
+        let start_offset = self.start_offset;
         self.start_offset = 0;
+
+        WriteCommand::Flush {
+            bytes: written,
+            start_offset,
+        }
     }
 }

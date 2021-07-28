@@ -15,10 +15,7 @@ use self::lock::PageLocks;
 use self::openfile::{OpenfileRef, Openfiles};
 use self::page::{PageCache, PageWriter};
 use self::pool::ConnectionPool;
-use self::{
-    buffer::{WriteBuffer, WriteCommand},
-    dir::DirDriver,
-};
+use self::{buffer::WriteCommand, dir::DirDriver};
 use crate::key::Bucket;
 use crate::model::{
     dentries,
@@ -26,7 +23,7 @@ use crate::model::{
     symlink,
 };
 use crate::view::{Name, NameRef, View};
-use antidotec::{self, reads, updates, Connection, Error, Transaction, TransactionLocks};
+use antidotec::{self, reads, updates, Bytes, Connection, Error, Transaction, TransactionLocks};
 use async_std::sync::{Arc, Mutex};
 use fuse::*;
 use nix::errno::Errno;
@@ -690,15 +687,16 @@ impl Driver {
 
     async fn fsync_openfile(&self, ino: u64, openfile: &mut OpenfileRef<'_>) -> Result<()> {
         let mut buffer = openfile.write_buffer.lock().await;
-        match buffer.gathered_so_far() {
-            Some((offset, bytes)) => {
+        match buffer.flush() {
+            WriteCommand::Flush {
+                start_offset,
+                bytes,
+            } => {
                 let mut pages = openfile.pages.lock().await;
-
-                self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, offset)
+                self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, start_offset)
                     .await?;
-                buffer.reset();
             }
-            None => {}
+            _ => {}
         }
 
         Ok(())
@@ -713,22 +711,24 @@ impl Driver {
             let mut tx = Transaction::from_raw(openfile.txid, &mut connection);
             let mut buffer = openfile.write_buffer.lock().await;
 
-            match buffer.gathered_so_far() {
-                Some((offset, bytes)) => {
+            match buffer.flush() {
+                WriteCommand::Flush {
+                    start_offset,
+                    bytes,
+                } => {
                     let mut pages = openfile.pages.lock().await;
-                    self.write_sync(&mut tx, &mut *pages, ino, bytes, offset)
+                    self.write_sync(&mut tx, &mut *pages, ino, bytes, start_offset)
                         .await?;
-                    buffer.reset();
                 }
-                None => {}
+                _ => {}
             }
 
             match tx.commit().await {
                 Err(Error::Antidote(antidotec::AntidoteError::Aborted)) => {
                     /* The inode may have been deleted. In this case, we don't want to retry
-                       the transaction. We simply exit. */
+                    the transaction. We simply exit. */
                     return Err(DriverError::Sys(Errno::EIO));
-                },
+                }
                 result => return result.map_err(DriverError::Antidote),
             }
         }
@@ -749,7 +749,6 @@ impl Driver {
         let mut buffer = openfile.write_buffer.lock().await;
 
         match buffer.try_append(offset, bytes) {
-            WriteCommand::Gathered => {}
             WriteCommand::Flush {
                 start_offset,
                 bytes,
@@ -757,20 +756,8 @@ impl Driver {
                 let mut pages = openfile.pages.lock().await;
                 self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, start_offset)
                     .await?;
-
-                buffer.reset();
             }
-            WriteCommand::Discontiguous => {
-                /* We got dicontiguous range, flush both.
-                TODO: This is not really smart, we could simply swap the old buffer with the new one and only
-                flush the oldest. */
-                drop(buffer);
-                self.fsync_openfile(ino, &mut openfile).await?;
-
-                let mut pages = openfile.pages.lock().await;
-                self.write_sync(&mut openfile.tx, &mut *pages, ino, bytes, offset)
-                    .await?;
-            }
+            _ => {}
         }
 
         Ok(())
@@ -781,7 +768,7 @@ impl Driver {
         tx: &mut Transaction<'_>,
         pages: &mut PageCache,
         ino: u64,
-        bytes: &[u8],
+        bytes: Bytes,
         offset: u64,
     ) -> Result<()> {
         let byte_range = offset..(offset + bytes.len() as u64);
@@ -798,18 +785,19 @@ impl Driver {
         tx: &mut Transaction<'_>,
         pages: &mut PageCache,
         ino: u64,
-        bytes: &[u8],
+        bytes: Bytes,
         offset: u64,
     ) -> Result<()> {
         let ts = time::now();
 
-        self.pages.write(tx, pages, ino, offset, bytes).await?;
+        self.pages
+            .write(tx, pages, ino, offset, bytes.clone())
+            .await?;
 
         let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
         let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
         let wrote_above_size = (offset + bytes.len() as u64).saturating_sub(inode.size);
-
         let update = if wrote_above_size > 0 {
             inode.size += wrote_above_size;
 
