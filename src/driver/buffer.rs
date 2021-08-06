@@ -1,10 +1,9 @@
 use antidotec::{Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum WriteCommand {
-    Gathered,
-    Flush { start_offset: u64, bytes: Bytes },
-    None,
+pub struct WritePayload {
+    pub start_offset: u64,
+    pub bytes: Bytes,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,7 +26,7 @@ impl WriteBuffer {
         self.bytes.is_empty()
     }
 
-    pub fn try_append(&mut self, offset: u64, payload: &[u8]) -> WriteCommand {
+    pub fn try_append(&mut self, offset: u64, payload: &[u8]) -> Option<WritePayload> {
         let was_empty = self.is_empty();
         if was_empty {
             self.start_offset = offset;
@@ -40,9 +39,9 @@ impl WriteBuffer {
             self.bytes.extend_from_slice(&payload);
 
             if !was_empty && self.bytes.len() as u64 > self.limit {
-                return self.flush();
+                return Some(self.flush());
             } else {
-                return WriteCommand::Gathered;
+                return None;
             }
         }
 
@@ -50,30 +49,26 @@ impl WriteBuffer {
            overwrite */
         if offset >= self.start_offset && write_end <= buffered_end {
             self.bytes[offset as usize..write_end as usize].copy_from_slice(payload);
-            return WriteCommand::Gathered;
+            return None;
         }
 
         /* Otherwise, we consider the part as being discontiguous and we won't
         gather it. */
         let previous_flush = self.flush();
         let gathered = self.try_append(offset, payload);
-        assert_eq!(gathered, WriteCommand::Gathered);
+        assert_eq!(gathered, None);
 
-        previous_flush
+        Some(previous_flush)
     }
 
-    pub fn flush(&mut self) -> WriteCommand {
-        if self.bytes.is_empty() {
-            return WriteCommand::None;
-        }
-
+    pub fn flush(&mut self) -> WritePayload {
         let written = self.bytes.split().freeze();
         let start_offset = self.start_offset;
         self.start_offset = 0;
 
-        WriteCommand::Flush {
-            bytes: written,
+        WritePayload {
             start_offset,
+            bytes: written,
         }
     }
 }

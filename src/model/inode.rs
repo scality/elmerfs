@@ -268,29 +268,13 @@ mod ops {
             .build()
     }
 
-    pub fn update_stats(ino: u64, inode: &Inode) -> UpdateQuery {
+    pub fn update_size(ts: Duration, ino: u64, new_size: u64) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
-            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
-            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
-            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
-            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
-            .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
-            .build()
-    }
-
-    pub fn update_stats_with_size(ino: u64, inode: &Inode) -> UpdateQuery {
-        let key = key(ino);
-
-        rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), inode.atime))
-            .push(lwwreg::set_duration(key.field(Field::Ctime), inode.ctime))
-            .push(lwwreg::set_duration(key.field(Field::Mtime), inode.mtime))
-            .push(lwwreg::set_u64(key.field(Field::Owner), inode.owner.into()))
-            .push(lwwreg::set_u32(key.field(Field::Mode), inode.mode))
-            .push(lwwreg::set_u64(key.field(Field::Size), inode.size))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), ts))
+            .push(lwwreg::set_u64(key.field(Field::Size), new_size))
             .build()
     }
 
@@ -310,6 +294,14 @@ mod ops {
         }
 
         removes.build()
+    }
+
+    pub fn decode_size(ino: u64, reply: &mut ReadReply, index: usize) -> Option<u64> {
+        let mut map = reply.rrmap(index)?;
+        let key = key(ino);
+
+        let size = map.remove(&key.field(Field::Size)).unwrap().into_lwwreg();
+        Some(lwwreg::read_u64(&size))
     }
 
     pub fn decode(ino: u64, reply: &mut ReadReply, index: usize) -> Option<Inode> {

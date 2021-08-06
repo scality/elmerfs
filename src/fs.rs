@@ -61,9 +61,7 @@ macro_rules! session {
 
         let task = async move {
             let mut final_result = None;
-            for attempt in 0..ATTEMPTS_ON_ABORTED {
-                tracing::debug!(attempt, "attempt");
-
+            for _ in 0..ATTEMPTS_ON_ABORTED {
                 let result = $op.await;
 
                 match &result {
@@ -89,7 +87,6 @@ macro_rules! session {
 
             match final_result {
                 Some(Ok($ok)) => {
-                    tracing::debug!("finished.");
                     $resp
                 }
                 Some(Err(error)) => {
@@ -316,7 +313,7 @@ impl Filesystem for Elmerfs {
     fn release(
         &mut self,
         req: &Request,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         _flags: u32,
         _lock_owner: u64,
@@ -326,23 +323,23 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.release(view, ino, fh), _ => {
+        session!(req, reply, driver.release(view, fh), _ => {
             reply.ok();
         });
     }
 
-    fn flush(&mut self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&mut self, req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.flush(ino, fh), _ => {
+        session!(req, reply, driver.flush(fh), _ => {
             reply.ok();
         });
     }
 
-    fn fsync(&mut self, req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&mut self, req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.fsync(ino, fh), _ => {
+        session!(req, reply, driver.fsync(fh), _ => {
             reply.ok();
         });
     }
@@ -350,7 +347,7 @@ impl Filesystem for Elmerfs {
     fn write(
         &mut self,
         req: &Request,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -365,7 +362,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let data = Vec::from(data);
 
-        session!(req, reply, driver.write(ino, fh, &data, offset), _ => {
+        session!(req, reply, driver.write(fh, &data, offset), _ => {
             reply.written(data.len() as u32);
         });
     }
@@ -373,7 +370,7 @@ impl Filesystem for Elmerfs {
     fn read(
         &mut self,
         req: &Request,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -386,7 +383,7 @@ impl Filesystem for Elmerfs {
         let offset = offset as u64;
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.read(ino, fh, offset, size), data => {
+        session!(req, reply, driver.read(fh, offset, size), data => {
             reply.data(&data);
         });
     }

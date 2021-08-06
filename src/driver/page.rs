@@ -16,6 +16,10 @@ impl PageWriter {
         Self { bucket, page_size }
     }
 
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
     pub async fn write(
         &self,
         tx: &mut Transaction<'_>,
@@ -300,6 +304,10 @@ impl PageCache {
             current: 0,
             limit,
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.pages.clear();
     }
 
     async fn read(

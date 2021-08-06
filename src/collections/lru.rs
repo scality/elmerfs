@@ -20,6 +20,11 @@ impl<K: Eq, T> Lru<K, T> {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.head_lru = 0;
+    }
+
     pub fn insert(&mut self, key: K, value: T) -> Option<T>
         where K: std::fmt::Debug
     {
