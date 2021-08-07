@@ -1,6 +1,7 @@
 use crate::driver::{Driver, DriverError};
 use crate::model::inode::Owner;
 use crate::view::View;
+use antidotec::Bytes;
 use async_std::{sync::Arc, task};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
@@ -360,9 +361,9 @@ impl Filesystem for Elmerfs {
         }
         let offset = offset as u64;
         let driver = self.driver.clone();
-        let data = Vec::from(data);
+        let data = Bytes::copy_from_slice(data);
 
-        session!(req, reply, driver.write(fh, &data, offset), _ => {
+        session!(req, reply, driver.write(fh, data.clone(), offset), _ => {
             reply.written(data.len() as u32);
         });
     }

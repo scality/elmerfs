@@ -131,9 +131,11 @@ struct Openfile {
     writer: PageWriter,
     write_buffer: WriteBuffer,
     not_commited_bytes: u64,
+    commit_threshold: u64,
+    writes_count: u64,
+    writes_count_threshold: u64,
     size: u64,
     last_write_offset: u64,
-    commit_threshold: u64,
     commands: Receiver<Command>,
     write_error_flag: bool,
 }
@@ -158,6 +160,8 @@ impl Openfile {
             not_commited_bytes: 0,
             last_write_offset: 0,
             commit_threshold: 4*page_size,
+            writes_count: 0,
+            writes_count_threshold: 16,
             commands: cmd_receiver,
             write_buffer: WriteBuffer::new(page_size),
             write_error_flag: false,
@@ -277,7 +281,8 @@ impl Openfile {
             }
         }
 
-        if self.not_commited_bytes > self.commit_threshold {
+        if self.not_commited_bytes > self.commit_threshold
+            || self.writes_count > self.writes_count_threshold {
             tracing::debug!(ino = self.ino, "exceeded commit threshold ({} bytes).", self.not_commited_bytes);
 
             self.commit_with(connection).await?;
@@ -290,8 +295,7 @@ impl Openfile {
         let txid = self.txid(connection).await?;
         let mut tx = DangleTx(Transaction::from_raw(txid, connection));
 
-        tracing::debug!(ino = self.ino, "writing {} bytes.", payload.bytes.len());
-
+        self.writes_count += 1;
         self.writer
             .write(
                 &mut tx,
@@ -444,8 +448,6 @@ impl Openfile {
         /* If the commit fails, we won't be able to recover the data. Reset the counter
         in all cases. */
         let cahed_size = self.size;
-        tracing::error!("commiting");
-
         match self.txid.take() {
             Some(txid) => {
                 let mut tx = Transaction::from_raw(txid, &mut *connection);
@@ -486,6 +488,7 @@ impl Openfile {
         self.page_cache.clear();
         self.not_commited_bytes = 0;
         self.last_write_offset = 0;
+        self.writes_count = 0;
 
         Ok(())
 

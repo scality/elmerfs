@@ -718,11 +718,11 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self, bytes), fields(offset, len = bytes.len()))]
-    pub(crate) async fn write(&self, fh: FileHandle, bytes: &[u8], offset: u64) -> Result<()> {
+    pub(crate) async fn write(&self, fh: FileHandle, bytes: Bytes, offset: u64) -> Result<()> {
         let openfile = self.openfile(fh).await?;
         openfile
             .write(WritePayload {
-                bytes: Bytes::copy_from_slice(bytes),
+                bytes,
                 start_offset: offset,
             })
             .await

@@ -63,6 +63,8 @@ impl WriteBuffer {
 
     pub fn flush(&mut self) -> WritePayload {
         let written = self.bytes.split().freeze();
+        self.bytes.reserve(self.limit as usize);
+
         let start_offset = self.start_offset;
         self.start_offset = 0;
 

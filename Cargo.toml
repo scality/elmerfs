@@ -31,4 +31,6 @@ version = "0.2"
 tempfile = "3.1"
 
 [profile.release]
+panic = "abort"
+lto = true
 debug = 1
