@@ -2,218 +2,38 @@ use crate::collections::Lru;
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, Bytes, RawIdent, Transaction};
+use std::fmt::Write;
 use std::hash::Hash;
 use std::ops::Range;
 
+use super::PAGE_SIZE;
+use super::buffer::WriteSlice;
+
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct PageWriter {
+pub(crate) struct PageIoDriver {
     bucket: Bucket,
     page_size: u64,
 }
 
-impl PageWriter {
+impl PageIoDriver {
     pub fn new(bucket: Bucket, page_size: u64) -> Self {
-        Self { bucket, page_size }
+        Self {
+            bucket,
+            cache,
+            page_size
+        }
     }
 
     pub fn page_size(&self) -> u64 {
         self.page_size
     }
 
-    pub async fn write(
-        &self,
-        tx: &mut Transaction<'_>,
-        pages: &mut PageCache,
-        ino: u64,
-        offset: u64,
-        content: Bytes,
-    ) -> Result<()> {
-        let byte_range = offset..(offset + content.len() as u64);
+    pub fn write(&self, tx: &mut Transaction<'_>, cache: &mut PageCache, ino: u64, slices: &[WriteSlice]) -> Result<()> {
+        let pager = Pager::new(self.page_size, slices);
 
-        let extent = self.page_range(&byte_range);
-        let remaining_pages = (extent.start + 1)..extent.end;
-        let offset = byte_range.start - extent.start * self.page_size;
-        tracing::debug!(?byte_range, ?extent, ?remaining_pages, ?offset);
-
-        let head_len = (self.page_size - offset).min(content.len() as u64);
-        let (head, remaining) = content.split_at(head_len as usize);
-
-        self.write_page(tx, pages, ino, extent.start, offset, head).await?;
-
-        if !remaining.is_empty() {
-            self.write_extent(tx, pages, ino, remaining_pages.start, remaining)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self, tx, pages, content))]
-    async fn write_page(
-        &self,
-        tx: &mut Transaction<'_>,
-        pages: &mut PageCache,
-        ino: u64,
-        page: u64,
-        offset: u64,
-        content: &[u8],
-    ) -> Result<()> {
-        assert!(content.len() as u64 <= self.page_size);
-        let write_range = offset..(offset + content.len() as u64);
-        tracing::debug!(?write_range);
-
-        let page = Key::new(ino, page);
-
-
-        let page_content = pages.read(self.bucket, tx, page).await?;
-
-        let mut new_page = page_content.to_vec();
-        let previous_len = page_content.len();
-        if write_range.end > page_content.len() as u64 {
-            tracing::debug!(
-                previous_len,
-                extended = (write_range.end - previous_len as u64)
-            );
-            new_page.resize(write_range.end as usize, 0);
-        }
-
-        new_page[write_range.start as usize..write_range.end as usize].copy_from_slice(content);
-        pages.write(self.bucket, tx, page, Bytes::from(new_page)).await
-    }
-
-    async fn write_extent(
-        &self,
-        tx: &mut Transaction<'_>,
-        pages: &mut PageCache,
-        ino: u64,
-        extent_start: u64,
-        content: &[u8],
-    ) -> Result<()> {
-        let content = Bytes::copy_from_slice(content);
-        let mut page = extent_start;
-        for chunk in content.chunks_exact(self.page_size as usize) {
-            assert!(chunk.len() == self.page_size as usize);
-
-            pages.write(self.bucket, tx, Key::new(ino, page), content.slice_ref(chunk)).await?;
-            page += 1;
-        };
-
-        let remaining = content.chunks_exact(self.page_size as usize).remainder();
-
-        if !remaining.is_empty() {
-            self.write_page(tx, pages, ino, page, 0, remaining).await?;
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(tx, pages, output))]
-    pub async fn read(
-        &self,
-        tx: &mut Transaction<'_>,
-        pages: &mut PageCache,
-        ino: u64,
-        offset: u64,
-        len: u64,
-        output: &mut Vec<u8>,
-    ) -> Result<()> {
-        let byte_range = offset..(offset + len);
-        let extent = self.page_range(&byte_range);
-        let remaining_pages = (extent.start + 1)..extent.end;
-        let offset = byte_range.start - extent.start * self.page_size;
-        tracing::debug!(?byte_range, ?extent, ?remaining_pages, ?offset);
-
-        let head_len = (self.page_size - offset).min(len);
-        self.read_page(tx, pages, ino, extent.start as u64, offset, head_len, output)
-            .await?;
-        assert_eq!(output.len(), head_len as usize);
-
-        let remaining_len = len.saturating_sub(head_len);
-
-        if remaining_len > 0 {
-            self.read_extent(tx, pages, ino, remaining_pages, remaining_len, output)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(tx, pages, output))]
-    async fn read_page(
-        &self,
-        tx: &mut Transaction<'_>,
-        pages: &mut PageCache,
-        ino: u64,
-        page: u64,
-        offset_in_page: u64,
-        len: u64,
-        output: &mut Vec<u8>,
-    ) -> Result<()> {
-        tracing::debug!(?page);
-        let end = offset_in_page + len;
-        assert!(end <= self.page_size);
-
-        let page = Key::new(ino, page);
-        let page_content = pages.read(self.bucket, tx, page).await?;
-
-        if page_content.is_empty() {
-            tracing::debug!("empty");
-            output.resize(output.len() + len as usize, 0);
-            return Ok(());
-        }
-
-        let page = 0..page_content.len();
-        let read = offset_in_page..end;
-        let overlapping = intersect_range(0..page_content.len() as u64, offset_in_page..end);
-        tracing::debug!(page_len = ?page, ?read, ?overlapping);
-        output
-            .extend_from_slice(&page_content[overlapping.start as usize..overlapping.end as usize]);
-
-        let padding = read.end.saturating_sub(page.end as u64).min(len);
-        if padding > 0 {
-            output.resize(output.len() + padding as usize, 0);
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(tx, pages, output))]
-    async fn read_extent(
-        &self,
-        tx: &mut Transaction<'_>,
-        pages: &mut PageCache,
-        ino: u64,
-        extent: Range<u64>,
-        len: u64,
-        output: &mut Vec<u8>,
-    ) -> Result<()> {
-        tracing::debug!("extent");
-
-        let mut page = extent.start;
-        let mut remaining = len;
-        while remaining >= self.page_size {
-            let content = pages.read(self.bucket, tx, Key::new(ino, page)).await?;
-
-            if content.is_empty() {
-                output.resize(output.len() + self.page_size as usize, 0);
-                remaining -= self.page_size;
-            } else {
-                output.extend_from_slice(&content[..content.len()]);
-
-                let padding = self.page_size.checked_sub(content.len() as u64).unwrap();
-                output.resize(output.len() + padding as usize, 0);
-                remaining -= self.page_size;
-            }
-
-            page += 1;
-        }
-
-        if remaining > 0 {
-            let content = pages.read(self.bucket, tx, Key::new(ino, page)).await?;
-            output.extend_from_slice(&content[..remaining.min(content.len() as u64) as usize]);
-
-//            let padding = remaining.saturating_sub(content.len() as u64);
-//            output.resize(output.len() + padding as usize, 0);
+        while let Some(page_writes) = pager.next_page() {
+            debug_assert!(page_writes.len() > 0);
+            let id = page_id(page_writes[0].offset);
         }
 
         Ok(())
@@ -363,4 +183,40 @@ impl PageCache {
             }
         }
     }
+}
+
+pub struct Pager<'a> {
+    page_size: u64,
+    slices: &'a [WriteSlice],
+    current_idx: usize,
+}
+
+
+impl<'a> Pager<'a> {
+    fn new(page_size: u64, slices: &'a [WriteSlice]) -> Self {
+        Pager {
+            page_size,
+            slices,
+            current_idx: 0
+        }
+    }
+
+    fn next_page(&mut self) -> Option<&'_ [WriteSlice]> {
+        if self.slices.len() == self.current_idx {
+            return None;
+        }
+
+        let current_page_id = page_id(self.slices[self.current_idx].offset);
+        let write_range = match self.slices[(self.current_idx + 1)..].iter().position(|w| page_id(w.offset) != current_page_id) {
+            Some(position) => self.current_idx..position,
+            None => self.current_idx..self.slices.len(),
+        };
+
+        self.current_idx = write_range.end;
+        Some(&self.slices[write_range])
+    }
+}
+
+fn page_id(offset: u64) -> u64 {
+    (offset / PAGE_SIZE) * PAGE_SIZE
 }

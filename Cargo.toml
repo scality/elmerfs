@@ -23,6 +23,7 @@ clap = "2.33"
 crossbeam = "0.7"
 once_cell = "1.4"
 tracing-flame = { version = "0.1" }
+jemallocator = "0.3.0"
 
 [dependencies.tracing-futures]
 version = "0.2"

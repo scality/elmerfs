@@ -1,76 +1,125 @@
-use antidotec::{Bytes, BytesMut};
+use std::fmt::Write;
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct WritePayload {
-    pub start_offset: u64,
-    pub bytes: Bytes,
+use antidotec::{Bytes};
+use crate::driver::{PAGE_SIZE, FUSE_MAX_WRITE};
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteSlice {
+    pub offset: u64,
+    pub buffer: Bytes,
+}
+
+impl WriteSlice {
+    pub fn len(&self) -> u64 {
+        self.buffer.len() as u64
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteBuffer {
-    bytes: BytesMut,
-    limit: u64,
+    cost_threshold: u64,
+    cost: u64,
     start_offset: u64,
+    len: u64,
+    writes: Vec<WriteSlice>,
 }
 
 impl WriteBuffer {
-    pub fn new(limit: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            bytes: BytesMut::with_capacity(limit as usize),
-            limit,
+            writes: Vec::with_capacity((PAGE_SIZE / FUSE_MAX_WRITE) as usize),
+            cost: 0,
+            cost_threshold: PAGE_SIZE,
+            len: 0,
             start_offset: 0,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
+    pub fn push(&mut self, write: WriteSlice) -> Option<Flush<'_>> {
+        let write_end = write.offset + write.len();
 
-    pub fn try_append(&mut self, offset: u64, payload: &[u8]) -> Option<WritePayload> {
-        let was_empty = self.is_empty();
-        if was_empty {
-            self.start_offset = offset;
+        if write.offset >= self.start_offset + self.len {
+            self.writes.push(write);
+        } else if write_end <= self.start_offset {
+            self.writes.insert(0, write);
+        } else {
+            self.push_overlapping(write);
         }
 
-        let buffered_end = self.start_offset + self.bytes.len() as u64;
-        let write_end = offset + payload.len() as u64;
+        self.cost += write.len();
+        self.start_offset = self.start_offset.min(write.offset);
+        self.len = self.len.max(write_end);
 
-        if buffered_end == offset {
-            self.bytes.extend_from_slice(&payload);
+        if self.cost > self.cost_threshold {
+            Some(self.flush())
+        } else {
+            None
+        }
+    }
 
-            if !was_empty && self.bytes.len() as u64 > self.limit {
-                return Some(self.flush());
-            } else {
-                return None;
+    fn push_overlapping(&mut self, write: WriteSlice) {
+        let write_end = write.offset + write.len();
+
+        /* Remove all buffered write that the new buffer covers */
+        self.writes.retain(|other| other.offset < write.offset || (other.offset + other.len()) > write_end);
+
+        /* Insert the buffer at the correct position. Then adjust adjacent buffers
+           to account for overlaps. */
+        let insert_idx = match self.writes.binary_search_by(|other| other.offset.cmp(&write.offset)) {
+            Ok(index) => index,
+            Err(index) => index
+        };
+
+        let (write_offset, write_len) = (write.offset, write.len());
+        self.writes.insert(insert_idx, write);
+
+        /* Adjust the buffer that was before us (if any) */
+        if insert_idx > 0 {
+            let before = &mut self.writes[insert_idx - 1];
+            let before_end = before.offset + before.len();
+
+            if before_end > write_offset {
+                let new_len = (before.len() - (before_end - write_offset)) as usize;
+                before.buffer.truncate(new_len);
             }
         }
 
-        /* If we are requested to write an already gathered part, simply
-           overwrite */
-        if offset >= self.start_offset && write_end <= buffered_end {
-            self.bytes[offset as usize..write_end as usize].copy_from_slice(payload);
-            return None;
+        /* Remove all buffered write that we overwrote. */
+        if let Some(overlapping) = self.writes.get_mut(insert_idx + 1) {
+            assert!(overlapping.offset < write_end);
+            let split_off = (write_end - overlapping.offset) as usize;
+            overlapping.buffer = overlapping.buffer.split_off(split_off as usize);
         }
-
-        /* Otherwise, we consider the part as being discontiguous and we won't
-        gather it. */
-        let previous_flush = self.flush();
-        let gathered = self.try_append(offset, payload);
-        assert_eq!(gathered, None);
-
-        Some(previous_flush)
     }
 
-    pub fn flush(&mut self) -> WritePayload {
-        let written = self.bytes.split().freeze();
-        self.bytes.reserve(self.limit as usize);
-
-        let start_offset = self.start_offset;
-        self.start_offset = 0;
-
-        WritePayload {
-            start_offset,
-            bytes: written,
+    pub fn flush(&mut self) -> Flush<'_> {
+        Flush {
+            inner: self,
+            current_idx: 0,
         }
+    }
+
+    fn clear(&mut self) {
+        self.writes.clear();
+        self.cost = 0;
+        self.len = 0;
+        self.start_offset = 0;
+    }
+}
+
+pub struct SparsePage<'a> {
+    writes: &'a [WriteSlice]
+}
+
+pub struct Flush<'a> {
+    inner: &'a mut WriteBuffer,
+}
+
+impl std::ops::Deref for Flush<'_> {
+    type Target = [WriteSlice];
+
+    fn deref(&self) -> Self::Target {
+        &self.inner.writes
     }
 }
