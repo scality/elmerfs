@@ -3,11 +3,11 @@ struct LruEntry<K, T> {
     key: K,
     value: T,
     next_lru: u32,
-    previous_lru: u32
+    previous_lru: u32,
 }
 
 #[derive(Debug, Clone)]
-pub struct Lru<K: Eq,  T> {
+pub struct Lru<K: Eq, T> {
     entries: Vec<LruEntry<K, T>>,
     head_lru: u32,
 }
@@ -26,23 +26,22 @@ impl<K: Eq, T> Lru<K, T> {
     }
 
     pub fn insert(&mut self, key: K, value: T) -> Option<T>
-        where K: std::fmt::Debug
+    where
+        K: std::fmt::Debug,
     {
         tracing::debug!(?key, "insert");
         match self.lookup(&key) {
-            Some(old_value) => {
-                Some(std::mem::replace(old_value, value))
-            },
+            Some(old_value) => Some(std::mem::replace(old_value, value)),
             None => {
                 tracing::debug!(?key, "pushed");
                 self.push_entry(key, value);
                 None
-            },
+            }
         }
     }
 
     fn push_entry(&mut self, key: K, value: T) -> u32 {
-        let tail_lru = if self.entries.len() > 0  {
+        let tail_lru = if self.entries.len() > 0 {
             self.entries[self.head_lru as usize].previous_lru
         } else {
             0
@@ -52,7 +51,7 @@ impl<K: Eq, T> Lru<K, T> {
             key,
             value,
             next_lru: self.head_lru,
-            previous_lru: tail_lru
+            previous_lru: tail_lru,
         });
 
         let inserted_idx = self.entries.len() - 1;
@@ -60,17 +59,23 @@ impl<K: Eq, T> Lru<K, T> {
         self.entries[tail_lru as usize].next_lru = inserted_idx as u32;
         self.head_lru = inserted_idx as u32;
 
-
         inserted_idx as u32
     }
 
     pub fn lookup(&mut self, key: &K) -> Option<&mut T>
-        where K: std::fmt::Debug
+    where
+        K: std::fmt::Debug,
     {
-        let entries: Vec<_> = self.entries.iter().map(|e| (&e.key, e.previous_lru, e.next_lru)).collect();
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| (&e.key, e.previous_lru, e.next_lru))
+            .collect();
         tracing::debug!(?key, ?entries, head = self.head_lru, "lookup");
         match self.lookup_idx(key) {
-            Some(entry_idx) if entry_idx == self.head_lru => Some(&mut self.entries[entry_idx as usize].value),
+            Some(entry_idx) if entry_idx == self.head_lru => {
+                Some(&mut self.entries[entry_idx as usize].value)
+            }
             Some(entry_idx) => {
                 let (entry_previous_lru, entry_next_lru) = {
                     let entry = &self.entries[entry_idx as usize];
@@ -91,63 +96,68 @@ impl<K: Eq, T> Lru<K, T> {
                 self.head_lru = entry_idx as u32;
 
                 Some(&mut self.entries[entry_idx as usize].value)
-            },
+            }
             None => None,
         }
     }
 
     fn lookup_idx(&self, key: &K) -> Option<u32> {
         if self.entries.len() > 0 && &self.entries[self.head_lru as usize].key == key {
-            return Some(self.head_lru)
+            return Some(self.head_lru);
         }
 
-        self.entries.iter().position(|p| &p.key == key).map(|i| i as u32)
+        self.entries
+            .iter()
+            .position(|p| &p.key == key)
+            .map(|i| i as u32)
     }
 
-    pub fn evict(&mut self) -> Option<(K, T)>
-        where K: std::fmt::Debug
-    {
+    pub fn evict(&mut self) -> Option<(K, T)> {
         match self.entries.len() {
             0 => None,
             1 => {
                 self.head_lru = 0;
-                self.entries.pop().map(|p| {
-                    tracing::debug!(key = ?p.key, "evicted");
-                    (p.key, p.value)
-                })
+                self.entries.pop().map(|p| (p.key, p.value))
             }
             _ => {
                 let evicted_idx = self.entries[self.head_lru as usize].previous_lru;
-                let last_idx = self.entries.len() - 1;
-
-                let (evicted_previous_lru, evicted_next_lru) = {
-                    let evicted = &self.entries[evicted_idx as usize];
-                    (evicted.previous_lru, evicted.next_lru)
-                };
-                self.entries[evicted_previous_lru as usize].next_lru = evicted_next_lru;
-                self.entries[evicted_next_lru as usize].previous_lru = evicted_previous_lru;
-
-                /* The removal moved the last element, we need to update references to him. */
-                if self.head_lru == last_idx as u32 {
-                    self.head_lru = evicted_idx;
-                }
-
-                if last_idx as u32 != evicted_idx  {
-                    let (swapped_previous_lru, swapped_next_lru) = {
-                        let last = &self.entries[last_idx];
-                        (last.previous_lru, last.next_lru)
-                    };
-
-                    self.entries[swapped_previous_lru as usize].next_lru = evicted_idx;
-                    self.entries[swapped_next_lru as usize].previous_lru = evicted_idx;
-                }
-
-                let evicted = self.entries.swap_remove(evicted_idx as usize);
-                let entries: Vec<_> = self.entries.iter().map(|e| (&e.key, e.previous_lru, e.next_lru)).collect();
-                tracing::debug!(key = ?evicted.key, ?entries, head = self.head_lru, "evicted");
-                Some((evicted.key, evicted.value))
+                self.remove_idx(evicted_idx)
             }
         }
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<(K, T)> {
+        let idx = self.lookup_idx(key)?;
+        self.remove_idx(idx)
+    }
+
+    fn remove_idx(&mut self, idx: u32) -> Option<(K, T)> {
+        let last_idx = self.entries.len() - 1;
+
+        let (removed_previous_lru, removed_next_lru) = {
+            let removed = &self.entries[idx as usize];
+            (removed.previous_lru, removed.next_lru)
+        };
+        self.entries[removed_previous_lru as usize].next_lru = removed_next_lru;
+        self.entries[removed_next_lru as usize].previous_lru = removed_previous_lru;
+
+        /* The removal moved the last element, we need to update references to him. */
+        if self.head_lru == last_idx as u32 {
+            self.head_lru = idx;
+        }
+
+        if last_idx as u32 != idx {
+            let (swapped_previous_lru, swapped_next_lru) = {
+                let last = &self.entries[last_idx];
+                (last.previous_lru, last.next_lru)
+            };
+
+            self.entries[swapped_previous_lru as usize].next_lru = idx;
+            self.entries[swapped_next_lru as usize].previous_lru = idx;
+        }
+
+        let removed = self.entries.swap_remove(idx as usize);
+        Some((removed.key, removed.value))
     }
 }
 

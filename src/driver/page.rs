@@ -1,26 +1,27 @@
 use crate::collections::Lru;
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
-use antidotec::{lwwreg, Bytes, RawIdent, Transaction};
-use std::fmt::Write;
+use antidotec::{lwwreg, Bytes, BytesMut, RawIdent, Transaction};
+use tracing::Instrument;
 use std::hash::Hash;
 use std::ops::Range;
 
-use super::PAGE_SIZE;
 use super::buffer::WriteSlice;
+use super::PAGE_SIZE;
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct PageIoDriver {
+pub(crate) struct PageDriver {
+    ino: u64,
     bucket: Bucket,
     page_size: u64,
 }
 
-impl PageIoDriver {
-    pub fn new(bucket: Bucket, page_size: u64) -> Self {
+impl PageDriver {
+    pub fn new(ino: u64, bucket: Bucket, page_size: u64) -> Self {
         Self {
+            ino,
             bucket,
-            cache,
-            page_size
+            page_size,
         }
     }
 
@@ -28,52 +29,98 @@ impl PageIoDriver {
         self.page_size
     }
 
-    pub fn write(&self, tx: &mut Transaction<'_>, cache: &mut PageCache, ino: u64, slices: &[WriteSlice]) -> Result<()> {
-        let pager = Pager::new(self.page_size, slices);
+    pub async fn write(
+        &self,
+        tx: &mut Transaction<'_>,
+        cache: &mut PageCache,
+        slices: &[WriteSlice],
+    ) -> Result<()> {
+        let mut pager = Pager::new(self.page_size, slices);
 
         while let Some(page_writes) = pager.next_page() {
             debug_assert!(page_writes.len() > 0);
             let id = page_id(page_writes[0].offset);
+            let page_key = Key::new(self.ino, id);
+
+            let mut page = cache.read(self.bucket, tx, page_key).await?.to_vec();
+
+            let write_end = page_writes.last().map(|p| p.offset + p.len()).unwrap();
+            let new_len = write_end % self.page_size;
+            page.resize(new_len as usize, 0);
+
+            for page_write in page_writes {
+                let offset_in_page = page_write.offset % self.page_size;
+                page[offset_in_page as usize..page_write.len() as usize]
+                    .copy_from_slice(&page_write.buffer[..]);
+            }
+
+            cache
+                .write(self.bucket, tx, page_key, Bytes::from(page))
+                .await?;
         }
 
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, tx, ino))]
-    pub async fn remove(
+    pub async fn read(
         &self,
         tx: &mut Transaction<'_>,
-        ino: u64,
-        byte_range: Range<u64>,
+        cache: &mut PageCache,
+        offset: u64,
+        len: u64,
+        output: &mut BytesMut,
     ) -> Result<()> {
-        let pages = self.page_range(&byte_range);
-        let remaining_pages = (pages.start + 1)..(pages.end);
-        let offset = byte_range.start - pages.start * self.page_size;
-        tracing::debug!(?byte_range, ?pages, ?remaining_pages, offset);
+        let end = offset + len;
+        let mut current_offset = offset;
+        while current_offset < end {
+            let id = page_id(current_offset);
+            let page_key = Key::new(self.ino, id);
 
-        let content_tail = {
-            let page_key = Key::new(ino, pages.start);
-            let mut reply = tx.read(self.bucket, vec![lwwreg::get(page_key)]).await?;
-            let mut content = reply.lwwreg(0).unwrap_or_default();
+            let offset_in_page = current_offset % self.page_size;
+            let chunk = (end - current_offset).min(self.page_size - offset_in_page);
+            let end_in_page = offset_in_page + chunk;
 
-            content.truncate(offset as usize);
-            lwwreg::set(page_key, content)
-        };
+            let page = cache.read(self.bucket, tx, page_key).await?;
 
-        let removes = remaining_pages.map(|p| lwwreg::set(Key::new(ino, p), Bytes::new()));
+            if offset_in_page >= page.len() as u64 {
+                output.resize(output.len() + chunk as usize, 0);
+            } else {
+                let end = end_in_page.min(page.len() as u64) as usize;
+                output.extend_from_slice(&page[offset_in_page as usize..end]);
 
-        let updates = std::iter::once(content_tail).chain(removes);
-        tx.update(self.bucket, updates).await?;
+                let padding = end_in_page.saturating_sub(page.len() as u64);
+                output.resize(output.len() + padding as usize, 0);
+            }
+
+            current_offset += chunk;
+        }
 
         Ok(())
     }
 
-    fn page_range(&self, byte_range: &Range<u64>) -> Range<u64> {
-        let first = byte_range.start / self.page_size;
-        let last = byte_range.end / self.page_size;
-        tracing::debug!(first, last);
+    pub async fn truncate(
+        &self,
+        tx: &mut Transaction<'_>,
+        cache: &mut PageCache,
+        offset: u64,
+        new_size: u64,
+        old_size: u64,
+    ) -> Result<()> {
+        let tail_page_id = page_id(offset);
+        let tail_page_key = Key::new(self.ino, tail_page_id);
+        let mut tail_page = cache.read(self.bucket, tx, tail_page_key).await?;
 
-        first..(last + 1)
+        tail_page.truncate((new_size % self.page_size) as usize);
+        cache
+            .write(self.bucket, tx, tail_page_key, tail_page)
+            .await?;
+
+        let remove_start = tail_page_id + 1;
+        let remove_end = page_id(new_size) + 1;
+        let removed_keys = (remove_start..remove_end).map(|id| Key::new(self.ino, id));
+        cache.remove_all(self.bucket, tx, removed_keys).await?;
+
+        Ok(())
     }
 }
 
@@ -126,16 +173,16 @@ impl PageCache {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.pages.clear();
+    pub fn cached_bytes(&self) -> u64 {
+        self.current
     }
 
-    async fn read(
-        &mut self,
-        bucket: Bucket,
-        tx: &mut Transaction<'_>,
-        key: Key,
-    ) -> Result<Bytes> {
+    pub fn clear(&mut self) {
+        self.pages.clear();
+        self.current = 0;
+    }
+
+    async fn read(&mut self, bucket: Bucket, tx: &mut Transaction<'_>, key: Key) -> Result<Bytes> {
         let (hit, bytes) = match self.pages.lookup(&key.page) {
             Some(bytes) => (true, bytes.clone()),
             None => {
@@ -168,6 +215,29 @@ impl PageCache {
         Ok(())
     }
 
+    async fn remove_all<P>(
+        &mut self,
+        bucket: Bucket,
+        tx: &mut Transaction<'_>,
+        pages: P,
+    ) -> Result<()>
+    where
+        P: IntoIterator<Item = Key>,
+    {
+        let removes = pages.into_iter().collect::<Vec<_>>();
+        for removal in &removes {
+            self.pages.remove(&removal.page);
+        }
+
+        tx.update(
+            bucket,
+            removes.into_iter().map(|p| lwwreg::set(p, Bytes::new())),
+        )
+        .await?;
+
+        Ok(())
+    }
+
     fn cache(&mut self, key: Key, bytes: Bytes) {
         self.current += bytes.len() as u64;
         self.pages.insert(key.page, bytes);
@@ -191,23 +261,25 @@ pub struct Pager<'a> {
     current_idx: usize,
 }
 
-
 impl<'a> Pager<'a> {
     fn new(page_size: u64, slices: &'a [WriteSlice]) -> Self {
         Pager {
             page_size,
             slices,
-            current_idx: 0
+            current_idx: 0,
         }
     }
 
-    fn next_page(&mut self) -> Option<&'_ [WriteSlice]> {
+    fn next_page(&mut self) -> Option<&[WriteSlice]> {
         if self.slices.len() == self.current_idx {
             return None;
         }
 
         let current_page_id = page_id(self.slices[self.current_idx].offset);
-        let write_range = match self.slices[(self.current_idx + 1)..].iter().position(|w| page_id(w.offset) != current_page_id) {
+        let write_range = match self.slices[(self.current_idx + 1)..]
+            .iter()
+            .position(|w| page_id(w.offset) != current_page_id)
+        {
             Some(position) => self.current_idx..position,
             None => self.current_idx..self.slices.len(),
         };
@@ -218,5 +290,5 @@ impl<'a> Pager<'a> {
 }
 
 fn page_id(offset: u64) -> u64 {
-    (offset / PAGE_SIZE) * PAGE_SIZE
+    offset / PAGE_SIZE
 }

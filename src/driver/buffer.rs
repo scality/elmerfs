@@ -1,8 +1,6 @@
-use std::fmt::Write;
-
-use antidotec::{Bytes};
-use crate::driver::{PAGE_SIZE, FUSE_MAX_WRITE};
-
+use crate::driver::FUSE_MAX_WRITE;
+use antidotec::Bytes;
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteSlice {
@@ -26,11 +24,11 @@ pub struct WriteBuffer {
 }
 
 impl WriteBuffer {
-    pub fn new() -> Self {
+    pub fn new(bytes_threshold: u64) -> Self {
         Self {
-            writes: Vec::with_capacity((PAGE_SIZE / FUSE_MAX_WRITE) as usize),
+            writes: Vec::with_capacity((bytes_threshold / FUSE_MAX_WRITE).min(1) as usize),
             cost: 0,
-            cost_threshold: PAGE_SIZE,
+            cost_threshold: bytes_threshold,
             len: 0,
             start_offset: 0,
         }
@@ -62,13 +60,18 @@ impl WriteBuffer {
         let write_end = write.offset + write.len();
 
         /* Remove all buffered write that the new buffer covers */
-        self.writes.retain(|other| other.offset < write.offset || (other.offset + other.len()) > write_end);
+        self.writes.retain(|other| {
+            other.offset < write.offset || (other.offset + other.len()) > write_end
+        });
 
         /* Insert the buffer at the correct position. Then adjust adjacent buffers
-           to account for overlaps. */
-        let insert_idx = match self.writes.binary_search_by(|other| other.offset.cmp(&write.offset)) {
+        to account for overlaps. */
+        let insert_idx = match self
+            .writes
+            .binary_search_by(|other| other.offset.cmp(&write.offset))
+        {
             Ok(index) => index,
-            Err(index) => index
+            Err(index) => index,
         };
 
         let (write_offset, write_len) = (write.offset, write.len());
@@ -94,10 +97,7 @@ impl WriteBuffer {
     }
 
     pub fn flush(&mut self) -> Flush<'_> {
-        Flush {
-            inner: self,
-            current_idx: 0,
-        }
+        Flush { inner: self }
     }
 
     fn clear(&mut self) {
@@ -108,18 +108,30 @@ impl WriteBuffer {
     }
 }
 
-pub struct SparsePage<'a> {
-    writes: &'a [WriteSlice]
-}
-
 pub struct Flush<'a> {
     inner: &'a mut WriteBuffer,
+}
+
+impl Flush<'_> {
+    pub fn extent(&self) -> Option<Range<u64>> {
+        if self.inner.len > 0 {
+            Some(self.inner.start_offset..(self.inner.start_offset + self.inner.len))
+        } else {
+            None
+        }
+    }
 }
 
 impl std::ops::Deref for Flush<'_> {
     type Target = [WriteSlice];
 
-    fn deref(&self) -> Self::Target {
+    fn deref(&self) -> &Self::Target {
         &self.inner.writes
+    }
+}
+
+impl Drop for Flush<'_> {
+    fn drop(&mut self) {
+        self.inner.clear();
     }
 }
