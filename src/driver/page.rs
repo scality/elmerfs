@@ -2,7 +2,6 @@ use crate::collections::Lru;
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, Bytes, BytesMut, RawIdent, Transaction};
-use tracing::Instrument;
 use std::hash::Hash;
 use std::ops::Range;
 
@@ -102,11 +101,10 @@ impl PageDriver {
         &self,
         tx: &mut Transaction<'_>,
         cache: &mut PageCache,
-        offset: u64,
         new_size: u64,
         old_size: u64,
     ) -> Result<()> {
-        let tail_page_id = page_id(offset);
+        let tail_page_id = page_id(new_size);
         let tail_page_key = Key::new(self.ino, tail_page_id);
         let mut tail_page = cache.read(self.bucket, tx, tail_page_key).await?;
 

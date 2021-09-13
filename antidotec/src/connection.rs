@@ -251,6 +251,18 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    pub async fn abort(mut self) -> Result<(), Error> {
+        assert!(self.connection.dropped.is_none());
+        self.connection.dropped = Some(self.id());
+        self.connection.abort_pending_transaction().await?;
+
+        self.txid = TxId::new();
+        mem::forget(self);
+
+        Ok(())
+    }
+
+
     #[tracing::instrument(skip(self, bucket, queries))]
     pub async fn read(
         &mut self,
@@ -322,6 +334,7 @@ impl Transaction<'_> {
 
         Ok(())
     }
+
 }
 
 impl Drop for Transaction<'_> {

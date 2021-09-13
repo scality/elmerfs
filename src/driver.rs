@@ -6,9 +6,10 @@ mod page;
 mod pool;
 
 use crate::driver::ino::InodeKind;
+use crate::driver::openfile::WriteAttrsDesc;
 use crate::time;
 
-use self::buffer::WritePayload;
+use self::buffer::WriteSlice;
 pub use self::pool::AddressBook;
 
 use self::dir::DirDriver;
@@ -142,7 +143,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(connection))]
-    pub(crate) async fn load_ino_counter(
+    async fn load_ino_counter(
         cfg: &Config,
         connection: &mut Connection,
     ) -> Result<InoGenerator> {
@@ -151,7 +152,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(connection))]
-    pub(crate) async fn make_root(
+    async fn make_root(
         cfg: &Config,
         openfiles: &mut Openfiles,
         connection: &mut Connection,
@@ -227,11 +228,17 @@ impl Driver {
             };
         }
 
-        /* Note that here we don't lock any pages when truncating. It is expected
-        as while concurrent read/write or write/write to the same register
-        might lead to invalid output even if they concerns different ranges,
-        here we are discarding without being dependant on a previously read
-        value. */
+        if ino::kind(ino) == InodeKind::Regular {
+            let mut openfiles = self.openfiles.lock().await;
+            let openfile = openfiles.open(ino).await?;
+
+            let result = openfile.write_attrs(Box::new(WriteAttrsDesc {
+                mode, uid, gid, size, atime, mtime
+            })).await;
+
+            openfiles.close(ino).await?;
+            return result;
+        }
 
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
@@ -248,7 +255,8 @@ impl Driver {
 
             if let Some(new_size) = size {
                 let mut openfiles = self.openfiles.lock().await;
-                Self::truncate(&mut openfiles, &mut tx, ino, new_size).await?;
+                let old_size = inode.size;
+                Self::truncate(&mut openfiles, &mut tx, ino, old_size, new_size).await?;
             }
 
             inode
@@ -256,28 +264,6 @@ impl Driver {
 
         tx.commit().await?;
         Ok(inode.attr(ino))
-    }
-
-    async fn truncate(
-        openfiles: &mut Openfiles,
-        tx: &mut Transaction<'_>,
-        ino: u64,
-        new_size: u64,
-    ) -> Result<()> {
-        if ino::kind(ino) != InodeKind::Regular {
-            return Err(EINVAL);
-        }
-
-        match openfiles.find(ino) {
-            Some(openfile) => openfile.truncate(tx, new_size).await,
-            None => {
-                let openfile = openfiles.open(ino).await?;
-                let result = openfile.truncate(tx, new_size).await;
-                openfiles.close(openfile.fh()).await?;
-
-                result
-            }
-        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -320,25 +306,20 @@ impl Driver {
         tx: &mut Transaction<'_>,
         ino: u64,
     ) -> Result<FileAttr> {
-        if ino::kind(ino) == InodeKind::Directory {
-            let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
+        if ino::kind(ino) == InodeKind::Regular {
+            let openfile = openfiles.open(ino).await?;
 
-            let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-            return Ok(inode.attr(ino));
+            let result = openfile.read_attrs().await;
+
+            openfiles.close(ino).await?;
+            return result;
         }
 
-        match openfiles.find(ino) {
-            Some(handle) => {
-                let inode = handle.read_attr().await?;
-                Ok(inode.attr(ino))
-            }
-            None => {
-                let handle = openfiles.open(ino).await?;
-                let result = handle.read_attr().await;
-                openfiles.close(handle.fh()).await?;
-                Ok(result?.attr(ino))
-            }
-        }
+
+        let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
+
+        let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+        return Ok(inode.attr(ino));
     }
 
     #[tracing::instrument(skip(self))]
@@ -675,15 +656,18 @@ impl Driver {
         )
         .await?;
 
+        /* The write attrs should only touch the file size and its data. We will only commit the unlink if the truncate is successful. */
         if inode.links.nlink() - 1 == 0 {
             let mut openfiles = self.openfiles.lock().await;
-            Self::truncate(&mut openfiles, &mut tx, entry.ino, 0).await?;
+            let openfile = openfiles.open(ino).await?;
 
-            tx.update(
-                self.cfg.bucket,
-                updates!(inode::remove(entry.ino), symlink::remove(entry.ino)),
-            )
-            .await?;
+            let result = openfile.write_attrs(Box::new(WriteAttrDesc {
+                size: Some(0)
+            })).await;
+
+
+            openfiles.close().await?;
+            result?;
         }
 
         tx.commit().await?;
@@ -709,7 +693,7 @@ impl Driver {
 
     pub(crate) async fn fsync(&self, fh: FileHandle) -> Result<()> {
         let openfile = self.openfile(fh).await?;
-        openfile.flush().await
+        openfile.sync().await
     }
 
     #[tracing::instrument(skip(self))]
@@ -718,13 +702,13 @@ impl Driver {
         openfiles.close(fh).await
     }
 
-    #[tracing::instrument(skip(self, bytes), fields(offset, len = bytes.len()))]
-    pub(crate) async fn write(&self, fh: FileHandle, bytes: Bytes, offset: u64) -> Result<()> {
+    #[tracing::instrument(skip(self, buffer), fields(offset, len = buffer.len()))]
+    pub(crate) async fn write(&self, fh: FileHandle, buffer: Bytes, offset: u64) -> Result<()> {
         let openfile = self.openfile(fh).await?;
         openfile
-            .write(WritePayload {
-                bytes,
-                start_offset: offset,
+            .write(WriteSlice {
+                buffer,
+                offset,
             })
             .await
     }

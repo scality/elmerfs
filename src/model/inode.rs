@@ -221,6 +221,43 @@ mod ops {
             .build()
     }
 
+    #[derive(Debug, Default)]
+    pub struct UpdateAttrsDesc {
+        mode: Option<u32>,
+        owner: Option<Owner>,
+        size: Option<u64>,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+    }
+
+    pub fn update_attrs(ino: u64, desc: UpdateAttrsDesc) -> UpdateQuery {
+        let key = key(ino);
+
+        let mut update = rrmap::update(key);
+
+        if let Some(new_mode) = desc.mode {
+            update = update.push(lwwreg::set_u32(key.field(Field::Mode), new_mode));
+        }
+
+        if let Some(new_owner) = desc.owner {
+            update = update.push(lwwreg::set_u64(key.field(Field::Owner), new_owner.into()))
+        }
+
+        if let Some(new_size) = desc.size {
+            update = update.push(lwwreg::set_u64(key.field(Field::Size), new_size));
+        }
+
+        if let Some(new_atime) = desc.atime {
+            update = update.push(lwwreg::set_duration(key.field(Field::Atime), new_atime));
+        }
+
+        if let Some(new_mtime) = desc.mtime {
+            update = update.push(lwwreg::set_duration(key.field(Field::Mtime), new_mtime));
+        }
+
+        update.build()
+    }
+
     pub fn add_link(ts: Duration, ino: u64, link: Link) -> UpdateQuery {
         let key = key(ino);
 
