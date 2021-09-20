@@ -243,9 +243,10 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
 
-        let inode = {
+        let (inode, updates) = {
             let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
             let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
+
 
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
@@ -253,16 +254,19 @@ impl Driver {
             update!(inode.atime, atime);
             update!(inode.mtime, mtime);
 
-            if let Some(new_size) = size {
-                let mut openfiles = self.openfiles.lock().await;
-                let old_size = inode.size;
-                Self::truncate(&mut openfiles, &mut tx, ino, old_size, new_size).await?;
-            }
-
-            inode
+            let updates = inode::UpdateAttrsDesc {
+                mode,
+                size: None,
+                atime,
+                mtime,
+                owner: Some(inode.owner)
+            };
+            (inode, inode::update_attrs(ino, updates))
         };
 
+        tx.update(self.cfg.bucket, updates!(updates)).await?;
         tx.commit().await?;
+
         Ok(inode.attr(ino))
     }
 
@@ -609,8 +613,7 @@ impl Driver {
         })
     }
 
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn unlink(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
+    async fn unlink(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -656,21 +659,20 @@ impl Driver {
         )
         .await?;
 
-        /* The write attrs should only touch the file size and its data. We will only commit the unlink if the truncate is successful. */
+        tx.commit().await?;
+
+        /* Unfortunately, this is not atomic, the truncate is not part of the same transaction. On the other hand
+           we have currently no means of preventing concurrent modification on the inode. So let's clear it on a best effort
+           basis as a simpler implementation. */
         if inode.links.nlink() - 1 == 0 {
             let mut openfiles = self.openfiles.lock().await;
-            let openfile = openfiles.open(ino).await?;
+            let openfile = openfiles.open(entry.ino).await?;
 
-            let result = openfile.write_attrs(Box::new(WriteAttrDesc {
-                size: Some(0)
-            })).await;
+            openfile.clear_on_exit();
 
-
-            openfiles.close().await?;
-            result?;
+            openfiles.close(openfile.fh()).await?;
         }
 
-        tx.commit().await?;
         Ok(())
     }
 

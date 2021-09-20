@@ -94,7 +94,7 @@ impl Openfiles {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct WriteAttrsDesc {
     mode: Option<u32>,
     uid: Option<u32>,
@@ -124,6 +124,7 @@ enum Command {
     Sync {
         response_sender: Sender<Result<(), DriverError>>,
     },
+    ClearOnExit,
     Exit {
         response_sender: Sender<Result<(), DriverError>>,
     },
@@ -148,6 +149,7 @@ struct Openfile {
     commands: Receiver<Command>,
     write_error: Option<DriverError>,
     mode: Mode,
+    clear_on_exit: bool,
 }
 
 impl Openfile {
@@ -172,6 +174,7 @@ impl Openfile {
             commands: cmd_receiver,
             mode: Mode::Idle,
             write_error: None,
+            clear_on_exit: false,
         };
 
         let _ = task::spawn(Self::run(openfile));
@@ -225,6 +228,9 @@ impl Openfile {
                 } => {
                     let result = self.handle_write_attrs(desc).await;
                     response_sender.send(result);
+                }
+                Command::ClearOnExit => {
+                    self.clear_on_exit = true;
                 }
                 Command::Exit { response_sender } => {
                     let result = self.handle_exit().await;
@@ -383,13 +389,18 @@ impl Openfile {
     }
 
     async fn handle_exit(&mut self) -> Result<(), DriverError> {
-        match self.handle_sync().await {
-            Ok(()) => self.commit().await,
-            error @ Err(_) => {
-                let _ = self.abort().await;
-                error
-            }
+        self.handle_sync().await?;
+        if self.clear_on_exit {
+            self.handle_write_attrs(Box::new(WriteAttrsDesc {
+                size: Some(0),
+                ..WriteAttrsDesc::default()
+            }))
+            .await?;
+
+            self.commit().await?;
         }
+
+        Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), DriverError> {
@@ -554,6 +565,10 @@ impl OpenfileHandle {
         let (response_sender, response_receiver) = channel::bounded(1);
         self.send(Command::Sync { response_sender }).await;
         self.recv(response_receiver).await
+    }
+
+    pub(crate) async fn clear_on_exit(&self) {
+        self.send(Command::ClearOnExit).await;
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), DriverError> {
