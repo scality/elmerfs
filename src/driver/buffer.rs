@@ -36,18 +36,26 @@ impl WriteBuffer {
 
     pub fn push(&mut self, write: WriteSlice) -> Option<Flush<'_>> {
         let write_end = write.offset + write.len();
+        let write_offset = write.offset;
+        let write_len = write.buffer.len();
 
         if write.offset >= self.start_offset + self.len {
             self.writes.push(write);
-        } else if write_end <= self.start_offset {
+        } else if write_end <= dbg!(self.start_offset) {
             self.writes.insert(0, write);
         } else {
             self.push_overlapping(write);
         }
 
-        self.cost += write.len();
-        self.start_offset = self.start_offset.min(write.offset);
+        self.cost += write_len as u64;
         self.len = self.len.max(write_end);
+
+        /* The current start_offset value only make sense if there is at least another write slice. */
+        self.start_offset = if self.writes.len() > 1  {
+            self.start_offset.min(write_offset)
+        } else {
+            write_offset
+        };
 
         if self.cost > self.cost_threshold {
             Some(self.flush())
@@ -74,7 +82,7 @@ impl WriteBuffer {
             Err(index) => index,
         };
 
-        let (write_offset, write_len) = (write.offset, write.len());
+        let write_offset = write.offset;
         self.writes.insert(insert_idx, write);
 
         /* Adjust the buffer that was before us (if any) */
@@ -133,5 +141,145 @@ impl std::ops::Deref for Flush<'_> {
 impl Drop for Flush<'_> {
     fn drop(&mut self) {
         self.inner.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect_buffer(buffer: &mut WriteBuffer) -> Vec<u8> {
+        let slices = buffer.flush();
+        let mut result = Vec::new();
+
+        for slice in slices.iter() {
+            result.extend_from_slice(&slice.buffer[..]);
+        }
+
+        result
+    }
+
+    macro_rules! assert_next_slice {
+        ($slices:expr, $offset:expr, $expected:expr) => {
+            let slice = $slices.next().expect("next slice");
+            assert_eq!(&slice.buffer[..], &$expected[..]);
+            assert_eq!(slice.offset, $offset);
+        };
+    }
+
+    #[test]
+    fn test_sequential_inserts() {
+        let mut buffer = WriteBuffer::new(u64::max_value());
+
+        buffer.push(WriteSlice {
+            offset: 0,
+            buffer: Bytes::from(vec![0, 1])
+        });
+
+        buffer.push(WriteSlice {
+            offset: 2,
+            buffer: Bytes::from(vec![2, 3])
+        });
+
+        assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_gapped() {
+        let mut buffer = WriteBuffer::new(u64::max_value());
+
+        buffer.push(WriteSlice {
+            offset: 0,
+            buffer: Bytes::from(vec![0, 1])
+        });
+
+        buffer.push(WriteSlice {
+            offset: 3,
+            buffer: Bytes::from(vec![3, 4])
+        });
+
+        let slices = buffer.flush();
+        let mut slices = slices.iter();
+        assert_next_slice!(slices, 0, vec![0, 1]);
+        assert_next_slice!(slices, 3, vec![3, 4]);
+        assert_eq!(slices.next(), None);
+    }
+
+    #[test]
+    fn test_insert_backward() {
+        let mut buffer = WriteBuffer::new(u64::max_value());
+
+        buffer.push(WriteSlice {
+            offset: 10,
+            buffer: Bytes::from(vec![0, 1])
+        });
+
+        buffer.push(WriteSlice {
+            offset: 3,
+            buffer: Bytes::from(vec![2, 3])
+        });
+
+        let slices = buffer.flush();
+        let mut slices = slices.iter();
+        assert_next_slice!(slices, 3, vec![2, 3]);
+        assert_next_slice!(slices, 10, vec![0, 1]);
+        assert_eq!(slices.next(), None);
+    }
+
+    #[test]
+    fn test_overlap_end() {
+        let mut buffer = WriteBuffer::new(u64::max_value());
+
+        buffer.push(WriteSlice {
+            offset: 3,
+            buffer: Bytes::from(vec![0, 1])
+        });
+
+        buffer.push(WriteSlice {
+            offset: 4,
+            buffer: Bytes::from(vec![2, 3])
+        });
+
+        assert_eq!(collect_buffer(&mut buffer), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn test_overlap_start() {
+        let mut buffer = WriteBuffer::new(u64::max_value());
+
+        buffer.push(WriteSlice {
+            offset: 3,
+            buffer: Bytes::from(vec![0, 1])
+        });
+
+        buffer.push(WriteSlice {
+            offset: 2,
+            buffer: Bytes::from(vec![2, 3])
+        });
+
+        assert_eq!(collect_buffer(&mut buffer), vec![2, 3, 1]);
+    }
+
+    #[test]
+
+    fn test_overlap_in_between() {
+        let mut buffer = WriteBuffer::new(u64::max_value());
+
+        buffer.push(WriteSlice {
+            offset: 0,
+            buffer: Bytes::from(vec![0, 1, 2])
+        });
+
+        buffer.push(WriteSlice {
+            offset: 4,
+            buffer: Bytes::from(vec![3, 4])
+        });
+
+
+        buffer.push(WriteSlice {
+            offset: 2,
+            buffer: Bytes::from(vec![5, 6, 7])
+        });
+        assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 5, 6, 7, 4]);
     }
 }

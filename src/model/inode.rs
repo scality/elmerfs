@@ -223,11 +223,11 @@ mod ops {
 
     #[derive(Debug, Default)]
     pub struct UpdateAttrsDesc {
-        mode: Option<u32>,
-        owner: Option<Owner>,
-        size: Option<u64>,
-        atime: Option<Duration>,
-        mtime: Option<Duration>,
+        pub mode: Option<u32>,
+        pub owner: Option<Owner>,
+        pub size: Option<u64>,
+        pub atime: Option<Duration>,
+        pub mtime: Option<Duration>,
     }
 
     pub fn update_attrs(ino: u64, desc: UpdateAttrsDesc) -> UpdateQuery {

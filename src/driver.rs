@@ -613,7 +613,7 @@ impl Driver {
         })
     }
 
-    async fn unlink(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
+    pub async fn unlink(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -668,7 +668,7 @@ impl Driver {
             let mut openfiles = self.openfiles.lock().await;
             let openfile = openfiles.open(entry.ino).await?;
 
-            openfile.clear_on_exit();
+            openfile.clear_on_exit().await;
 
             openfiles.close(openfile.fh()).await?;
         }

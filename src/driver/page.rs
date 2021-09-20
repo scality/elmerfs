@@ -3,7 +3,6 @@ use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, Bytes, BytesMut, RawIdent, Transaction};
 use std::hash::Hash;
-use std::ops::Range;
 
 use super::buffer::WriteSlice;
 use super::PAGE_SIZE;
@@ -34,7 +33,7 @@ impl PageDriver {
         cache: &mut PageCache,
         slices: &[WriteSlice],
     ) -> Result<()> {
-        let mut pager = Pager::new(self.page_size, slices);
+        let mut pager = Pager::new(slices);
 
         while let Some(page_writes) = pager.next_page() {
             debug_assert!(page_writes.len() > 0);
@@ -104,6 +103,7 @@ impl PageDriver {
         new_size: u64,
         old_size: u64,
     ) -> Result<()> {
+        assert!(new_size < old_size);
         let tail_page_id = page_id(new_size);
         let tail_page_key = Key::new(self.ino, tail_page_id);
         let mut tail_page = cache.read(self.bucket, tx, tail_page_key).await?;
@@ -114,7 +114,7 @@ impl PageDriver {
             .await?;
 
         let remove_start = tail_page_id + 1;
-        let remove_end = page_id(new_size) + 1;
+        let remove_end = page_id(old_size) + 1;
         let removed_keys = (remove_start..remove_end).map(|id| Key::new(self.ino, id));
         cache.remove_all(self.bucket, tx, removed_keys).await?;
 
@@ -147,14 +147,6 @@ impl Into<RawIdent> for Key {
     }
 }
 
-fn intersect_range(lhs: Range<u64>, rhs: Range<u64>) -> Range<u64> {
-    if lhs.end < rhs.start || rhs.end < lhs.start {
-        return 0..0;
-    }
-
-    lhs.start.max(rhs.start)..lhs.end.min(rhs.end)
-}
-
 #[derive(Debug)]
 pub(crate) struct PageCache {
     pages: Lru<u64, Bytes>,
@@ -169,10 +161,6 @@ impl PageCache {
             current: 0,
             limit,
         }
-    }
-
-    pub fn cached_bytes(&self) -> u64 {
-        self.current
     }
 
     pub fn clear(&mut self) {
@@ -254,15 +242,13 @@ impl PageCache {
 }
 
 pub struct Pager<'a> {
-    page_size: u64,
     slices: &'a [WriteSlice],
     current_idx: usize,
 }
 
 impl<'a> Pager<'a> {
-    fn new(page_size: u64, slices: &'a [WriteSlice]) -> Self {
+    fn new(slices: &'a [WriteSlice]) -> Self {
         Pager {
-            page_size,
             slices,
             current_idx: 0,
         }

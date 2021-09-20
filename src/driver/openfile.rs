@@ -96,12 +96,12 @@ impl Openfiles {
 
 #[derive(Debug, Default)]
 pub struct WriteAttrsDesc {
-    mode: Option<u32>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    size: Option<u64>,
-    atime: Option<Duration>,
-    mtime: Option<Duration>,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<u64>,
+    pub atime: Option<Duration>,
+    pub mtime: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -212,29 +212,29 @@ impl Openfile {
                     response_sender,
                 } => {
                     let result = self.handle_read(offset, len).await;
-                    response_sender.send(result);
+                    let _ = response_sender.send(result).await;
                 }
                 Command::Sync { response_sender } => {
                     let result = self.handle_sync().await;
-                    response_sender.send(result);
+                    let _ = response_sender.send(result).await;
                 }
                 Command::ReadAttrs { response_sender } => {
                     let result = self.handle_read_attrs().await;
-                    response_sender.send(result);
+                    let _ = response_sender.send(result).await;
                 }
                 Command::WriteAttrs {
                     desc,
                     response_sender,
                 } => {
                     let result = self.handle_write_attrs(desc).await;
-                    response_sender.send(result);
+                    let _ = response_sender.send(result).await;
                 }
                 Command::ClearOnExit => {
                     self.clear_on_exit = true;
                 }
                 Command::Exit { response_sender } => {
                     let result = self.handle_exit().await;
-                    response_sender.send(result).await;
+                    let _ = response_sender.send(result).await;
                     break;
                 }
             }
@@ -448,10 +448,10 @@ impl Openfile {
             if extent.end > *cached_size {
                 *cached_size = extent.end;
                 tx.update(bucket, updates!(inode::update_size(now, ino, extent.end)))
-                    .await;
+                    .await?;
             } else {
                 tx.update(bucket, updates!(inode::update_size(now, ino, *cached_size)))
-                    .await;
+                    .await?;
             }
         }
 
