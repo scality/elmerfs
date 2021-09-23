@@ -282,4 +282,36 @@ mod tests {
         });
         assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 5, 6, 7, 4]);
     }
+
+    #[test]
+    fn test_flush_limit() {
+        let bytes_threshold = 4;
+        let mut buffer = WriteBuffer::new(bytes_threshold);
+
+        buffer.push(WriteSlice {
+            offset: 0,
+            buffer: Bytes::from(vec![0, 1, 2])
+        });
+
+        /* Even if it is overlapping, we account each write into the cost. */
+        let flush = buffer.push(WriteSlice {
+            offset: 0,
+            buffer: Bytes::from(vec![0, 1, 3])
+        });
+
+        {
+            assert!(flush.is_some());
+            let slices = flush.unwrap();
+            let mut slices = slices.iter();
+            assert_next_slice!(&mut slices, 0, vec![0, 1, 3]);
+            assert_eq!(slices.next(), None);
+        }
+
+        /* The cost should have been reset. */
+        let flush = buffer.push(WriteSlice {
+            offset: 4,
+            buffer: Bytes::from(vec![0, 1, 2])
+        });
+        assert!(flush.is_none());
+    }
 }
