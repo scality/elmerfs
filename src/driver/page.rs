@@ -2,24 +2,54 @@ use crate::collections::Lru;
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, Bytes, BytesMut, RawIdent, Transaction};
+use async_trait::async_trait;
+use std::collections::HashMap;
 use std::hash::Hash;
 
 use super::buffer::WriteSlice;
 use super::PAGE_SIZE;
 
-#[derive(Debug, Copy, Clone)]
+/// A handle to a transaction. This is useful for when a PageStore doesn't have any
+/// notion of transaction. Having this as an associated type would be a better model
+/// but would require GAT.
+pub enum TransactionHandle<'a, 'conn> {
+    Dangling,
+    Active(&'a mut Transaction<'conn>),
+}
+
+impl<'a, 'conn> TransactionHandle<'a, 'conn> {
+    fn get(&mut self) -> &mut Transaction<'conn> {
+        match self {
+            Self::Dangling => panic!("dangling"),
+            Self::Active(tx) => tx,
+        }
+    }
+
+    fn dangling() -> Self {
+        TransactionHandle::Dangling
+    }
+}
+
+impl<'a, 'conn> From<&'a mut Transaction<'conn>> for TransactionHandle<'a, 'conn> {
+    fn from(tx: &'a mut Transaction<'conn>) -> Self {
+        TransactionHandle::Active(tx)
+    }
+}
+
 pub(crate) struct PageDriver {
     ino: u64,
     bucket: Bucket,
     page_size: u64,
+    store: Box<dyn PageStore>,
 }
 
 impl PageDriver {
-    pub fn new(ino: u64, bucket: Bucket, page_size: u64) -> Self {
+    pub fn new(ino: u64, bucket: Bucket, page_size: u64, store: Box<dyn PageStore>) -> Self {
         Self {
             ino,
             bucket,
             page_size,
+            store
         }
     }
 
@@ -28,9 +58,8 @@ impl PageDriver {
     }
 
     pub async fn write(
-        &self,
-        tx: &mut Transaction<'_>,
-        cache: &mut PageCache,
+        &mut self,
+        mut tx: TransactionHandle<'_, '_>,
         slices: &[WriteSlice],
     ) -> Result<()> {
         let mut pager = Pager::new(slices);
@@ -40,7 +69,11 @@ impl PageDriver {
             let id = page_id(page_writes[0].offset);
             let page_key = Key::new(self.ino, id);
 
-            let mut page = cache.read(self.bucket, tx, page_key).await?.to_vec();
+            let mut page = self
+                .store
+                .read(self.bucket, &mut tx, page_key)
+                .await?
+                .to_vec();
 
             let write_end = page_writes.last().map(|p| p.offset + p.len()).unwrap();
             let new_len = write_end % self.page_size;
@@ -52,8 +85,8 @@ impl PageDriver {
                     .copy_from_slice(&page_write.buffer[..]);
             }
 
-            cache
-                .write(self.bucket, tx, page_key, Bytes::from(page))
+            self.store
+                .write(self.bucket, &mut tx, page_key, Bytes::from(page))
                 .await?;
         }
 
@@ -61,9 +94,8 @@ impl PageDriver {
     }
 
     pub async fn read(
-        &self,
-        tx: &mut Transaction<'_>,
-        cache: &mut PageCache,
+        &mut self,
+        mut tx: TransactionHandle<'_, '_>,
         offset: u64,
         len: u64,
         output: &mut BytesMut,
@@ -78,7 +110,7 @@ impl PageDriver {
             let chunk = (end - current_offset).min(self.page_size - offset_in_page);
             let end_in_page = offset_in_page + chunk;
 
-            let page = cache.read(self.bucket, tx, page_key).await?;
+            let page = self.store.read(self.bucket, &mut tx, page_key).await?;
 
             if offset_in_page >= page.len() as u64 {
                 output.resize(output.len() + chunk as usize, 0);
@@ -97,28 +129,35 @@ impl PageDriver {
     }
 
     pub async fn truncate(
-        &self,
-        tx: &mut Transaction<'_>,
-        cache: &mut PageCache,
+        &mut self,
+        mut tx: TransactionHandle<'_, '_>,
         new_size: u64,
         old_size: u64,
     ) -> Result<()> {
         assert!(new_size < old_size);
         let tail_page_id = page_id(new_size);
         let tail_page_key = Key::new(self.ino, tail_page_id);
-        let mut tail_page = cache.read(self.bucket, tx, tail_page_key).await?;
+        let mut tail_page = self.store.read(self.bucket, &mut tx, tail_page_key).await?;
 
         tail_page.truncate((new_size % self.page_size) as usize);
-        cache
-            .write(self.bucket, tx, tail_page_key, tail_page)
+        self.store
+            .write(self.bucket, &mut tx, tail_page_key, tail_page)
             .await?;
 
         let remove_start = tail_page_id + 1;
         let remove_end = page_id(old_size) + 1;
-        let removed_keys = (remove_start..remove_end).map(|id| Key::new(self.ino, id));
-        cache.remove_all(self.bucket, tx, removed_keys).await?;
+        let removed_keys = (remove_start..remove_end)
+            .map(|id| Key::new(self.ino, id))
+            .collect::<Vec<_>>();
+        self.store
+            .remove_all(self.bucket, &mut tx, removed_keys)
+            .await?;
 
         Ok(())
+    }
+
+    pub fn invalidate(&mut self) -> Result<()> {
+        self.store.invalidate()
     }
 }
 
@@ -147,6 +186,33 @@ impl Into<RawIdent> for Key {
     }
 }
 
+#[async_trait]
+trait PageStore: Send {
+    async fn read(
+        &mut self,
+        bucket: Bucket,
+        tx: &mut TransactionHandle<'_, '_>,
+        key: Key,
+    ) -> Result<Bytes>;
+
+    async fn write(
+        &mut self,
+        bucket: Bucket,
+        tx: &mut TransactionHandle<'_, '_>,
+        key: Key,
+        bytes: Bytes,
+    ) -> Result<()>;
+
+    async fn remove_all(
+        &mut self,
+        bucket: Bucket,
+        tx: &mut TransactionHandle<'_, '_>,
+        pages: Vec<Key>,
+    ) -> Result<()>;
+
+    fn invalidate(&mut self) -> Result<()> { Ok(()) }
+}
+
 #[derive(Debug)]
 pub(crate) struct PageCache {
     pages: Lru<u64, Bytes>,
@@ -168,7 +234,33 @@ impl PageCache {
         self.current = 0;
     }
 
-    async fn read(&mut self, bucket: Bucket, tx: &mut Transaction<'_>, key: Key) -> Result<Bytes> {
+    fn cache(&mut self, key: Key, bytes: Bytes) {
+        self.current += bytes.len() as u64;
+        self.pages.insert(key.page, bytes);
+    }
+
+    fn trim(&mut self) {
+        while self.current > self.limit {
+            match self.pages.evict() {
+                Some((_, bytes)) => {
+                    self.current -= bytes.len() as u64;
+                }
+                None => return,
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl PageStore for PageCache {
+    async fn read(
+        &mut self,
+        bucket: Bucket,
+        tx: &mut TransactionHandle<'_, '_>,
+        key: Key,
+    ) -> Result<Bytes> {
+        let tx = tx.get();
+
         let (hit, bytes) = match self.pages.lookup(&key.page) {
             Some(bytes) => (true, bytes.clone()),
             None => {
@@ -188,56 +280,46 @@ impl PageCache {
     async fn write(
         &mut self,
         bucket: Bucket,
-        tx: &mut Transaction<'_>,
+        tx: &mut TransactionHandle<'_, '_>,
         key: Key,
         bytes: Bytes,
     ) -> Result<()> {
+        let tx = tx.get();
+
         self.trim();
 
         tx.update(bucket, std::iter::once(lwwreg::set(key, bytes.clone())))
             .await?;
+
         self.cache(key, bytes);
 
         Ok(())
     }
 
-    async fn remove_all<P>(
+    async fn remove_all(
         &mut self,
         bucket: Bucket,
-        tx: &mut Transaction<'_>,
-        pages: P,
-    ) -> Result<()>
-    where
-        P: IntoIterator<Item = Key>,
-    {
-        let removes = pages.into_iter().collect::<Vec<_>>();
-        for removal in &removes {
+        tx: &mut TransactionHandle<'_, '_>,
+        pages: Vec<Key>,
+    ) -> Result<()> {
+        let tx = tx.get();
+
+        for removal in &pages {
             self.pages.remove(&removal.page);
         }
 
         tx.update(
             bucket,
-            removes.into_iter().map(|p| lwwreg::set(p, Bytes::new())),
+            pages.into_iter().map(|p| lwwreg::set(p, Bytes::new())),
         )
         .await?;
 
         Ok(())
     }
 
-    fn cache(&mut self, key: Key, bytes: Bytes) {
-        self.current += bytes.len() as u64;
-        self.pages.insert(key.page, bytes);
-    }
-
-    fn trim(&mut self) {
-        while self.current > self.limit {
-            match self.pages.evict() {
-                Some((_, bytes)) => {
-                    self.current -= bytes.len() as u64;
-                }
-                None => return,
-            }
-        }
+    fn invalidate(&mut self) -> Result<()> {
+        self.clear();
+        Ok(())
     }
 }
 
@@ -275,4 +357,48 @@ impl<'a> Pager<'a> {
 
 fn page_id(offset: u64) -> u64 {
     offset / PAGE_SIZE
+}
+
+mod tests {
+    use super::*;
+
+    struct HashPageStore {
+        pages: HashMap<Key, Bytes>,
+    }
+
+    #[async_trait]
+    impl PageStore for HashPageStore {
+        async fn read(
+            &mut self,
+            _bucket: Bucket,
+            _tx: &mut TransactionHandle<'_, '_>,
+            key: Key,
+        ) -> Result<Bytes> {
+            Ok(self.pages.get(&key).cloned().unwrap_or_default())
+        }
+
+        async fn write(
+            &mut self,
+            _bucket: Bucket,
+            _tx: &mut TransactionHandle<'_, '_>,
+            key: Key,
+            bytes: Bytes,
+        ) -> Result<()> {
+            self.pages.insert(key, bytes);
+            Ok(())
+        }
+
+        async fn remove_all(
+            &mut self,
+            _bucket: Bucket,
+            _tx: &mut TransactionHandle<'_, '_>,
+            pages: Vec<Key>,
+        ) -> Result<()> {
+            for page_key in pages {
+                self.pages.remove(&page_key);
+            }
+
+            Ok(())
+        }
+    }
 }

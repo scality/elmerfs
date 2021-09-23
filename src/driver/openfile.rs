@@ -143,7 +143,6 @@ struct Openfile {
     pool: Arc<ConnectionPool>,
     write_buffer: WriteBuffer,
     cache_txid: Option<TxId>,
-    cache: PageCache,
     cached_size: u64,
     driver: PageDriver,
     commands: Receiver<Command>,
@@ -168,9 +167,8 @@ impl Openfile {
             pool,
             write_buffer: WriteBuffer::new(PAGE_SIZE),
             cache_txid: None,
-            cache: PageCache::new(6 * page_size),
             cached_size: 0,
-            driver: PageDriver::new(ino, bucket, page_size),
+            driver,
             commands: cmd_receiver,
             mode: Mode::Idle,
             write_error: None,
@@ -254,7 +252,6 @@ impl Openfile {
                 &mut tx,
                 &mut self.driver,
                 &mut self.cached_size,
-                &mut self.cache,
                 slices,
             )
             .await
@@ -284,12 +281,12 @@ impl Openfile {
         let mut connection = pool.acquire().await?;
         let txid = self.txid().await?;
 
-        let mut tx = Transaction::from_raw(txid, &mut connection);
+        let mut tx = DangleTx(Transaction::from_raw(txid, &mut connection));
 
         let mut output = BytesMut::with_capacity(len as usize);
         let truncated_len = len.min(self.cached_size);
         self.driver
-            .read(&mut tx, &mut self.cache, offset, truncated_len, &mut output)
+            .read((&mut *tx).into(),  offset, truncated_len, &mut output)
             .await?;
 
         output.resize(len as usize, 0);
@@ -331,7 +328,7 @@ impl Openfile {
 
                 if old_size > new_size {
                     self.driver
-                        .truncate(&mut tx, &mut self.cache, new_size, old_size)
+                        .truncate((&mut *tx).into(), new_size, old_size)
                         .await?;
                 }
             }
@@ -414,10 +411,9 @@ impl Openfile {
             Self::write_slices_and_update_size(
                 self.ino,
                 self.bucket,
-                &mut tx,
+                (&mut *tx).into(),
                 &mut self.driver,
                 &mut self.cached_size,
-                &mut self.cache,
                 slices,
             )
             .await
@@ -438,11 +434,10 @@ impl Openfile {
         tx: &mut Transaction<'_>,
         driver: &mut PageDriver,
         cached_size: &mut u64,
-        cache: &mut PageCache,
         slices: Flush<'_>,
     ) -> Result<(), DriverError> {
         if let Some(extent) = slices.extent() {
-            driver.write(tx, cache, &slices).await?;
+            driver.write(tx.into(), &slices).await?;
 
             let now = time::now();
             if extent.end > *cached_size {
@@ -471,7 +466,7 @@ impl Openfile {
     }
 
     async fn commit(&mut self) -> Result<(), DriverError> {
-        self.cache.clear();
+        self.driver.invalidate();
         self.cached_size = 0;
 
         if let Some(txid) = self.cache_txid.take() {
@@ -484,8 +479,8 @@ impl Openfile {
     }
 
     async fn abort(&mut self) -> Result<(), DriverError> {
+        self.driver.invalidate();
         self.cached_size = 0;
-        self.cache.clear();
 
         if let Some(txid) = self.cache_txid.take() {
             let mut connection = self.pool.acquire().await?;
