@@ -26,7 +26,7 @@ pub struct WriteBuffer {
 impl WriteBuffer {
     pub fn new(bytes_threshold: u64) -> Self {
         Self {
-            writes: Vec::with_capacity((bytes_threshold / FUSE_MAX_WRITE).min(1) as usize),
+            writes: Vec::with_capacity((bytes_threshold / FUSE_MAX_WRITE).max(1) as usize),
             cost: 0,
             cost_threshold: bytes_threshold,
             len: 0,
@@ -41,7 +41,7 @@ impl WriteBuffer {
 
         if write.offset >= self.start_offset + self.len {
             self.writes.push(write);
-        } else if write_end <= dbg!(self.start_offset) {
+        } else if write_end <= self.start_offset {
             self.writes.insert(0, write);
         } else {
             self.push_overlapping(write);
@@ -116,6 +116,7 @@ impl WriteBuffer {
     }
 }
 
+#[must_use = "The flushed buffers should be handled when flushed"]
 pub struct Flush<'a> {
     inner: &'a mut WriteBuffer,
 }
@@ -169,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_sequential_inserts() {
-        let mut buffer = WriteBuffer::new(u64::max_value());
+        let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
             offset: 0,
@@ -186,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_gapped() {
-        let mut buffer = WriteBuffer::new(u64::max_value());
+        let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
             offset: 0,
@@ -207,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_insert_backward() {
-        let mut buffer = WriteBuffer::new(u64::max_value());
+        let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
             offset: 10,
@@ -228,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_overlap_end() {
-        let mut buffer = WriteBuffer::new(u64::max_value());
+        let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
             offset: 3,
@@ -245,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_overlap_start() {
-        let mut buffer = WriteBuffer::new(u64::max_value());
+        let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
             offset: 3,
@@ -263,7 +264,7 @@ mod tests {
     #[test]
 
     fn test_overlap_in_between() {
-        let mut buffer = WriteBuffer::new(u64::max_value());
+        let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
             offset: 0,
