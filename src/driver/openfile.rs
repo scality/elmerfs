@@ -187,7 +187,7 @@ impl Openfile {
             let command = match self.commands.recv().await {
                 Ok(command) => command,
                 Err(_) => {
-                    tracing::error!(ino = self.ino, "No more openfile clients. Exiting.");
+                    tracing::warn!(ino = self.ino, "no more openfile clients. Exiting.");
                     break;
                 }
             };
@@ -235,6 +235,23 @@ impl Openfile {
                     let _ = response_sender.send(result).await;
                     break;
                 }
+            }
+        }
+
+        if self.clear_on_exit {
+            let result = self
+                .handle_write_attrs(Box::new(WriteAttrsDesc {
+                    size: Some(0),
+                    ..WriteAttrsDesc::default()
+                }))
+                .await;
+
+            if let Err(truncate_error) = result {
+                tracing::error!(
+                    ino = self.ino,
+                    ?truncate_error,
+                    "failed to clear data on exit."
+                );
             }
         }
     }
