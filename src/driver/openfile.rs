@@ -14,9 +14,9 @@ use crate::time;
 use crate::Bucket;
 
 use super::buffer::{Flush, WriteBuffer, WriteSlice};
-use super::page::PageDriver;
+use super::page::{PageCache, PageDriver};
 use super::pool::ConnectionPool;
-use super::{page::PageCache, DriverError, PAGE_SIZE};
+use super::{DriverError, PAGE_SIZE};
 
 #[derive(Debug)]
 struct OpenfileEntry {
@@ -45,7 +45,8 @@ impl Openfiles {
 
         match self.entries.entry(ino) {
             Entry::Vacant(entry) => {
-                let driver = PageDriver::new(ino, self.bucket, PAGE_SIZE);
+                let cache = PageCache::new(PAGE_SIZE * 16);
+                let driver = PageDriver::new(ino, self.bucket, PAGE_SIZE, cache);
                 let handle =
                     Openfile::spawn(ino, self.bucket, driver, self.connection_pool.clone()).await?;
 
@@ -144,7 +145,7 @@ struct Openfile {
     write_buffer: WriteBuffer,
     cache_txid: Option<TxId>,
     cached_size: u64,
-    driver: PageDriver,
+    driver: PageDriver<PageCache>,
     commands: Receiver<Command>,
     write_error: Option<DriverError>,
     mode: Mode,
@@ -155,10 +156,9 @@ impl Openfile {
     pub async fn spawn(
         ino: u64,
         bucket: Bucket,
-        driver: PageDriver,
+        driver: PageDriver<PageCache>,
         pool: Arc<ConnectionPool>,
     ) -> Result<OpenfileHandle, DriverError> {
-        let page_size = driver.page_size();
         let (cmd_sender, cmd_receiver) = channel::bounded(128);
 
         let openfile = Openfile {
@@ -286,7 +286,7 @@ impl Openfile {
         let mut output = BytesMut::with_capacity(len as usize);
         let truncated_len = len.min(self.cached_size);
         self.driver
-            .read((&mut *tx).into(),  offset, truncated_len, &mut output)
+            .read((&mut *tx).into(), offset, truncated_len, &mut output)
             .await?;
 
         output.resize(len as usize, 0);
@@ -432,7 +432,7 @@ impl Openfile {
         ino: u64,
         bucket: Bucket,
         tx: &mut Transaction<'_>,
-        driver: &mut PageDriver,
+        driver: &mut PageDriver<PageCache>,
         cached_size: &mut u64,
         slices: Flush<'_>,
     ) -> Result<(), DriverError> {
@@ -466,7 +466,7 @@ impl Openfile {
     }
 
     async fn commit(&mut self) -> Result<(), DriverError> {
-        self.driver.invalidate();
+        self.driver.invalidate_cache()?;
         self.cached_size = 0;
 
         if let Some(txid) = self.cache_txid.take() {
@@ -479,7 +479,7 @@ impl Openfile {
     }
 
     async fn abort(&mut self) -> Result<(), DriverError> {
-        self.driver.invalidate();
+        self.driver.invalidate_cache()?;
         self.cached_size = 0;
 
         if let Some(txid) = self.cache_txid.take() {
@@ -500,7 +500,7 @@ impl Openfile {
 
                 let mut reply = tx.read(self.bucket, reads!(inode::read(self.ino))).await?;
                 self.cached_size = inode::decode_size(self.ino, &mut reply, 0).ok_or(ENOENT)?;
-                self.cache.clear();
+                self.driver.invalidate_cache()?;
 
                 Ok(tx.id())
             }

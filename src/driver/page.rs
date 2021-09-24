@@ -3,16 +3,15 @@ use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
 use antidotec::{lwwreg, Bytes, BytesMut, RawIdent, Transaction};
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::hash::Hash;
 
 use super::buffer::WriteSlice;
-use super::PAGE_SIZE;
 
 /// A handle to a transaction. This is useful for when a PageStore doesn't have any
 /// notion of transaction. Having this as an associated type would be a better model
 /// but would require GAT.
 pub enum TransactionHandle<'a, 'conn> {
+    #[cfg(test)]
     Dangling,
     Active(&'a mut Transaction<'conn>),
 }
@@ -20,11 +19,13 @@ pub enum TransactionHandle<'a, 'conn> {
 impl<'a, 'conn> TransactionHandle<'a, 'conn> {
     fn get(&mut self) -> &mut Transaction<'conn> {
         match self {
+            #[cfg(test)]
             Self::Dangling => panic!("dangling"),
             Self::Active(tx) => tx,
         }
     }
 
+    #[cfg(test)]
     fn dangling() -> Self {
         TransactionHandle::Dangling
     }
@@ -36,25 +37,21 @@ impl<'a, 'conn> From<&'a mut Transaction<'conn>> for TransactionHandle<'a, 'conn
     }
 }
 
-pub(crate) struct PageDriver {
+pub(crate) struct PageDriver<S: PageStore> {
     ino: u64,
     bucket: Bucket,
     page_size: u64,
-    store: Box<dyn PageStore>,
+    store: S,
 }
 
-impl PageDriver {
-    pub fn new(ino: u64, bucket: Bucket, page_size: u64, store: Box<dyn PageStore>) -> Self {
+impl<S: PageStore> PageDriver<S> {
+    pub fn new(ino: u64, bucket: Bucket, page_size: u64, store: S) -> Self {
         Self {
             ino,
             bucket,
             page_size,
-            store
+            store,
         }
-    }
-
-    pub fn page_size(&self) -> u64 {
-        self.page_size
     }
 
     pub async fn write(
@@ -62,32 +59,46 @@ impl PageDriver {
         mut tx: TransactionHandle<'_, '_>,
         slices: &[WriteSlice],
     ) -> Result<()> {
-        let mut pager = Pager::new(slices);
+        let normalized_slices = normalize_slices(slices, self.page_size);
 
-        while let Some(page_writes) = pager.next_page() {
-            debug_assert!(page_writes.len() > 0);
-            let id = page_id(page_writes[0].offset);
-            let page_key = Key::new(self.ino, id);
+        let mut slices_range = 0..0;
+        while slices_range.start < normalized_slices.len() {
+            let page_id = self.page_id(normalized_slices[slices_range.start].offset);
 
+            /* Get the number of slices sharing the same page id. */
+            slices_range.end = slices_range.start + normalized_slices[slices_range.start..]
+                .iter()
+                .take_while(|s| self.page_id(s.offset) == page_id)
+                .count();
+
+            let page_key = Key::new(self.ino, page_id);
             let mut page = self
                 .store
                 .read(self.bucket, &mut tx, page_key)
                 .await?
                 .to_vec();
 
-            let write_end = page_writes.last().map(|p| p.offset + p.len()).unwrap();
-            let new_len = write_end % self.page_size;
+            let write_end = {
+                let slice = &normalized_slices[slices_range.end - 1];
+                slice.offset + slice.len()
+            };
+
+            let page_offset = page_id * self.page_size;
+            let new_len = (write_end - page_offset).max(page.len() as u64);
             page.resize(new_len as usize, 0);
 
-            for page_write in page_writes {
-                let offset_in_page = page_write.offset % self.page_size;
-                page[offset_in_page as usize..page_write.len() as usize]
-                    .copy_from_slice(&page_write.buffer[..]);
+            for slice in &normalized_slices[slices_range.clone()] {
+                let offset_in_page = slice.offset % self.page_size;
+                let end_in_page = offset_in_page+ slice.len();
+                page[offset_in_page as usize..end_in_page as usize]
+                    .copy_from_slice(&slice.buffer[..]);
             }
 
             self.store
                 .write(self.bucket, &mut tx, page_key, Bytes::from(page))
                 .await?;
+
+            slices_range.start = slices_range.end;
         }
 
         Ok(())
@@ -103,7 +114,7 @@ impl PageDriver {
         let end = offset + len;
         let mut current_offset = offset;
         while current_offset < end {
-            let id = page_id(current_offset);
+            let id = self.page_id(current_offset);
             let page_key = Key::new(self.ino, id);
 
             let offset_in_page = current_offset % self.page_size;
@@ -134,8 +145,8 @@ impl PageDriver {
         new_size: u64,
         old_size: u64,
     ) -> Result<()> {
-        assert!(new_size < old_size);
-        let tail_page_id = page_id(new_size);
+        assert!(new_size <= old_size);
+        let tail_page_id = self.page_id(new_size);
         let tail_page_key = Key::new(self.ino, tail_page_id);
         let mut tail_page = self.store.read(self.bucket, &mut tx, tail_page_key).await?;
 
@@ -145,7 +156,7 @@ impl PageDriver {
             .await?;
 
         let remove_start = tail_page_id + 1;
-        let remove_end = page_id(old_size) + 1;
+        let remove_end = self.page_id(old_size) + 1;
         let removed_keys = (remove_start..remove_end)
             .map(|id| Key::new(self.ino, id))
             .collect::<Vec<_>>();
@@ -156,9 +167,44 @@ impl PageDriver {
         Ok(())
     }
 
-    pub fn invalidate(&mut self) -> Result<()> {
-        self.store.invalidate()
+    pub fn invalidate_cache(&mut self) -> Result<()> {
+        self.store.invalidate_cache()
     }
+
+    fn page_id(&self, offset: u64) -> u64 {
+        offset / self.page_size
+    }
+}
+
+/// Creates a new buffer of slices with the guarantee that no slice
+/// span more than one page.
+fn normalize_slices(slices: &[WriteSlice], page_size: u64) -> Vec<WriteSlice> {
+    /* Assumes that slices rarely span more than two pages. Pages are
+    already big, this should be quite rare. */
+    let mut normalized_slices = Vec::with_capacity(2 * slices.len());
+
+    for slice in slices {
+        let mut offset_in_slice = 0;
+
+        while offset_in_slice < slice.buffer.len() as u64 {
+            let current_offset = slice.offset + offset_in_slice;
+            let offset_in_page = current_offset % page_size;
+
+            let remaining_in_page =
+                (page_size - offset_in_page).min(slice.buffer.len() as u64 - offset_in_slice);
+
+            let end_in_slice = offset_in_slice + remaining_in_page;
+            normalized_slices.push(WriteSlice {
+                buffer: slice
+                    .buffer
+                    .slice(offset_in_slice as usize..end_in_slice as usize),
+                offset: current_offset,
+            });
+            offset_in_slice += remaining_in_page;
+        }
+    }
+
+    normalized_slices
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -187,7 +233,7 @@ impl Into<RawIdent> for Key {
 }
 
 #[async_trait]
-trait PageStore: Send {
+pub(crate) trait PageStore: Send {
     async fn read(
         &mut self,
         bucket: Bucket,
@@ -210,7 +256,9 @@ trait PageStore: Send {
         pages: Vec<Key>,
     ) -> Result<()>;
 
-    fn invalidate(&mut self) -> Result<()> { Ok(()) }
+    fn invalidate_cache(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -317,53 +365,34 @@ impl PageStore for PageCache {
         Ok(())
     }
 
-    fn invalidate(&mut self) -> Result<()> {
+    fn invalidate_cache(&mut self) -> Result<()> {
         self.clear();
         Ok(())
     }
 }
 
-pub struct Pager<'a> {
-    slices: &'a [WriteSlice],
-    current_idx: usize,
-}
-
-impl<'a> Pager<'a> {
-    fn new(slices: &'a [WriteSlice]) -> Self {
-        Pager {
-            slices,
-            current_idx: 0,
-        }
-    }
-
-    fn next_page(&mut self) -> Option<&[WriteSlice]> {
-        if self.slices.len() == self.current_idx {
-            return None;
-        }
-
-        let current_page_id = page_id(self.slices[self.current_idx].offset);
-        let write_range = match self.slices[(self.current_idx + 1)..]
-            .iter()
-            .position(|w| page_id(w.offset) != current_page_id)
-        {
-            Some(position) => self.current_idx..position,
-            None => self.current_idx..self.slices.len(),
-        };
-
-        self.current_idx = write_range.end;
-        Some(&self.slices[write_range])
-    }
-}
-
-fn page_id(offset: u64) -> u64 {
-    offset / PAGE_SIZE
-}
-
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    const INO: u64 = 0x1;
+    const PAGE_SIZE: u64 = 4;
 
     struct HashPageStore {
         pages: HashMap<Key, Bytes>,
+    }
+
+    impl HashPageStore {
+        fn new() -> Self {
+            HashPageStore {
+                pages: HashMap::new(),
+            }
+        }
+
+        fn page(&self, id: u64) -> &[u8] {
+            &self.pages[&Key::new(INO, id)][..]
+        }
     }
 
     #[async_trait]
@@ -400,5 +429,260 @@ mod tests {
 
             Ok(())
         }
+    }
+
+    fn new_driver() -> PageDriver<HashPageStore> {
+        let store = HashPageStore::new();
+        PageDriver::new(INO, Bucket::new(0), PAGE_SIZE, store)
+    }
+
+    fn new_slice(offset: u64, buffer: impl Into<Bytes>) -> WriteSlice {
+        WriteSlice {
+            offset,
+            buffer: buffer.into(),
+        }
+    }
+
+    fn tx() -> TransactionHandle<'static, 'static> {
+        TransactionHandle::dangling()
+    }
+
+    #[test]
+    fn test_normalize_already_normalized() {
+        let slices = vec![
+            new_slice(0, vec![0]),
+            new_slice(1, vec![1]),
+            new_slice(2, vec![2]),
+            new_slice(3, vec![3]),
+        ];
+
+        let expected = slices.clone();
+        let normalized = normalize_slices(&slices, PAGE_SIZE);
+        assert_eq!(expected, normalized);
+    }
+
+    #[test]
+    fn test_normalize_spanning_two() {
+        let slices = vec![new_slice(0, vec![0, 1, 2, 3, 4, 5])];
+
+        let expected = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+            new_slice(4, vec![4, 5])
+        ];
+        let normalized = normalize_slices(&slices, PAGE_SIZE);
+        assert_eq!(expected, normalized);
+    }
+
+    #[test]
+    fn test_normalize_gapped() {
+        let slices = vec![
+            new_slice(0, vec![0, 1, 2, 3, 4]),
+            new_slice(16, vec![0, 1, 2, 3, 4]),
+        ];
+
+        let expected = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+            new_slice(4, vec![4]),
+
+            new_slice(16, vec![0, 1, 2, 3]),
+            new_slice(20, vec![4]),
+        ];
+        let normalized = normalize_slices(&slices, PAGE_SIZE);
+        assert_eq!(expected, normalized);
+    }
+
+    #[test]
+    fn test_normalize_empty() {
+        let empty = vec![];
+        let expected = empty.clone();
+        assert_eq!(expected, normalize_slices(&empty, PAGE_SIZE));
+    }
+
+    #[async_std::test]
+    async fn test_write_seq() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2]),
+            new_slice(3, vec![3, 4, 5]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+
+        assert_eq!(driver.store.page(0), vec![0, 1, 2, 3]);
+        assert_eq!(driver.store.page(1), vec![4, 5]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_write_gapped() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2]),
+            new_slice(14, vec![3, 4, 5]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        assert_eq!(driver.store.page(0), vec![0, 1, 2]);
+        assert_eq!(driver.store.page(3), vec![0, 0, 3, 4]);
+        assert_eq!(driver.store.page(4), vec![5]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_overwrite() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2]),
+            new_slice(14, vec![3, 4, 5]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        let writes = vec![
+            new_slice(3, vec![2, 3]),
+            new_slice(12, vec![6, 7, 8]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        assert_eq!(driver.store.page(0), vec![0, 1, 2, 2]);
+        assert_eq!(driver.store.page(1), vec![3]);
+        assert_eq!(driver.store.page(3), vec![6, 7, 8, 4]);
+        assert_eq!(driver.store.page(4), vec![5]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_write_aligned() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+            new_slice(4, vec![0, 1, 2, 3]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        assert_eq!(driver.store.page(0), vec![0, 1, 2, 3]);
+        assert_eq!(driver.store.page(1), vec![0, 1, 2, 3]);
+
+        Ok(())
+    }
+
+
+    macro_rules! assert_read {
+        ($driver:expr, $off:expr, $len:expr, $result:expr) => {
+            let mut output = BytesMut::with_capacity(4);
+            $driver.read(tx(), $off, $len, &mut output).await?;
+
+            assert_eq!(&output[..], $result);
+        };
+    }
+
+
+    #[async_std::test]
+    async fn test_read_exact() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        assert_read!(driver, 0, 4, vec![0, 1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_read_more() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        assert_read!(driver, 0, 6, vec![0, 1, 2, 3, 0, 0]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_read_unaligned() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(2, vec![2, 3]),
+            new_slice(4, vec![2, 3]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        assert_read!(driver, 3, 4, vec![3, 2, 3, 0]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_read_not_written() -> Result<()> {
+        let mut driver = new_driver();
+
+        assert_read!(driver, 0, 4, vec![0, 0, 0, 0]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_truncate_down() -> Result<()> {
+        let mut driver = new_driver();
+
+        let new_size = 0;
+        let old_size = 0;
+        driver.truncate(tx(), new_size, old_size).await?;
+
+        assert_read!(driver, 0, 4, vec![0, 0, 0, 0]);
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+            new_slice(4, vec![0, 1, 2, 3]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        let new_size = 4;
+        let old_size = 8;
+        driver.truncate(tx(), new_size, old_size).await?;
+
+        assert_read!(driver, 2, 4, vec![2, 3, 0, 0]);
+        assert_read!(driver, 0, 4, vec![0, 1, 2, 3]);
+
+        let new_size = 2;
+        let old_size = 4;
+        driver.truncate(tx(), new_size, old_size).await?;
+        assert_read!(driver, 0, 4, vec![0, 1, 0, 0]);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_truncate_down_on_gapped() -> Result<()> {
+        let mut driver = new_driver();
+
+        let writes = vec![
+            new_slice(0, vec![0, 1, 2, 3]),
+            new_slice(8, vec![0, 1, 2, 3]),
+        ];
+        driver.write(tx(), &writes).await?;
+
+        let new_size = 6;
+        let old_size = 12;
+        driver.truncate(tx(), new_size, old_size).await?;
+
+        assert_read!(driver, 11, 4, vec![0, 0, 0, 0]);
+        assert_read!(driver, 0, 5, vec![0, 1, 2, 3, 0]);
+
+        Ok(())
     }
 }

@@ -51,7 +51,7 @@ impl WriteBuffer {
         self.len = self.len.max(write_end);
 
         /* The current start_offset value only make sense if there is at least another write slice. */
-        self.start_offset = if self.writes.len() > 1  {
+        self.start_offset = if self.writes.len() > 1 {
             self.start_offset.min(write_offset)
         } else {
             write_offset
@@ -174,12 +174,12 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 0,
-            buffer: Bytes::from(vec![0, 1])
+            buffer: Bytes::from(vec![0, 1]),
         });
 
         buffer.push(WriteSlice {
             offset: 2,
-            buffer: Bytes::from(vec![2, 3])
+            buffer: Bytes::from(vec![2, 3]),
         });
 
         assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 2, 3]);
@@ -191,12 +191,12 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 0,
-            buffer: Bytes::from(vec![0, 1])
+            buffer: Bytes::from(vec![0, 1]),
         });
 
         buffer.push(WriteSlice {
             offset: 3,
-            buffer: Bytes::from(vec![3, 4])
+            buffer: Bytes::from(vec![3, 4]),
         });
 
         let slices = buffer.flush();
@@ -212,12 +212,12 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 10,
-            buffer: Bytes::from(vec![0, 1])
+            buffer: Bytes::from(vec![0, 1]),
         });
 
         buffer.push(WriteSlice {
             offset: 3,
-            buffer: Bytes::from(vec![2, 3])
+            buffer: Bytes::from(vec![2, 3]),
         });
 
         let slices = buffer.flush();
@@ -233,12 +233,12 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 3,
-            buffer: Bytes::from(vec![0, 1])
+            buffer: Bytes::from(vec![0, 1]),
         });
 
         buffer.push(WriteSlice {
             offset: 4,
-            buffer: Bytes::from(vec![2, 3])
+            buffer: Bytes::from(vec![2, 3]),
         });
 
         assert_eq!(collect_buffer(&mut buffer), vec![0, 2, 3]);
@@ -250,12 +250,12 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 3,
-            buffer: Bytes::from(vec![0, 1])
+            buffer: Bytes::from(vec![0, 1]),
         });
 
         buffer.push(WriteSlice {
             offset: 2,
-            buffer: Bytes::from(vec![2, 3])
+            buffer: Bytes::from(vec![2, 3]),
         });
 
         assert_eq!(collect_buffer(&mut buffer), vec![2, 3, 1]);
@@ -268,18 +268,17 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 0,
-            buffer: Bytes::from(vec![0, 1, 2])
+            buffer: Bytes::from(vec![0, 1, 2]),
         });
 
         buffer.push(WriteSlice {
             offset: 4,
-            buffer: Bytes::from(vec![3, 4])
+            buffer: Bytes::from(vec![3, 4]),
         });
-
 
         buffer.push(WriteSlice {
             offset: 2,
-            buffer: Bytes::from(vec![5, 6, 7])
+            buffer: Bytes::from(vec![5, 6, 7]),
         });
         assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 5, 6, 7, 4]);
     }
@@ -291,13 +290,13 @@ mod tests {
 
         buffer.push(WriteSlice {
             offset: 0,
-            buffer: Bytes::from(vec![0, 1, 2])
+            buffer: Bytes::from(vec![0, 1, 2]),
         });
 
         /* Even if it is overlapping, we account each write into the cost. */
         let flush = buffer.push(WriteSlice {
             offset: 0,
-            buffer: Bytes::from(vec![0, 1, 3])
+            buffer: Bytes::from(vec![0, 1, 3]),
         });
 
         {
@@ -311,7 +310,7 @@ mod tests {
         /* The cost should have been reset. */
         let flush = buffer.push(WriteSlice {
             offset: 4,
-            buffer: Bytes::from(vec![0, 1, 2])
+            buffer: Bytes::from(vec![0, 1, 2]),
         });
         assert!(flush.is_none());
     }
