@@ -182,7 +182,11 @@ impl Openfile {
         })
     }
 
-    #[tracing::instrument(skip(self), fields(ino = self.ino))]
+    #[tracing::instrument(
+        name = "openfile",
+        skip(self),
+        fields(ino = self.ino)
+    )]
     async fn run(mut self) {
         loop {
             let command = match self.commands.recv().await {
@@ -200,7 +204,7 @@ impl Openfile {
                         tracing::error!(
                             ino = self.ino,
                             ?result,
-                            "failed to asynchronosly write some data."
+                            "failed to asynchronously write some data."
                         );
                     }
                     self.write_error = self.write_error.or(result.err());
@@ -464,11 +468,14 @@ impl Openfile {
         slices: Flush<'_>,
     ) -> Result<(), DriverError> {
         if let Some(extent) = slices.extent() {
+            tracing::debug!(slices_len = slices.len(), "writing slices");
             driver.write(tx.into(), &slices).await?;
 
             let now = time::now();
             if extent.end > *cached_size {
                 *cached_size = extent.end;
+                tracing::debug!(cached_size = *cached_size, "size update");
+
                 tx.update(bucket, updates!(inode::update_size(now, ino, extent.end)))
                     .await?;
             } else {
@@ -482,6 +489,8 @@ impl Openfile {
 
     async fn request_mode(&mut self, new_mode: Mode) -> Result<(), DriverError> {
         let old_mode = std::mem::replace(&mut self.mode, new_mode);
+
+        tracing::debug!(?old_mode, ?new_mode, "new mode requested");
         match (old_mode, new_mode) {
             (Mode::Write, Mode::Read) => {
                 self.flush().await?;
@@ -497,6 +506,8 @@ impl Openfile {
         self.cached_size = 0;
 
         if let Some(txid) = self.cache_txid.take() {
+            tracing::debug!(?txid, "commiting");
+
             let mut connection = self.pool.acquire().await?;
             let tx = Transaction::from_raw(txid, &mut connection);
             tx.commit().await?;
@@ -510,6 +521,8 @@ impl Openfile {
         self.cached_size = 0;
 
         if let Some(txid) = self.cache_txid.take() {
+            tracing::debug!(?txid, "aborting");
+
             let mut connection = self.pool.acquire().await?;
             let tx = Transaction::from_raw(txid, &mut connection);
             tx.abort().await?;
@@ -518,9 +531,13 @@ impl Openfile {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn txid(&mut self) -> Result<TxId, DriverError> {
         match self.cache_txid.clone() {
-            Some(txid) => Ok(txid),
+            Some(txid) => {
+                tracing::debug!(?txid, "cached transaction");
+                Ok(txid)
+            },
             None => {
                 let mut connection = self.pool.acquire().await?;
                 let mut tx = DangleTx(connection.transaction().await?);
@@ -529,7 +546,10 @@ impl Openfile {
                 self.cached_size = inode::decode_size(self.ino, &mut reply, 0).ok_or(ENOENT)?;
                 self.driver.invalidate_cache()?;
 
-                Ok(tx.id())
+                let txid = tx.id();
+                self.cache_txid = Some(txid.clone());
+                tracing::debug!(?txid, self.cached_size, "up to date size");
+                Ok(txid)
             }
         }
     }

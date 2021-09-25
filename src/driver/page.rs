@@ -319,6 +319,7 @@ impl PageStore for PageCache {
             }
         };
 
+        tracing::debug!(hit, "cache lookup");
         if !hit {
             self.cache(key, bytes.clone())
         }

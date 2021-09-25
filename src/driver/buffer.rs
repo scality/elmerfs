@@ -262,7 +262,6 @@ mod tests {
     }
 
     #[test]
-
     fn test_overlap_in_between() {
         let mut buffer = WriteBuffer::new(64);
 
@@ -313,5 +312,19 @@ mod tests {
             buffer: Bytes::from(vec![0, 1, 2]),
         });
         assert!(flush.is_none());
+    }
+
+    #[test]
+    fn test_extent() {
+        let mut buffer = WriteBuffer::new(64);
+
+        buffer.push(WriteSlice {
+            offset: 0,
+            buffer: Bytes::from(vec![0, 1, 2]),
+        });
+
+
+        let flush = buffer.flush();
+        assert_eq!(flush.extent(), Some(0..6));
     }
 }

@@ -25,15 +25,10 @@ impl<K: Eq, T> Lru<K, T> {
         self.head_lru = 0;
     }
 
-    pub fn insert(&mut self, key: K, value: T) -> Option<T>
-    where
-        K: std::fmt::Debug,
-    {
-        tracing::debug!(?key, "insert");
+    pub fn insert(&mut self, key: K, value: T) -> Option<T> {
         match self.lookup(&key) {
             Some(old_value) => Some(std::mem::replace(old_value, value)),
             None => {
-                tracing::debug!(?key, "pushed");
                 self.push_entry(key, value);
                 None
             }
@@ -62,16 +57,7 @@ impl<K: Eq, T> Lru<K, T> {
         inserted_idx as u32
     }
 
-    pub fn lookup(&mut self, key: &K) -> Option<&mut T>
-    where
-        K: std::fmt::Debug,
-    {
-        let entries: Vec<_> = self
-            .entries
-            .iter()
-            .map(|e| (&e.key, e.previous_lru, e.next_lru))
-            .collect();
-        tracing::debug!(?key, ?entries, head = self.head_lru, "lookup");
+    pub fn lookup(&mut self, key: &K) -> Option<&mut T> {
         match self.lookup_idx(key) {
             Some(entry_idx) if entry_idx == self.head_lru => {
                 Some(&mut self.entries[entry_idx as usize].value)
