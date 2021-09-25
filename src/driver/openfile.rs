@@ -182,6 +182,7 @@ impl Openfile {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(ino = self.ino))]
     async fn run(mut self) {
         loop {
             let command = match self.commands.recv().await {
@@ -256,6 +257,10 @@ impl Openfile {
         }
     }
 
+    #[tracing::instrument(
+        skip(self, write_slice),
+        fields(offset = write_slice.offset, len = write_slice.buffer.len())
+    )]
     async fn handle_write(&mut self, write_slice: WriteSlice) -> Result<(), DriverError> {
         self.request_mode(Mode::Write).await?;
 
@@ -287,6 +292,7 @@ impl Openfile {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn handle_read(&mut self, offset: u64, len: u64) -> Result<Bytes, DriverError> {
         self.request_mode(Mode::Read).await?;
 
@@ -310,12 +316,14 @@ impl Openfile {
         Ok(output.freeze())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn handle_sync(&mut self) -> Result<(), DriverError> {
         self.request_mode(Mode::Write).await?;
         self.write_error.take().map(Err).unwrap_or(Ok(()))?;
         self.flush().await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn handle_write_attrs(
         &mut self,
         attrs: Box<WriteAttrsDesc>,
@@ -344,6 +352,8 @@ impl Openfile {
                 self.cached_size = new_size;
 
                 if old_size > new_size {
+                    tracing::debug!("truncate down");
+
                     self.driver
                         .truncate((&mut *tx).into(), new_size, old_size)
                         .await?;
