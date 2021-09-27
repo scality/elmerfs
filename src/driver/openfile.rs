@@ -300,13 +300,14 @@ impl Openfile {
     async fn handle_read(&mut self, offset: u64, len: u64) -> Result<Bytes, DriverError> {
         self.request_mode(Mode::Read).await?;
 
-        if offset > self.cached_size {
-            return Err(EINVAL);
-        }
-
         let pool = self.pool.clone();
         let mut connection = pool.acquire().await?;
         let txid = self.txid().await?;
+
+        if offset > self.cached_size {
+            tracing::warn!("reading past cached size");
+            return Err(EINVAL);
+        }
 
         let mut tx = DangleTx(Transaction::from_raw(txid, &mut connection));
 
