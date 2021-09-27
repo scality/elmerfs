@@ -97,10 +97,11 @@ impl WriteBuffer {
         }
 
         /* Remove all buffered write that we overwrote. */
-        if let Some(overlapping) = self.writes.get_mut(insert_idx + 1) {
-            assert!(overlapping.offset < write_end);
-            let split_off = (write_end - overlapping.offset) as usize;
-            overlapping.buffer = overlapping.buffer.split_off(split_off as usize);
+        if let Some(after) = self.writes.get_mut(insert_idx + 1) {
+            if after.offset < write_end {
+                let split_off = (write_end - after.offset) as usize;
+                after.buffer = after.buffer.split_off(split_off as usize);
+            }
         }
     }
 
@@ -183,6 +184,28 @@ mod tests {
         });
 
         assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_unordered_offsets() {
+        let mut buffer = WriteBuffer::new(64);
+
+        buffer.push(WriteSlice {
+            offset: 4,
+            buffer: Bytes::from(vec![0, 1]),
+        });
+
+        buffer.push(WriteSlice {
+            offset: 35,
+            buffer: Bytes::from(vec![2, 3]),
+        });
+
+        buffer.push(WriteSlice {
+            offset: 28,
+            buffer: Bytes::from(vec![3, 4]),
+        });
+
+        assert_eq!(collect_buffer(&mut buffer), vec![0, 1, 3, 4, 2, 3]);
     }
 
     #[test]
