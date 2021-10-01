@@ -1,10 +1,11 @@
+mod collections;
+pub mod config;
 mod driver;
 mod fs;
 mod key;
 mod model;
-mod view;
 mod time;
-mod collections;
+mod view;
 
 use crate::driver::Driver;
 use crate::fs::Elmerfs;
@@ -14,11 +15,11 @@ use std::io;
 use std::process::{Command, Stdio};
 use tracing::*;
 
-pub use crate::driver::{AddressBook, Config};
-pub use crate::key::Bucket;
+pub use crate::driver::AddressBook;
 pub use crate::driver::ListingFlavor;
+pub use crate::key::Bucket;
 pub use crate::view::View;
-
+pub use config::Config;
 
 /// There is two main thread of execution to follow:
 ///
@@ -29,20 +30,23 @@ pub use crate::view::View;
 /// The second one, the dispatcher thread, it takes fuse request and dispatch
 /// them into asynchronous tasks calling into the root of the filesystem,
 /// the Rp driver.
-pub fn run(cfg: Config, forced_view: Option<View>, mountpoint: &OsStr) {
+pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) {
     const RETRIES: u32 = 5;
 
-    let driver = task::block_on(Driver::new(cfg)).expect("driver init");
-
+    let driver = task::block_on(Driver::new(config.clone())).expect("driver init");
     let driver = Arc::new(driver);
-    let options = [
-        "-o", "fsname=rpfs",
-        "-o", "max_readahead=4804864",
-        "-o", "max_write=4804864",
-    ]
-        .iter()
-        .map(|o| o.as_ref())
-        .collect::<Vec<&OsStr>>();
+
+    let fuse_options: Vec<&OsStr> =
+        config
+            .fuse
+            .options
+            .iter()
+            .fold(Vec::new(), |mut options, (name, value)| {
+                options.push("-o".as_ref());
+                options.push(name.as_ref());
+                options.push(value.as_ref());
+                options
+            });
 
     for _ in 0..RETRIES {
         let _umount = UmountOnDrop::new(mountpoint);
@@ -51,7 +55,7 @@ pub fn run(cfg: Config, forced_view: Option<View>, mountpoint: &OsStr) {
             forced_view,
             driver: driver.clone(),
         };
-        match fuse::mount(fs, &mountpoint, &options) {
+        match fuse::mount(fs, &mountpoint, &fuse_options) {
             Ok(()) => break,
             Err(error) if error.kind() == io::ErrorKind::NotConnected => {
                 continue;

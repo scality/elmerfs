@@ -15,6 +15,7 @@ antidotec = { path = "antidotec" }
 fuse = "0.3"
 nix = "0.17"
 thiserror = "1.0"
+anyhow = "1.0"
 time = "0.1"
 tracing = "0.1.25"
 tracing-subscriber = { version = "0.2.16", features = ["env-filter"] }
@@ -22,9 +23,10 @@ tracing-appender = { version = "0.1" }
 clap = "2.33"
 crossbeam = "0.7"
 once_cell = "1.4"
-tracing-flame = { version = "0.1" }
 jemallocator = "0.3.0"
 async-trait = "0.1"
+toml = "0.5"
+serde = { version = "1.0", features = ["derive"] }
 
 [dependencies.tracing-futures]
 version = "0.2"

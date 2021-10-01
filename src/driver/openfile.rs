@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use crate::driver::{EBADFD, EINVAL, EIO, ENOENT};
 use crate::model::inode;
-use crate::time;
 use crate::Bucket;
+use crate::{time, Config};
 
 use super::buffer::{Flush, WriteBuffer, WriteSlice};
 use super::page::{PageCache, PageDriver};
 use super::pool::ConnectionPool;
-use super::{DriverError, PAGE_SIZE};
+use super::DriverError;
 
 #[derive(Debug)]
 struct OpenfileEntry {
@@ -26,15 +26,15 @@ struct OpenfileEntry {
 
 #[derive(Debug)]
 pub(crate) struct Openfiles {
-    bucket: Bucket,
+    config: Arc<Config>,
     connection_pool: Arc<ConnectionPool>,
     entries: HashMap<u64, OpenfileEntry>,
 }
 
 impl Openfiles {
-    pub(crate) fn new(bucket: Bucket, connection_pool: Arc<ConnectionPool>) -> Self {
+    pub(crate) fn new(config: Arc<Config>, connection_pool: Arc<ConnectionPool>) -> Self {
         Self {
-            bucket,
+            config,
             connection_pool,
             entries: HashMap::with_capacity(1024),
         }
@@ -45,10 +45,23 @@ impl Openfiles {
 
         match self.entries.entry(ino) {
             Entry::Vacant(entry) => {
-                let cache = PageCache::new(PAGE_SIZE * 16);
-                let driver = PageDriver::new(ino, self.bucket, PAGE_SIZE, cache);
-                let handle =
-                    Openfile::spawn(ino, self.bucket, driver, self.connection_pool.clone()).await?;
+                let cache = PageCache::new(self.config.driver.page_cache_capacity_b);
+                let driver = PageDriver::new(
+                    ino,
+                    self.config.bucket(),
+                    self.config.driver.page_size_b,
+                    cache,
+                );
+                let write_buffer = WriteBuffer::new(self.config.driver.gather_capacity_b);
+
+                let handle = Openfile::spawn(
+                    ino,
+                    self.config.bucket(),
+                    write_buffer,
+                    driver,
+                    self.connection_pool.clone(),
+                )
+                .await?;
 
                 Ok(entry
                     .insert(OpenfileEntry {
@@ -156,6 +169,7 @@ impl Openfile {
     pub async fn spawn(
         ino: u64,
         bucket: Bucket,
+        write_buffer: WriteBuffer,
         driver: PageDriver<PageCache>,
         pool: Arc<ConnectionPool>,
     ) -> Result<OpenfileHandle, DriverError> {
@@ -165,7 +179,7 @@ impl Openfile {
             bucket,
             ino,
             pool,
-            write_buffer: WriteBuffer::new(PAGE_SIZE),
+            write_buffer,
             cache_txid: None,
             cached_size: 0,
             driver,

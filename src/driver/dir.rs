@@ -14,13 +14,13 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub(super) struct DirDriver {
-    cfg: Config,
+    config: Arc<Config>,
     pool: Arc<ConnectionPool>,
 }
 
 impl DirDriver {
-    pub(super) fn new(cfg: Config, pool: Arc<ConnectionPool>) -> Self {
-        Self { cfg, pool }
+    pub(super) fn new(config: Arc<Config>, pool: Arc<ConnectionPool>) -> Self {
+        Self { config, pool }
     }
 
     pub(super) async fn decode_view(
@@ -69,7 +69,9 @@ impl DirDriver {
 
             let cleaned_entries = self.clean_loaded_entries(&entries[..], &entries_to_purge[..]);
 
-            let mut reply = tx.read(self.cfg.bucket, reads!(inode::read(ino))).await?;
+            let mut reply = tx
+                .read(self.config.bucket(), reads!(inode::read(ino)))
+                .await?;
             let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
             self.purge(tx, ino, &inode, &entries[..], entries_to_purge)
@@ -122,7 +124,7 @@ impl DirDriver {
 
         let mut children = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 directories.clone().map(|(_, d)| inode::read(d.ino)),
             )
             .await?;
@@ -183,16 +185,17 @@ impl DirDriver {
 
         for purged in purged {
             let entry = &entries[purged.idx];
-            let old_link = parent_inode
-                .links
-                .find(purged.ino, &entry.name)
-                .cloned();
+            let old_link = parent_inode.links.find(purged.ino, &entry.name).cloned();
 
             if old_link.is_none() {
-                tracing::warn!(?parent_inode, ?entry, "found an entry that wasn't referenced in parent inode.");
+                tracing::warn!(
+                    ?parent_inode,
+                    ?entry,
+                    "found an entry that wasn't referenced in parent inode."
+                );
             } else {
                 tx.update(
-                    self.cfg.bucket,
+                    self.config.bucket(),
                     updates!(
                         inode::remove_link(ts, entry.ino, old_link.unwrap()),
                         dentries::remove_entry(parent_ino, entry)

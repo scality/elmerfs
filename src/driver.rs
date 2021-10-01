@@ -16,7 +16,7 @@ use self::dir::DirDriver;
 use self::ino::InoGenerator;
 use self::openfile::{OpenfileHandle, Openfiles};
 use self::pool::ConnectionPool;
-use crate::key::Bucket;
+use crate::config::Config;
 use crate::model::{
     dentries,
     inode::{self, Owner},
@@ -61,7 +61,7 @@ macro_rules! transaction {
     };
 
     ($cfg:expr, $connection:expr, { shared: [$($shared:expr),*], exclusive: [$($excl:expr),*] }) => {{
-        if $cfg.locks {
+        if $cfg.driver.use_locks {
             $connection.transaction_with_locks(TransactionLocks {
                 shared: vec![$($shared.into()),*],
                 exclusive: vec![$($excl.into()),*]
@@ -98,16 +98,8 @@ impl DriverError {
 
 pub(crate) type Result<T> = std::result::Result<T, DriverError>;
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub bucket: Bucket,
-    pub addresses: Arc<AddressBook>,
-    pub locks: bool,
-    pub listing_flavor: dir::ListingFlavor,
-}
-
 pub(crate) struct Driver {
-    cfg: Config,
+    config: Arc<Config>,
     ino_counter: Arc<InoGenerator>,
     pool: Arc<ConnectionPool>,
     openfiles: Arc<Mutex<Openfiles>>,
@@ -115,26 +107,26 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
-    pub async fn new(cfg: Config) -> Result<Self> {
+    pub async fn new(config: Arc<Config>) -> Result<Self> {
         let pool = Arc::new(ConnectionPool::with_capacity(
-            cfg.addresses.clone(),
+            config.antidote.addresses.clone(),
             MAX_CONNECTIONS,
         ));
-        let openfiles = Arc::new(Mutex::new(Openfiles::new(cfg.bucket, pool.clone())));
+        let openfiles = Arc::new(Mutex::new(Openfiles::new(config.clone(), pool.clone())));
 
         let ino_counter = {
             let mut connection = pool.acquire().await?;
             let mut openfiles = openfiles.lock().await;
-            Self::make_root(&cfg, &mut *openfiles, &mut connection).await?;
-            let ino_counter = Self::load_ino_counter(&cfg, &mut connection).await?;
+            Self::make_root(&config, &mut *openfiles, &mut connection).await?;
+            let ino_counter = InoGenerator::load(&mut connection, config.bucket()).await?;
 
             ino_counter
         };
 
-        let dirs = DirDriver::new(cfg.clone(), pool.clone());
+        let dirs = DirDriver::new(config.clone(), pool.clone());
 
         Ok(Self {
-            cfg,
+            config,
             ino_counter: Arc::new(ino_counter),
             pool,
             openfiles,
@@ -143,25 +135,17 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(connection))]
-    async fn load_ino_counter(
-        cfg: &Config,
-        connection: &mut Connection,
-    ) -> Result<InoGenerator> {
-        let counter = InoGenerator::load(connection, cfg.bucket).await?;
-        Ok(counter)
-    }
-
-    #[tracing::instrument(skip(connection))]
     async fn make_root(
-        cfg: &Config,
+        config: &Config,
         openfiles: &mut Openfiles,
         connection: &mut Connection,
     ) -> Result<()> {
         let ts = time::now();
 
-        let mut tx = transaction!(cfg, connection, { exclusive: [inode::key(ROOT_INO)] }).await?;
+        let mut tx =
+            transaction!(config, connection, { exclusive: [inode::key(ROOT_INO)] }).await?;
 
-        match Self::attr_of(cfg, openfiles, &mut tx, ROOT_INO).await {
+        match Self::attr_of(config, openfiles, &mut tx, ROOT_INO).await {
             Ok(_) => {
                 tx.commit().await?;
                 return Ok(());
@@ -183,7 +167,7 @@ impl Driver {
             dotdot: Some(ROOT_INO),
         };
         tx.update(
-            cfg.bucket,
+            config.bucket(),
             updates!(
                 inode::create(ts, root),
                 dentries::create(View { uid: 0 }, ROOT_INO, ROOT_INO)
@@ -199,10 +183,10 @@ impl Driver {
     pub(crate) async fn getattr(&self, view: View, ino: u64) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
 
-        let mut tx = transaction!(self.cfg, connection, { shared: [inode::key(ino)] }).await?;
+        let mut tx = transaction!(self.config, connection, { shared: [inode::key(ino)] }).await?;
 
         let mut openfiles = self.openfiles.lock().await;
-        let attrs = Self::attr_of(&self.cfg, &mut openfiles, &mut tx, ino).await?;
+        let attrs = Self::attr_of(&self.config, &mut openfiles, &mut tx, ino).await?;
 
         let result = tx.commit().await;
 
@@ -232,21 +216,30 @@ impl Driver {
             let mut openfiles = self.openfiles.lock().await;
             let openfile = openfiles.open(ino).await?;
 
-            let result = openfile.write_attrs(Box::new(WriteAttrsDesc {
-                mode, uid, gid, size, atime, mtime
-            })).await;
+            let result = openfile
+                .write_attrs(Box::new(WriteAttrsDesc {
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    atime,
+                    mtime,
+                }))
+                .await;
 
             openfiles.close(ino).await?;
             return result;
         }
 
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { exclusive: [inode::key(ino)] }).await?;
+        let mut tx =
+            transaction!(self.config, connection, { exclusive: [inode::key(ino)] }).await?;
 
         let (inode, updates) = {
-            let mut reply = tx.read(self.cfg.bucket, vec![inode::read(ino)]).await?;
+            let mut reply = tx
+                .read(self.config.bucket(), vec![inode::read(ino)])
+                .await?;
             let mut inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
-
 
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
@@ -259,12 +252,12 @@ impl Driver {
                 size: None,
                 atime,
                 mtime,
-                owner: Some(inode.owner)
+                owner: Some(inode.owner),
             };
             (inode, inode::update_attrs(ino, updates))
         };
 
-        tx.update(self.cfg.bucket, updates!(updates)).await?;
+        tx.update(self.config.bucket(), updates!(updates)).await?;
         tx.commit().await?;
 
         Ok(inode.attr(ino))
@@ -278,13 +271,13 @@ impl Driver {
         name: &NameRef,
     ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             shared: [dentries::key(parent_ino)]
         })
         .await?;
 
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
+            .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
         let entries = self
@@ -295,7 +288,7 @@ impl Driver {
         let attr = match entries.get(&name) {
             Some(entry) => {
                 let mut openfiles = self.openfiles.lock().await;
-                Self::attr_of(&self.cfg, &mut *openfiles, &mut tx, entry.ino).await
+                Self::attr_of(&self.config, &mut *openfiles, &mut tx, entry.ino).await
             }
             None => Err(ENOENT),
         };
@@ -305,7 +298,7 @@ impl Driver {
     }
 
     async fn attr_of(
-        cfg: &Config,
+        config: &Config,
         openfiles: &mut Openfiles,
         tx: &mut Transaction<'_>,
         ino: u64,
@@ -319,8 +312,7 @@ impl Driver {
             return result;
         }
 
-
-        let mut reply = tx.read(cfg.bucket, vec![inode::read(ino)]).await?;
+        let mut reply = tx.read(config.bucket(), vec![inode::read(ino)]).await?;
 
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
         return Ok(inode.attr(ino));
@@ -345,11 +337,12 @@ impl Driver {
     ) -> Result<Vec<ReadDirEntry>> {
         assert!(offset >= 0);
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [dentries::key(ino)] }).await?;
+        let mut tx =
+            transaction!(self.config, connection, { shared: [dentries::key(ino)] }).await?;
 
         let mut reply = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 reads!(inode::read(ino), dentries::read(ino)),
             )
             .await?;
@@ -380,7 +373,7 @@ impl Driver {
         }
 
         let offset = offset.saturating_sub(2);
-        for entry in entries.iter_from(self.cfg.listing_flavor, offset as usize) {
+        for entry in entries.iter_from(self.config.driver.listing_flavor, offset as usize) {
             let entry = entry?;
 
             mapped_entries.push(ReadDirEntry {
@@ -411,7 +404,7 @@ impl Driver {
             .next(ino::Directory, &mut connection)
             .await?;
 
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             exclusive: [
                 inode::key(parent_ino),
                 dentries::key(parent_ino)
@@ -420,7 +413,7 @@ impl Driver {
         .await?;
 
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
+            .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
         /* 1. Check if the entry doesn't already exists. */
@@ -452,7 +445,7 @@ impl Driver {
         let dentry = dentries::Entry::new(name, ino);
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 inode::create(ts, desc),
                 dentries::add_entry(parent_ino, &dentry),
@@ -487,14 +480,14 @@ impl Driver {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             exclusive: [inode::key(parent_ino), dentries::key(parent_ino)]
         })
         .await?;
 
         let mut reply = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 reads!(inode::read(parent_ino), dentries::read(parent_ino)),
             )
             .await?;
@@ -507,7 +500,7 @@ impl Driver {
         let entry = parent_entries.get(&name).ok_or(ENOENT)?;
 
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(dentries::read(entry.ino)))
+            .read(self.config.bucket(), reads!(dentries::read(entry.ino)))
             .await?;
 
         let entries = self
@@ -524,7 +517,7 @@ impl Driver {
         let old_dotdot_link = parent_inode.links.find(entry.ino, &dotdot).unwrap();
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 dentries::remove_entry(parent_ino, &dentry_to_remove),
                 inode::remove_link(ts, parent_ino, old_dotdot_link.clone()),
@@ -553,7 +546,7 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let ino = self.ino_counter.next(ino::Regular, &mut connection).await?;
 
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             exclusive: [
                 inode::key(parent_ino),
                 dentries::key(parent_ino)
@@ -562,7 +555,7 @@ impl Driver {
         .await?;
 
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
+            .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
         let entries = self
@@ -584,7 +577,7 @@ impl Driver {
             dotdot: None,
         };
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             vec![
                 inode::create(ts, inode),
                 inode::touch(ts, parent_ino),
@@ -617,7 +610,7 @@ impl Driver {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             exclusive: [
                 inode::key(parent_ino),
                 dentries::key(parent_ino)
@@ -627,7 +620,7 @@ impl Driver {
 
         /* 1. Get the entry to unlink. */
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
+            .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
         let entries = self
@@ -640,7 +633,7 @@ impl Driver {
         /* 2. Get the inode to remove the link with the view that it was
         created from. */
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(inode::read(entry.ino)))
+            .read(self.config.bucket(), reads!(inode::read(entry.ino)))
             .await?;
 
         let inode = inode::decode(entry.ino, &mut reply, 0).ok_or(ENOENT)?;
@@ -651,7 +644,7 @@ impl Driver {
             .ok_or(ENOENT)?;
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 dentries::remove_entry(parent_ino, &dentry_to_remove),
                 inode::remove_link(ts, entry.ino, link)
@@ -662,8 +655,8 @@ impl Driver {
         tx.commit().await?;
 
         /* Unfortunately, this is not atomic, the truncate is not part of the same transaction. On the other hand
-           we have currently no means of preventing concurrent modification on the inode. So let's clear it on a best effort
-           basis as a simpler implementation. */
+        we have currently no means of preventing concurrent modification on the inode. So let's clear it on a best effort
+        basis as a simpler implementation. */
         if inode.links.nlink() - 1 == 0 {
             let mut openfiles = self.openfiles.lock().await;
             let openfile = openfiles.open(entry.ino).await?;
@@ -707,12 +700,7 @@ impl Driver {
     #[tracing::instrument(skip(self, buffer), fields(offset, len = buffer.len()))]
     pub(crate) async fn write(&self, fh: FileHandle, buffer: Bytes, offset: u64) -> Result<()> {
         let openfile = self.openfile(fh).await?;
-        openfile
-            .write(WriteSlice {
-                buffer,
-                offset,
-            })
-            .await
+        openfile.write(WriteSlice { buffer, offset }).await
     }
 
     pub(crate) async fn read(&self, fh: FileHandle, offset: u64, len: u32) -> Result<Bytes> {
@@ -749,7 +737,7 @@ impl Driver {
         to determine the kind of rename that we are dealing with. */
         let mut reply = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 reads!(dentries::read(parent_ino), dentries::read(new_parent_ino)),
             )
             .await?;
@@ -810,7 +798,9 @@ impl Driver {
         let ts = time::now();
 
         let ino = state.entry.ino;
-        let mut reply = tx.read(self.cfg.bucket, reads!(inode::read(ino))).await?;
+        let mut reply = tx
+            .read(self.config.bucket(), reads!(inode::read(ino)))
+            .await?;
 
         let inode = inode::decode(ino, &mut reply, 0).ok_or(ENOENT)?;
 
@@ -826,7 +816,7 @@ impl Driver {
         let new_link = inode::Link::new(state.new_parent_ino, dentry_to_add.name.clone());
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 dentries::remove_entry(state.parent_ino, &dentry_to_remove),
                 dentries::add_entry(state.new_parent_ino, &dentry_to_add),
@@ -855,7 +845,7 @@ impl Driver {
 
         /* 1. Read the target inode to remove the link in the target directory. */
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(inode::read(target.ino)))
+            .read(self.config.bucket(), reads!(inode::read(target.ino)))
             .await?;
         let target_inode = inode::decode(target.ino, &mut reply, 0).ok_or(ENOENT)?;
 
@@ -869,7 +859,7 @@ impl Driver {
                 .unwrap();
 
             tx.update(
-                self.cfg.bucket,
+                self.config.bucket(),
                 updates!(
                     inode::remove_link(ts, target.ino, link),
                     dentries::remove_entry(state.new_parent_ino, &dentry_to_remove)
@@ -878,7 +868,7 @@ impl Driver {
             .await?;
         } else {
             tx.update(
-                self.cfg.bucket,
+                self.config.bucket(),
                 updates!(
                     inode::remove(target.ino),
                     symlink::remove(target.ino),
@@ -921,7 +911,7 @@ impl Driver {
         /* 1. Fetch target dentries to check if the destination is empty. */
         let mut reply = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 reads!(
                     inode::read(state.new_parent_ino),
                     dentries::read(target.ino)
@@ -953,7 +943,7 @@ impl Driver {
         the new directory. */
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 inode::remove(target.ino),
                 dentries::remove(target.ino),
@@ -977,7 +967,7 @@ impl Driver {
         let ino = state.entry.ino;
         let mut reply = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 reads!(inode::read(state.entry.ino), inode::read(state.parent_ino)),
             )
             .await?;
@@ -1012,7 +1002,7 @@ impl Driver {
         we delete the old entries, then we create the new ones. We are
         still inside a unique transaction, we shoud be safe. */
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 dentries::remove_entry(state.parent_ino, &old_dentry),
                 inode::unlink_from_parent(ts, ino, old_link.clone()),
@@ -1022,7 +1012,7 @@ impl Driver {
         .await?;
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 dentries::add_entry(state.new_parent_ino, &new_dentry),
                 inode::link_to_parent(ts, ino, state.new_parent_ino, new_link),
@@ -1045,7 +1035,7 @@ impl Driver {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             exclusive: [
                 inode::key(ino),
                 inode::key(new_parent_ino),
@@ -1057,7 +1047,7 @@ impl Driver {
         /* 1. Check if an entry exist with the same name. */
         let mut reply = tx
             .read(
-                self.cfg.bucket,
+                self.config.bucket(),
                 reads!(inode::read(ino), dentries::read(new_parent_ino)),
             )
             .await?;
@@ -1077,7 +1067,7 @@ impl Driver {
         let new_link = inode::Link::new(new_parent_ino, new_name);
 
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates!(
                 inode::touch(ts, new_parent_ino),
                 dentries::add_entry(new_parent_ino, &new_dentry),
@@ -1099,9 +1089,11 @@ impl Driver {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn read_link(&self, view: View, ino: u64) -> Result<String> {
         let mut connection = self.pool.acquire().await?;
-        let mut tx = transaction!(self.cfg, connection, { shared: [symlink::key(ino)] }).await?;
+        let mut tx = transaction!(self.config, connection, { shared: [symlink::key(ino)] }).await?;
 
-        let mut reply = tx.read(self.cfg.bucket, reads!(symlink::read(ino))).await?;
+        let mut reply = tx
+            .read(self.config.bucket(), reads!(symlink::read(ino)))
+            .await?;
 
         let link = symlink::decode(&mut reply, 0).ok_or(ENOENT)?;
 
@@ -1123,7 +1115,7 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let ino = self.ino_counter.next(ino::Symlink, &mut connection).await?;
 
-        let mut tx = transaction!(self.cfg, connection, {
+        let mut tx = transaction!(self.config, connection, {
             exclusive: [
                 inode::key(parent_ino),
                 dentries::key(parent_ino)
@@ -1135,7 +1127,7 @@ impl Driver {
 
         /* 1. Check if the entry exists. */
         let mut reply = tx
-            .read(self.cfg.bucket, reads!(dentries::read(parent_ino)))
+            .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
         let entries = self
@@ -1160,7 +1152,7 @@ impl Driver {
             dotdot: None,
         };
         tx.update(
-            self.cfg.bucket,
+            self.config.bucket(),
             updates![
                 inode::create(ts, inode),
                 inode::touch(ts, parent_ino),
@@ -1205,7 +1197,7 @@ impl Driver {
 
             let mut reply = tx
                 .read(
-                    self.cfg.bucket,
+                    self.config.bucket(),
                     reads!(inode::read(lhs_parent), inode::read(rhs_parent)),
                 )
                 .await?;
