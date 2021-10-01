@@ -131,7 +131,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Mode {
     Idle,
     Write,
@@ -469,7 +469,7 @@ impl Openfile {
         slices: Flush<'_>,
     ) -> Result<(), DriverError> {
         if let Some(extent) = slices.extent() {
-            tracing::debug!(slices_len = slices.len(), "writing slices");
+            tracing::debug!(slices_len = slices.len(), ?extent, "writing slices");
             driver.write(tx.into(), &slices).await?;
 
             let now = time::now();
@@ -490,6 +490,10 @@ impl Openfile {
 
     async fn request_mode(&mut self, new_mode: Mode) -> Result<(), DriverError> {
         let old_mode = std::mem::replace(&mut self.mode, new_mode);
+
+        if old_mode == new_mode {
+            return Ok(());
+        }
 
         tracing::debug!(?old_mode, ?new_mode, "new mode requested");
         match (old_mode, new_mode) {
@@ -536,9 +540,9 @@ impl Openfile {
     async fn txid(&mut self) -> Result<TxId, DriverError> {
         match self.cache_txid.clone() {
             Some(txid) => {
-                tracing::debug!(?txid, "cached transaction");
+                tracing::debug!(?txid, self.cached_size, "using cached tx.");
                 Ok(txid)
-            },
+            }
             None => {
                 let mut connection = self.pool.acquire().await?;
                 let mut tx = DangleTx(connection.transaction().await?);
@@ -549,7 +553,7 @@ impl Openfile {
 
                 let txid = tx.id();
                 self.cache_txid = Some(txid.clone());
-                tracing::debug!(?txid, self.cached_size, "up to date size");
+                tracing::debug!(?txid, self.cached_size, "tx cached.");
                 Ok(txid)
             }
         }

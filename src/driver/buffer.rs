@@ -19,7 +19,7 @@ pub struct WriteBuffer {
     cost_threshold: u64,
     cost: u64,
     start_offset: u64,
-    len: u64,
+    end_offset: u64,
     writes: Vec<WriteSlice>,
 }
 
@@ -29,7 +29,7 @@ impl WriteBuffer {
             writes: Vec::with_capacity((bytes_threshold / FUSE_MAX_WRITE).max(1) as usize),
             cost: 0,
             cost_threshold: bytes_threshold,
-            len: 0,
+            end_offset: 0,
             start_offset: 0,
         }
     }
@@ -39,7 +39,7 @@ impl WriteBuffer {
         let write_offset = write.offset;
         let write_len = write.buffer.len();
 
-        if write.offset >= self.start_offset + self.len {
+        if write.offset >= self.end_offset {
             self.writes.push(write);
         } else if write_end <= self.start_offset {
             self.writes.insert(0, write);
@@ -48,7 +48,7 @@ impl WriteBuffer {
         }
 
         self.cost += write_len as u64;
-        self.len = self.len.max(write_end);
+        self.end_offset = self.end_offset.max(write_end);
 
         /* The current start_offset value only make sense if there is at least another write slice. */
         self.start_offset = if self.writes.len() > 1 {
@@ -112,7 +112,7 @@ impl WriteBuffer {
     fn clear(&mut self) {
         self.writes.clear();
         self.cost = 0;
-        self.len = 0;
+        self.end_offset = 0;
         self.start_offset = 0;
     }
 }
@@ -124,8 +124,14 @@ pub struct Flush<'a> {
 
 impl Flush<'_> {
     pub fn extent(&self) -> Option<Range<u64>> {
-        if self.inner.len > 0 {
-            Some(self.inner.start_offset..(self.inner.start_offset + self.inner.len))
+        let len = self
+            .inner
+            .end_offset
+            .checked_sub(self.inner.start_offset)
+            .expect("end > start");
+
+        if len > 0 {
+            Some(self.inner.start_offset..self.inner.end_offset)
         } else {
             None
         }
@@ -342,12 +348,21 @@ mod tests {
         let mut buffer = WriteBuffer::new(64);
 
         buffer.push(WriteSlice {
-            offset: 0,
+            offset: 2,
             buffer: Bytes::from(vec![0, 1, 2]),
         });
 
+        buffer.push(WriteSlice {
+            offset: 4,
+            buffer: Bytes::from(vec![0, 1, 2]),
+        });
+
+        buffer.push(WriteSlice {
+            offset: 7,
+            buffer: Bytes::from(vec![0, 1, 2]),
+        });
 
         let flush = buffer.flush();
-        assert_eq!(flush.extent(), Some(0..6));
+        assert_eq!(flush.extent(), Some(2..10));
     }
 }
