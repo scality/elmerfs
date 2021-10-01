@@ -1,3 +1,6 @@
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use clap::{App, Arg};
 use elmerfs::{self, AddressBook, Bucket, Config, View};
 use std::sync::Arc;
