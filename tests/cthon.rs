@@ -1,4 +1,4 @@
-use elmerfs::{AddressBook, UmountOnDrop, Bucket, Config, View, ListingFlavor};
+use elmerfs::{ UmountOnDrop, config, View};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -13,8 +13,6 @@ use tracing_subscriber::{self, filter::EnvFilter};
 /* Run test as if they were on the behalf of the root user */
 const TEST_VIEW: View = View { uid: 0 };
 const CHTON_PATH: &str = "vendor/cthon04/";
-const CTHON_BASIC_BUCKET: Bucket = Bucket::new(0);
-const ANTIDOTE_URL: &str = "127.0.0.1:8101";
 
 fn setup_logging() {
     let filter = EnvFilter::try_from_default_env()
@@ -31,21 +29,14 @@ fn setup_logging() {
 fn cthon_basic() {
     setup_logging();
 
-    let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
-    let cfg = Config {
-        listing_flavor: ListingFlavor::FullyQualified,
-        bucket: CTHON_BASIC_BUCKET,
-        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
-            ANTIDOTE_URL,
-        )])),
-        locks: true,
-    };
-    fs::create_dir_all(&tests_dir.path()).expect("failed ot create test mountpoint");
+    let tests_dir = tempfile::tempdir().expect("tmp mountpoint");
+    let cfg = config::load("./tests/chton.elmerfs.toml").expect("config loaded");
+    fs::create_dir_all(&tests_dir.path()).expect("test dirs created");
     info!(workdir = ?tests_dir.path().as_os_str());
 
     let tests_dir_path = OsString::from(tests_dir.path().as_os_str());
     let umount = UmountOnDrop::new(&tests_dir_path);
-    let rpfs_thread = thread::spawn(move || elmerfs::run(cfg, Some(TEST_VIEW), &tests_dir_path));
+    let rpfs_thread = thread::spawn(move || elmerfs::run(Arc::new(cfg), Some(TEST_VIEW), &tests_dir_path));
 
     thread::sleep(Duration::from_secs(5));
     let bin_dir = Path::new(CHTON_PATH).join("basic");
@@ -67,22 +58,14 @@ fn cthon_basic() {
 fn cthon_general() {
     setup_logging();
 
-    let tests_dir = tempfile::tempdir().expect("failed to create mountpoint tmpdir");
-    let cfg = Config {
-        listing_flavor: ListingFlavor::FullyQualified,
-        bucket: CTHON_BASIC_BUCKET,
-        addresses: Arc::new(AddressBook::with_addresses(vec![String::from(
-            ANTIDOTE_URL,
-        )])),
-        locks: true,
-    };
-
-    fs::create_dir_all(&tests_dir.path()).expect("failed ot create test mountpoint");
+    let tests_dir = tempfile::tempdir().expect("tmp mountpoint");
+    let cfg = config::load("./tests/chton.elmerfs.toml").expect("config loaded");
+    fs::create_dir_all(&tests_dir.path()).expect("test dirs created");
     info!(workdir = ?tests_dir.path().as_os_str());
 
     let tests_dir_path = OsString::from(tests_dir.path().as_os_str());
     let umount = UmountOnDrop::new(&tests_dir_path);
-    let rpfs_thread = thread::spawn(move || elmerfs::run(cfg, Some(TEST_VIEW), &tests_dir_path));
+    let rpfs_thread = thread::spawn(move || elmerfs::run(Arc::new(cfg), Some(TEST_VIEW), &tests_dir_path));
 
     thread::sleep(Duration::from_secs(5));
     let bin_dir = Path::new(CHTON_PATH).join("general");

@@ -8,15 +8,16 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::driver::{EBADFD, EINVAL, EIO, ENOENT};
-use crate::model::inode;
-use crate::Bucket;
-use crate::{time, Config};
-
 use super::buffer::{Flush, WriteBuffer, WriteSlice};
 use super::page::{PageCache, PageDriver};
 use super::pool::ConnectionPool;
 use super::DriverError;
+use crate::driver::{EBADFD, EINVAL, EIO, ENOENT};
+use crate::model::inode::{self, Ino};
+use crate::Bucket;
+use crate::{time, Config};
+
+type Fh = Ino;
 
 #[derive(Debug)]
 struct OpenfileEntry {
@@ -28,7 +29,7 @@ struct OpenfileEntry {
 pub(crate) struct Openfiles {
     config: Arc<Config>,
     connection_pool: Arc<ConnectionPool>,
-    entries: HashMap<u64, OpenfileEntry>,
+    entries: HashMap<Ino, OpenfileEntry>,
 }
 
 impl Openfiles {
@@ -40,7 +41,7 @@ impl Openfiles {
         }
     }
 
-    pub async fn open(&mut self, ino: u64) -> Result<OpenfileHandle, DriverError> {
+    pub async fn open(&mut self, ino: Ino) -> Result<OpenfileHandle, DriverError> {
         use std::collections::hash_map::Entry;
 
         match self.entries.entry(ino) {
@@ -79,19 +80,19 @@ impl Openfiles {
         }
     }
 
-    pub fn get(&self, fh: u64) -> Result<OpenfileHandle, DriverError> {
+    pub fn get(&self, fh: Fh) -> Result<OpenfileHandle, DriverError> {
         self.entries
             .get(&fh)
             .ok_or(EBADFD)
             .map(|e| e.handle.clone())
     }
 
-    pub async fn close(&mut self, fh: u64) -> Result<(), DriverError> {
+    pub async fn close(&mut self, fh: Fh) -> Result<(), DriverError> {
         use std::collections::hash_map::Entry;
 
         match self.entries.entry(fh) {
             Entry::Vacant(_) => {
-                tracing::error!(ino = fh, "Closing an already closed file.");
+                tracing::error!(ino = ?fh, "Closing an already closed file.");
                 Err(EIO)
             }
             Entry::Occupied(mut entry) => {
@@ -153,7 +154,7 @@ enum Mode {
 
 struct Openfile {
     bucket: Bucket,
-    ino: u64,
+    ino: Ino,
     pool: Arc<ConnectionPool>,
     write_buffer: WriteBuffer,
     cache_txid: Option<TxId>,
@@ -167,7 +168,7 @@ struct Openfile {
 
 impl Openfile {
     pub async fn spawn(
-        ino: u64,
+        ino: Ino,
         bucket: Bucket,
         write_buffer: WriteBuffer,
         driver: PageDriver<PageCache>,
@@ -199,14 +200,14 @@ impl Openfile {
     #[tracing::instrument(
         name = "openfile",
         skip(self),
-        fields(ino = self.ino)
+        fields(ino = display(self.ino))
     )]
     async fn run(mut self) {
         loop {
             let command = match self.commands.recv().await {
                 Ok(command) => command,
                 Err(_) => {
-                    tracing::warn!(ino = self.ino, "no more openfile clients. Exiting.");
+                    tracing::warn!("no more openfile clients. Exiting.");
                     break;
                 }
             };
@@ -215,11 +216,7 @@ impl Openfile {
                 Command::Write { payload } => {
                     let result = self.handle_write(payload).await;
                     if result.is_err() {
-                        tracing::error!(
-                            ino = self.ino,
-                            ?result,
-                            "failed to asynchronously write some data."
-                        );
+                        tracing::error!(?result, "failed to asynchronously write some data.");
                     }
                     self.write_error = self.write_error.or(result.err());
                 }
@@ -266,11 +263,7 @@ impl Openfile {
                 .await;
 
             if let Err(truncate_error) = result {
-                tracing::error!(
-                    ino = self.ino,
-                    ?truncate_error,
-                    "failed to clear data on exit."
-                );
+                tracing::error!(?truncate_error, "failed to clear data on exit.");
             }
         }
     }
@@ -475,7 +468,7 @@ impl Openfile {
     }
 
     async fn write_slices_and_update_size(
-        ino: u64,
+        ino: Ino,
         bucket: Bucket,
         tx: &mut Transaction<'_>,
         driver: &mut PageDriver<PageCache>,
@@ -576,12 +569,12 @@ impl Openfile {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenfileHandle {
-    ino: u64,
+    ino: Ino,
     sender: Sender<Command>,
 }
 
 impl OpenfileHandle {
-    pub(crate) fn fh(&self) -> u64 {
+    pub(crate) fn fh(&self) -> Fh {
         self.ino
     }
 
@@ -642,7 +635,10 @@ impl OpenfileHandle {
         match receiver.recv().await {
             Ok(result) => result,
             Err(_) => {
-                tracing::error!(ino = self.ino, "response channel closed. Replying EIO.");
+                tracing::error!(
+                    ino = display(self.ino),
+                    "response channel closed. Replying EIO."
+                );
                 Err(EIO)
             }
         }

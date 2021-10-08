@@ -53,7 +53,8 @@ fn main() -> Result<(), anyhow::Error> {
     });
 
     let config = Arc::new(elmerfs::config::load(&Path::new(config_path))?);
-    elmerfs::run(config, forced_view, mountpoint);
+    tracing::info!(?config, "Config loaded.");
 
+    elmerfs::run(config, forced_view, mountpoint);
     Ok(())
 }

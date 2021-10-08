@@ -1,6 +1,7 @@
 use crate::collections::Lru;
 use crate::driver::Result;
 use crate::key::{Bucket, KeyWriter, Ty};
+use crate::model::inode::Ino;
 use antidotec::{lwwreg, Bytes, BytesMut, RawIdent, Transaction};
 use async_trait::async_trait;
 use std::hash::Hash;
@@ -38,14 +39,14 @@ impl<'a, 'conn> From<&'a mut Transaction<'conn>> for TransactionHandle<'a, 'conn
 }
 
 pub(crate) struct PageDriver<S: PageStore> {
-    ino: u64,
+    ino: Ino,
     bucket: Bucket,
     page_size: u64,
     store: S,
 }
 
 impl<S: PageStore> PageDriver<S> {
-    pub fn new(ino: u64, bucket: Bucket, page_size: u64, store: S) -> Self {
+    pub fn new(ino: Ino, bucket: Bucket, page_size: u64, store: S) -> Self {
         Self {
             ino,
             bucket,
@@ -209,12 +210,12 @@ fn normalize_slices(slices: &[WriteSlice], page_size: u64) -> Vec<WriteSlice> {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
-    pub ino: u64,
+    pub ino: Ino,
     pub page: u64,
 }
 
 impl Key {
-    pub fn new(ino: u64, page: u64) -> Self {
+    pub fn new(ino: Ino, page: u64) -> Self {
         Key { ino, page }
     }
 
@@ -226,7 +227,7 @@ impl Key {
 impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
         KeyWriter::with_capacity(Ty::Page, Self::byte_len())
-            .write_u64(self.ino)
+            .write_u64(self.ino.into())
             .write_u64(self.page)
             .into()
     }
@@ -375,9 +376,10 @@ impl PageStore for PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::inode::Ino;
     use std::collections::HashMap;
 
-    const INO: u64 = 0x1;
+    const INO: Ino = Ino(0x1);
     const PAGE_SIZE: u64 = 4;
 
     struct HashPageStore {

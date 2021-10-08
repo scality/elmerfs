@@ -1,70 +1,42 @@
-use crate::key::{Bucket, KeyWriter, Ty};
-use antidotec::{lwwreg, Connection, Error, RawIdent, TransactionLocks};
-use std::ops::Range;
+use crate::{
+    key::{KeyWriter, Ty},
+    Config,
+    model::inode::{Ino, InodeKind, InoDesc}
+};
+use antidotec::{lwwreg, Connection, Error, RawIdent};
 use async_std::sync::Mutex;
-use std::mem;
+use std::{ops::Range, sync::Arc};
 
-const BATCH_SIZE: u64 = 1 << 16;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum InodeKind {
-    Regular = 0,
-    Directory = 1,
-    Symlink = 2,
-}
-
-
-pub use self::InodeKind::*;
-
-pub fn with_kind(kind: InodeKind, id: u64) -> u64 {
-    assert!(id < (1 << (64 - 8*mem::size_of::<InodeKind>())));
-
-    (id << 8*mem::size_of::<InodeKind>()) | kind as u64
-}
-
-pub fn kind(ino: u64) -> InodeKind {
-    let x = ino & ((1 << 8*mem::size_of::<InodeKind>()) - 1) as u64;
-
-    match x {
-        _ if ino == 1 => InodeKind::Directory,
-        0 => InodeKind::Regular,
-        1 => InodeKind::Directory,
-        2 => InodeKind::Symlink,
-        _ => unreachable!(),
-    }
-}
-
-pub fn file_type(ino: u64) -> fuse::FileType {
-    match self::kind(ino) {
-        InodeKind::Regular => fuse::FileType::RegularFile,
-        InodeKind::Directory => fuse::FileType::Directory,
-        InodeKind::Symlink => fuse::FileType::Symlink,
-    }
-}
+const RANGE_SIZE: u64 = 1024;
 
 #[derive(Debug)]
 pub struct InoGenerator {
-    bucket: Bucket,
+    config: Arc<Config>,
     range: Mutex<Range<u64>>,
 }
 
 impl InoGenerator {
-    pub async fn load(connection: &mut Connection, bucket: Bucket) -> Result<Self, Error> {
-        let (next, max) = Self::allocate_range(connection, bucket).await?;
+    pub async fn load(connection: &mut Connection, config: Arc<Config>) -> Result<Self, Error> {
+        let (next, max) = Self::allocate_range(&config, connection).await?;
 
         Ok(Self {
-            bucket,
+            config,
             range: Mutex::new(next..max),
         })
     }
 
-    pub async fn next(&self, kind: InodeKind, connection: &mut Connection) -> Result<u64, Error> {
-        let ino = self.next_id(connection).await?;
-        Ok(self::with_kind(kind, ino))
+    pub async fn next(&self, kind: InodeKind, connection: &mut Connection) -> Result<Ino, Error> {
+        let sequence = self.next_sequence(connection).await?;
+        let ino_desc = InoDesc {
+            cluster_id: self.config.cluster_id,
+            node_id: self.config.node_id,
+            kind,
+            sequence
+        };
+        Ok(Ino::encode(ino_desc))
     }
 
-    pub async fn next_id(&self, connection: &mut Connection) -> Result<u64, Error> {
+    pub async fn next_sequence(&self, connection: &mut Connection) -> Result<u64, Error> {
         let mut range = self.range.lock().await;
 
         let found = loop {
@@ -72,7 +44,7 @@ impl InoGenerator {
             *range = next..range.end;
 
             if next >= range.end {
-                let (next, max) = Self::allocate_range(connection, self.bucket).await?;
+                let (next, max) = Self::allocate_range(&self.config, connection).await?;
                 *range = next..max;
             } else {
                 break next;
@@ -83,29 +55,27 @@ impl InoGenerator {
     }
 
     pub async fn allocate_range(
+        config: &Config,
         connection: &mut Connection,
-        bucket: Bucket,
     ) -> Result<(u64, u64), Error> {
-        let mut tx = connection
-            .transaction_with_locks(TransactionLocks {
-                exclusive: vec![key().into()],
-                shared: vec![],
-            })
-            .await?;
+        let mut tx = connection.transaction().await?;
+        let key = key(config.cluster_id, config.node_id);
 
-        let mut reply = tx.read(bucket, vec![lwwreg::get(key())]).await?;
+        let mut reply = tx.read(config.bucket(), vec![lwwreg::get(key)]).await?;
         let result = match reply.lwwreg(0) {
             None => {
                 let next = 2;
-                let max = next + BATCH_SIZE;
-                tx.update(bucket, vec![lwwreg::set_u64(key(), max)]).await?;
+                let max = next + RANGE_SIZE;
+                tx.update(config.bucket(), vec![lwwreg::set_u64(key, max)])
+                    .await?;
 
                 (next, max)
             }
             Some(previous_max) => {
                 let next = lwwreg::read_u64(&previous_max);
-                let max = next + BATCH_SIZE;
-                tx.update(bucket, vec![lwwreg::set_u64(key(), max)]).await?;
+                let max = next + RANGE_SIZE;
+                tx.update(config.bucket(), vec![lwwreg::set_u64(key, max)])
+                    .await?;
 
                 (next, max)
             }
@@ -117,20 +87,29 @@ impl InoGenerator {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct Key {}
+pub struct Key {
+    cluster_id: u8,
+    node_id: u8,
+}
 
 impl Key {
-    fn new() -> Self {
-        Self {}
+    fn new(cluster_id: u8, node_id: u8) -> Self {
+        Self {
+            cluster_id,
+            node_id,
+        }
     }
 }
 
-pub fn key() -> Key {
-    Key::new()
+pub fn key(cluster_id: u8, node_id: u8) -> Key {
+    Key::new(cluster_id, node_id)
 }
 
 impl Into<RawIdent> for Key {
     fn into(self) -> RawIdent {
-        KeyWriter::with_capacity(Ty::InoCounter, 0).into()
+        KeyWriter::with_capacity(Ty::InoCounter, 2)
+            .write_u8(self.cluster_id)
+            .write_u8(self.node_id)
+            .into()
     }
 }

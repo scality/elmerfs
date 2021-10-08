@@ -1,7 +1,7 @@
-use crate::driver::ino;
 use crate::driver::pool::ConnectionPool;
 use crate::driver::{Config, Result, ENOENT};
-use crate::model::{dentries, inode};
+use crate::model::inode::{self, Ino};
+use crate::model::dentries;
 use crate::time;
 use crate::view::View;
 use crate::view::{Name, NameRef};
@@ -27,7 +27,7 @@ impl DirDriver {
         &self,
         view: View,
         tx: &mut Transaction<'_>,
-        ino: u64,
+        ino: Ino,
         reply: &mut antidotec::ReadReply,
         index: usize,
     ) -> Result<DirView> {
@@ -40,7 +40,7 @@ impl DirDriver {
         view: View,
         tx: &mut Transaction<'_>,
         mut entries: Vec<dentries::Entry>,
-        ino: u64,
+        ino: Ino,
     ) -> Result<DirView> {
         entries.sort();
 
@@ -90,22 +90,21 @@ impl DirDriver {
         sorted_entries: &[dentries::Entry],
         duplicates: &mut Vec<PurgeEntry>,
     ) {
-        let mut previous_ino = 0; /* 0 is an ino number that cannot appear. */
+        let mut previous_ino = None; /* 0 is an ino number that cannot appear. */
 
         tracing::debug!(?sorted_entries, "sorted");
-        let directories = sorted_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| ino::kind(e.ino) == ino::Directory && !Self::is_dot(&e.name.prefix));
+        let directories = sorted_entries.iter().enumerate().filter(|(_, e)| {
+            inode::kind(e.ino) == inode::Directory && !Self::is_dot(&e.name.prefix)
+        });
 
         for (idx, entry) in directories {
-            if entry.ino == previous_ino {
+            if Some(entry.ino) == previous_ino {
                 duplicates.push(PurgeEntry {
                     idx,
                     ino: entry.ino,
                 });
             } else {
-                previous_ino = entry.ino;
+                previous_ino = Some(entry.ino);
             }
         }
     }
@@ -113,14 +112,13 @@ impl DirDriver {
     async fn check_directory_parent_ino(
         &self,
         tx: &mut Transaction<'_>,
-        parent_ino: u64,
+        parent_ino: Ino,
         sorted_entries: &[dentries::Entry],
         invalid: &mut Vec<PurgeEntry>,
     ) -> Result<()> {
-        let directories = sorted_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| ino::kind(e.ino) == ino::Directory && !Self::is_dot(&e.name.prefix));
+        let directories = sorted_entries.iter().enumerate().filter(|(_, e)| {
+            inode::kind(e.ino) == inode::Directory && !Self::is_dot(&e.name.prefix)
+        });
 
         let mut children = tx
             .read(
@@ -133,7 +131,7 @@ impl DirDriver {
             let child_inode = inode::decode(entry.ino, &mut children, query_idx).ok_or(ENOENT)?;
 
             if child_inode.dotdot != Some(parent_ino) {
-                tracing::debug!(?child_inode, parent_ino, "invalid parent_ino");
+                tracing::debug!(?child_inode, ?parent_ino, "invalid parent_ino");
 
                 invalid.push(PurgeEntry {
                     idx,
@@ -157,7 +155,7 @@ impl DirDriver {
             .cloned()
             .enumerate()
             .filter_map(|(idx, e)| {
-                if ino::kind(e.ino) != ino::Directory {
+                if inode::kind(e.ino) != inode::Directory {
                     return Some(e);
                 }
 
@@ -176,7 +174,7 @@ impl DirDriver {
     async fn purge(
         &self,
         tx: &mut Transaction<'_>,
-        parent_ino: u64,
+        parent_ino: Ino,
         parent_inode: &inode::Inode,
         entries: &[dentries::Entry],
         purged: Vec<PurgeEntry>,
@@ -255,12 +253,12 @@ impl DirDriver {
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd)]
 pub struct PurgeEntry {
     idx: usize,
-    ino: u64,
+    ino: Ino,
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct EntryView {
-    pub ino: u64,
+    pub ino: Ino,
     pub view: View,
     pub prefix: Arc<str>,
     next: Option<usize>,
@@ -359,7 +357,7 @@ impl DirView {
 #[derive(Debug)]
 pub struct EntryRef<'a> {
     pub name: Cow<'a, str>,
-    pub ino: u64,
+    pub ino: Ino,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

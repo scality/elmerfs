@@ -5,7 +5,6 @@ mod openfile;
 mod page;
 mod pool;
 
-use crate::driver::ino::InodeKind;
 use crate::driver::openfile::WriteAttrsDesc;
 use crate::time;
 
@@ -19,7 +18,7 @@ use self::pool::ConnectionPool;
 use crate::config::Config;
 use crate::model::{
     dentries,
-    inode::{self, Owner},
+    inode::{self, Owner, InodeKind, Ino},
     symlink,
 };
 use crate::view::{Name, NameRef, View};
@@ -33,7 +32,6 @@ use thiserror::Error;
 
 pub use self::dir::ListingFlavor;
 
-pub(crate) const ROOT_INO: u64 = 1;
 pub(crate) const MAX_CONNECTIONS: usize = 32;
 pub(crate) const PAGE_SIZE: u64 = 2 * 1024 * 1024;
 pub(crate) const FUSE_MAX_WRITE: u64 = 128 * 1024;
@@ -45,7 +43,7 @@ const ENOTEMPTY: DriverError = DriverError::Sys(Errno::ENOTEMPTY);
 const EIO: DriverError = DriverError::Sys(Errno::EIO);
 const EBADFD: DriverError = DriverError::Sys(Errno::EBADFD);
 
-pub type FileHandle = u64;
+pub type FileHandle = Ino;
 
 macro_rules! transaction {
     ($cfg:expr, $connection:expr) => {
@@ -118,7 +116,7 @@ impl Driver {
             let mut connection = pool.acquire().await?;
             let mut openfiles = openfiles.lock().await;
             Self::make_root(&config, &mut *openfiles, &mut connection).await?;
-            let ino_counter = InoGenerator::load(&mut connection, config.bucket()).await?;
+            let ino_counter = InoGenerator::load(&mut connection, config.clone()).await?;
 
             ino_counter
         };
@@ -143,9 +141,9 @@ impl Driver {
         let ts = time::now();
 
         let mut tx =
-            transaction!(config, connection, { exclusive: [inode::key(ROOT_INO)] }).await?;
+            transaction!(config, connection, { exclusive: [inode::key(Ino::root())] }).await?;
 
-        match Self::attr_of(config, openfiles, &mut tx, ROOT_INO).await {
+        match Self::attr_of(config, openfiles, &mut tx, Ino::root()).await {
             Ok(_) => {
                 tx.commit().await?;
                 return Ok(());
@@ -155,22 +153,22 @@ impl Driver {
         };
 
         let links = [
-            inode::Link::new(ROOT_INO, Name::new(".", View::root())),
-            inode::Link::new(ROOT_INO, Name::new("..", View::root())),
+            inode::Link::new(Ino::root(), Name::new(".", View::root())),
+            inode::Link::new(Ino::root(), Name::new("..", View::root())),
         ];
         let root = inode::CreateDesc {
-            ino: ROOT_INO,
+            ino: Ino::root(),
             owner: Owner { uid: 0, gid: 0 },
             links: links.iter().cloned(),
             size: PAGE_SIZE,
             mode: 0o755,
-            dotdot: Some(ROOT_INO),
+            dotdot: Some(Ino::root()),
         };
         tx.update(
             config.bucket(),
             updates!(
                 inode::create(ts, root),
-                dentries::create(View { uid: 0 }, ROOT_INO, ROOT_INO)
+                dentries::create(View { uid: 0 }, Ino::root(), Ino::root())
             ),
         )
         .await?;
@@ -180,7 +178,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn getattr(&self, view: View, ino: u64) -> Result<FileAttr> {
+    pub(crate) async fn getattr(&self, view: View, ino: Ino) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
 
         let mut tx = transaction!(self.config, connection, { shared: [inode::key(ino)] }).await?;
@@ -198,7 +196,7 @@ impl Driver {
     pub(crate) async fn setattr(
         &self,
         view: View,
-        ino: u64,
+        ino: Ino,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -212,7 +210,7 @@ impl Driver {
             };
         }
 
-        if ino::kind(ino) == InodeKind::Regular {
+        if inode::kind(ino) == InodeKind::Regular {
             let mut openfiles = self.openfiles.lock().await;
             let openfile = openfiles.open(ino).await?;
 
@@ -267,7 +265,7 @@ impl Driver {
     pub(crate) async fn lookup(
         &self,
         view: View,
-        parent_ino: u64,
+        parent_ino: Ino,
         name: &NameRef,
     ) -> Result<FileAttr> {
         let mut connection = self.pool.acquire().await?;
@@ -301,9 +299,9 @@ impl Driver {
         config: &Config,
         openfiles: &mut Openfiles,
         tx: &mut Transaction<'_>,
-        ino: u64,
+        ino: Ino,
     ) -> Result<FileAttr> {
-        if ino::kind(ino) == InodeKind::Regular {
+        if inode::kind(ino) == InodeKind::Regular {
             let openfile = openfiles.open(ino).await?;
 
             let result = openfile.read_attrs().await;
@@ -319,12 +317,12 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn opendir(&self, view: View, ino: u64) -> Result<()> {
+    pub(crate) async fn opendir(&self, view: View, ino: Ino) -> Result<()> {
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn releasedir(&self, view: View, ino: u64) -> Result<()> {
+    pub(crate) async fn releasedir(&self, view: View, ino: Ino) -> Result<()> {
         Ok(())
     }
 
@@ -332,7 +330,7 @@ impl Driver {
     pub(crate) async fn readdir(
         &self,
         view: View,
-        ino: u64,
+        ino: Ino,
         offset: i64,
     ) -> Result<Vec<ReadDirEntry>> {
         assert!(offset >= 0);
@@ -359,7 +357,7 @@ impl Driver {
             mapped_entries.push(ReadDirEntry {
                 name: ".".into(),
                 ino,
-                kind: ino::file_type(ino),
+                kind: inode::file_type(ino),
             });
         }
 
@@ -368,7 +366,7 @@ impl Driver {
             mapped_entries.push(ReadDirEntry {
                 name: "..".into(),
                 ino: dotdot,
-                kind: ino::file_type(dotdot),
+                kind: inode::file_type(dotdot),
             });
         }
 
@@ -379,7 +377,7 @@ impl Driver {
             mapped_entries.push(ReadDirEntry {
                 name: entry.name.into_owned(),
                 ino: entry.ino,
-                kind: ino::file_type(entry.ino),
+                kind: inode::file_type(entry.ino),
             });
         }
 
@@ -393,7 +391,7 @@ impl Driver {
         view: View,
         owner: Owner,
         mode: u32,
-        parent_ino: u64,
+        parent_ino: Ino,
         name: &NameRef,
     ) -> Result<FileAttr> {
         let ts = time::now();
@@ -401,7 +399,7 @@ impl Driver {
         let mut connection = self.pool.acquire().await?;
         let ino = self
             .ino_counter
-            .next(ino::Directory, &mut connection)
+            .next(inode::Directory, &mut connection)
             .await?;
 
         let mut tx = transaction!(self.config, connection, {
@@ -465,7 +463,7 @@ impl Driver {
             blocks: 1,
             rdev: 0,
             size: PAGE_SIZE,
-            ino,
+            ino: u64::from(ino),
             gid: owner.gid,
             uid: owner.uid,
             perm: mode as u16,
@@ -476,7 +474,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn rmdir(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
+    pub(crate) async fn rmdir(&self, view: View, parent_ino: Ino, name: &NameRef) -> Result<()> {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -537,14 +535,14 @@ impl Driver {
         view: View,
         owner: Owner,
         mode: u32,
-        parent_ino: u64,
+        parent_ino: Ino,
         name: &NameRef,
         _rdev: u32,
     ) -> Result<FileAttr> {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(ino::Regular, &mut connection).await?;
+        let ino = self.ino_counter.next(inode::Regular, &mut connection).await?;
 
         let mut tx = transaction!(self.config, connection, {
             exclusive: [
@@ -596,7 +594,7 @@ impl Driver {
             blocks: 1,
             rdev: 0,
             size: 0,
-            ino,
+            ino: u64::from(ino),
             gid: owner.gid,
             uid: owner.uid,
             perm: mode as u16,
@@ -606,7 +604,7 @@ impl Driver {
         })
     }
 
-    pub async fn unlink(&self, view: View, parent_ino: u64, name: &NameRef) -> Result<()> {
+    pub async fn unlink(&self, view: View, parent_ino: Ino, name: &NameRef) -> Result<()> {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -675,7 +673,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn open(&self, ino: u64) -> Result<FileHandle> {
+    pub(crate) async fn open(&self, ino: Ino) -> Result<FileHandle> {
         let mut openfiles = self.openfiles.lock().await;
         let handle = openfiles.open(ino).await?;
 
@@ -712,9 +710,9 @@ impl Driver {
     pub(crate) async fn rename(
         &self,
         view: View,
-        parent_ino: u64,
+        parent_ino: Ino,
         name: &NameRef,
-        new_parent_ino: u64,
+        new_parent_ino: Ino,
         new_name: &NameRef,
     ) -> Result<()> {
         let parents_to_lock = self
@@ -762,8 +760,8 @@ impl Driver {
             new_parent_entries,
         };
 
-        match ino::kind(entry.ino) {
-            ino::Directory => {
+        match inode::kind(entry.ino) {
+            inode::Directory => {
                 self.rename_dir(view, &mut tx, state).await?;
             }
             _ => {
@@ -839,7 +837,7 @@ impl Driver {
         let ts = time::now();
 
         /* Don't allow overwrite of directory. */
-        if ino::kind(target.ino) == ino::Directory {
+        if inode::kind(target.ino) == inode::Directory {
             return Err(EEXIST);
         }
 
@@ -904,7 +902,7 @@ impl Driver {
         let ts = time::now();
 
         /* Only rename to empty directories are accepted. */
-        if ino::kind(target.ino) != ino::Directory {
+        if inode::kind(target.ino) != inode::Directory {
             return Err(EEXIST);
         }
 
@@ -1028,8 +1026,8 @@ impl Driver {
     pub(crate) async fn link(
         &self,
         view: View,
-        ino: u64,
-        new_parent_ino: u64,
+        ino: Ino,
+        new_parent_ino: Ino,
         new_name: &NameRef,
     ) -> Result<FileAttr> {
         let ts = time::now();
@@ -1087,7 +1085,7 @@ impl Driver {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn read_link(&self, view: View, ino: u64) -> Result<String> {
+    pub(crate) async fn read_link(&self, view: View, ino: Ino) -> Result<String> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.config, connection, { shared: [symlink::key(ino)] }).await?;
 
@@ -1105,7 +1103,7 @@ impl Driver {
     pub(crate) async fn symlink(
         &self,
         view: View,
-        parent_ino: u64,
+        parent_ino: Ino,
         owner: Owner,
         name: &NameRef,
         link: &str,
@@ -1113,7 +1111,7 @@ impl Driver {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(ino::Symlink, &mut connection).await?;
+        let ino = self.ino_counter.next(inode::Symlink, &mut connection).await?;
 
         let mut tx = transaction!(self.config, connection, {
             exclusive: [
@@ -1172,7 +1170,7 @@ impl Driver {
             blocks: ((symlink_size - 1) / PAGE_SIZE + 1) as u64,
             rdev: 0,
             size: symlink_size,
-            ino,
+            ino: u64::from(ino),
             gid: owner.gid,
             uid: owner.uid,
             perm: 0o644,
@@ -1184,9 +1182,9 @@ impl Driver {
 
     pub async fn up_until_common_ancestor(
         &self,
-        mut lhs_parent: u64,
-        mut rhs_parent: u64,
-    ) -> Result<Vec<u64>> {
+        mut lhs_parent: Ino,
+        mut rhs_parent: Ino,
+    ) -> Result<Vec<Ino>> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.transaction().await?;
 
@@ -1218,14 +1216,14 @@ impl Driver {
 
 #[derive(Debug)]
 pub(crate) struct ReadDirEntry {
-    pub(crate) ino: u64,
+    pub(crate) ino: Ino,
     pub(crate) kind: FileType,
     pub(crate) name: String,
 }
 
 struct RenameState {
-    parent_ino: u64,
-    new_parent_ino: u64,
+    parent_ino: Ino,
+    new_parent_ino: Ino,
     new_name: NameRef,
     entry: dir::EntryView,
     new_parent_entries: dir::DirView,
