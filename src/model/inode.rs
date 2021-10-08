@@ -229,7 +229,7 @@ impl Inode {
         FileAttr {
             ino: ino.into(),
             size: self.size,
-            blocks: self.size / crate::driver::PAGE_SIZE,
+            blocks: self.size / 4096,
             atime: timespec_from_duration(self.atime),
             mtime: timespec_from_duration(self.mtime),
             ctime: timespec_from_duration(self.ctime),

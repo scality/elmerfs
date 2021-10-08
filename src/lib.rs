@@ -10,6 +10,7 @@ mod view;
 use crate::driver::Driver;
 use crate::fs::Elmerfs;
 use async_std::{sync::Arc, task};
+use driver::{DriverError, EIO};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::process::{Command, Stdio};
@@ -21,19 +22,10 @@ pub use crate::key::Bucket;
 pub use crate::view::View;
 pub use config::Config;
 
-/// There is two main thread of execution to follow:
-///
-/// The first one is dedicated to fuse whom sole purpose is to perform
-/// argument format validation (e.g are name given valid utf8 strings ?) and
-/// send those requests to whoever might be interested.
-///
-/// The second one, the dispatcher thread, it takes fuse request and dispatch
-/// them into asynchronous tasks calling into the root of the filesystem,
-/// the Rp driver.
-pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) {
+pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) -> Result<(), DriverError> {
     const RETRIES: u32 = 5;
 
-    let driver = task::block_on(Driver::new(config.clone())).expect("driver init");
+    let driver = task::block_on(Driver::new(config.clone()))?;
     let driver = Arc::new(driver);
 
     let fuse_options: Vec<&OsStr> =
@@ -48,6 +40,7 @@ pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) {
                 options
             });
 
+    let mut mounted = false;
     for _ in 0..RETRIES {
         let _umount = UmountOnDrop::new(mountpoint);
 
@@ -56,7 +49,10 @@ pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) {
             driver: driver.clone(),
         };
         match fuse::mount(fs, &mountpoint, &fuse_options) {
-            Ok(()) => break,
+            Ok(()) => {
+                mounted = true;
+                break
+            },
             Err(error) if error.kind() == io::ErrorKind::NotConnected => {
                 continue;
             }
@@ -65,6 +61,18 @@ pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) {
             }
         }
     }
+
+    if mounted {
+        Ok(())
+    } else {
+        Err(EIO)
+    }
+}
+
+pub fn bootstrap(config: Arc<Config>) -> Result<(), DriverError> {
+    task::block_on(
+        Driver::bootstrap(config)
+    )
 }
 
 pub struct UmountOnDrop(OsString);

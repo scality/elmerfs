@@ -33,15 +33,14 @@ use thiserror::Error;
 pub use self::dir::ListingFlavor;
 
 pub(crate) const MAX_CONNECTIONS: usize = 32;
-pub(crate) const PAGE_SIZE: u64 = 2 * 1024 * 1024;
-pub(crate) const FUSE_MAX_WRITE: u64 = 128 * 1024;
+pub(crate) const ENOENT: DriverError = DriverError::Sys(Errno::ENOENT);
+pub(crate) const EINVAL: DriverError = DriverError::Sys(Errno::EINVAL);
+pub(crate) const EEXIST: DriverError = DriverError::Sys(Errno::EEXIST);
+pub(crate) const ENOTEMPTY: DriverError = DriverError::Sys(Errno::ENOTEMPTY);
+pub(crate) const EIO: DriverError = DriverError::Sys(Errno::EIO);
+pub(crate) const EBADFD: DriverError = DriverError::Sys(Errno::EBADFD);
 
-const ENOENT: DriverError = DriverError::Sys(Errno::ENOENT);
-const EINVAL: DriverError = DriverError::Sys(Errno::EINVAL);
-const EEXIST: DriverError = DriverError::Sys(Errno::EEXIST);
-const ENOTEMPTY: DriverError = DriverError::Sys(Errno::ENOTEMPTY);
-const EIO: DriverError = DriverError::Sys(Errno::EIO);
-const EBADFD: DriverError = DriverError::Sys(Errno::EBADFD);
+pub(crate) const FUSE_MAX_WRITE: u64 = 128 * 1024;
 
 pub type FileHandle = Ino;
 
@@ -74,7 +73,7 @@ macro_rules! transaction {
 }
 
 #[derive(Error, Debug)]
-pub(crate) enum DriverError {
+pub enum DriverError {
     #[error("driver replied with: {0}")]
     Sys(Errno),
 
@@ -114,10 +113,7 @@ impl Driver {
 
         let ino_counter = {
             let mut connection = pool.acquire().await?;
-            let mut openfiles = openfiles.lock().await;
-            Self::make_root(&config, &mut *openfiles, &mut connection).await?;
             let ino_counter = InoGenerator::load(&mut connection, config.clone()).await?;
-
             ino_counter
         };
 
@@ -132,8 +128,19 @@ impl Driver {
         })
     }
 
+    pub async fn bootstrap(config: Arc<Config>) -> Result<()> {
+        let pool = Arc::new(ConnectionPool::with_capacity(
+            config.antidote.addresses.clone(),
+            MAX_CONNECTIONS,
+        ));
+        let mut openfiles = Openfiles::new(config.clone(), pool.clone());
+
+        let mut connection = pool.acquire().await?;
+        Self::create_root(&config, &mut openfiles, &mut connection).await
+    }
+
     #[tracing::instrument(skip(connection))]
-    async fn make_root(
+    async fn create_root(
         config: &Config,
         openfiles: &mut Openfiles,
         connection: &mut Connection,
@@ -144,10 +151,7 @@ impl Driver {
             transaction!(config, connection, { exclusive: [inode::key(Ino::root())] }).await?;
 
         match Self::attr_of(config, openfiles, &mut tx, Ino::root()).await {
-            Ok(_) => {
-                tx.commit().await?;
-                return Ok(());
-            }
+            Ok(_) => return Err(EEXIST),
             Err(DriverError::Sys(Errno::ENOENT)) => {}
             Err(error) => return Err(error),
         };
@@ -160,7 +164,7 @@ impl Driver {
             ino: Ino::root(),
             owner: Owner { uid: 0, gid: 0 },
             links: links.iter().cloned(),
-            size: PAGE_SIZE,
+            size: config.driver.page_size_b,
             mode: 0o755,
             dotdot: Some(Ino::root()),
         };
@@ -436,7 +440,7 @@ impl Driver {
             ino,
             links: links.iter().cloned(),
             mode,
-            size: PAGE_SIZE,
+            size: self.config.driver.page_size_b,
             owner,
             dotdot: Some(parent_ino),
         };
@@ -462,7 +466,7 @@ impl Driver {
             crtime: time::timespec(ts),
             blocks: 1,
             rdev: 0,
-            size: PAGE_SIZE,
+            size: self.config.driver.page_size_b,
             ino: u64::from(ino),
             gid: owner.gid,
             uid: owner.uid,
@@ -1167,7 +1171,7 @@ impl Driver {
             ctime: time::timespec(ts),
             mtime: time::timespec(ts),
             crtime: time::timespec(ts),
-            blocks: ((symlink_size - 1) / PAGE_SIZE + 1) as u64,
+            blocks: ((symlink_size - 1) / 4096 + 1) as u64,
             rdev: 0,
             size: symlink_size,
             ino: u64::from(ino),
