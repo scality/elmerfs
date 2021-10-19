@@ -1,0 +1,18 @@
+cluster_id = 0
+node_id = 0
+
+[antidote]
+
+addresses = ["127.0.0.1:8101"]
+
+[driver]
+
+bucket = 0
+page_size_b = 8388608 # 8MB
+gather_capacity_b = 8388608 # 8MB
+page_cache_capacity_b = 67108864 # 8 * page_size_b
+listing_flavor = "partial"
+
+[fuse]
+
+fsname = "elmerfs"
