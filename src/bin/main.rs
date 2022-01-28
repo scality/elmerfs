@@ -6,6 +6,7 @@ use clap::{App, Arg};
 use elmerfs::{self, View};
 use std::{path::Path, sync::Arc};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tokio::runtime;
 
 fn main() -> Result<(), anyhow::Error> {
     let args = App::new("elmerfs")
@@ -61,11 +62,14 @@ fn main() -> Result<(), anyhow::Error> {
     let config = Arc::new(elmerfs::config::load(&Path::new(config_path))?);
     tracing::info!(?config, "Config loaded.");
 
+    let runtime =
+        runtime::Builder::new_multi_thread().enable_all().build()?;
+
     if args.is_present("bootstrap") {
-        elmerfs::bootstrap(config).with_context(|| "failed to bootstrap driver")?;
+        elmerfs::bootstrap(runtime, config).with_context(|| "failed to bootstrap driver")?;
         tracing::info!("driver bootstrapped");
     } else {
-        elmerfs::run(config, forced_view, mountpoint).with_context(|| "failed to mount driver")?;
+        elmerfs::run(runtime, config, forced_view, mountpoint).with_context(|| "failed to mount driver")?;
     }
 
     Ok(())

@@ -6,15 +6,17 @@ mod key;
 mod model;
 mod time;
 mod view;
+mod metrics;
 
 use crate::driver::Driver;
 use crate::fs::Elmerfs;
-use async_std::{sync::Arc, task};
+use std::sync::Arc;
+use tokio::runtime::{Runtime};
 use driver::{DriverError, EIO};
 use std::ffi::{OsStr, OsString};
-use std::io;
 use std::process::{Command, Stdio};
 use tracing::*;
+
 
 pub use crate::driver::AddressBook;
 pub use crate::driver::ListingFlavor;
@@ -22,10 +24,8 @@ pub use crate::key::Bucket;
 pub use crate::view::View;
 pub use config::Config;
 
-pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) -> Result<(), DriverError> {
-    const RETRIES: u32 = 5;
-
-    let driver = task::block_on(Driver::new(config.clone()))?;
+pub fn run(runtime: Runtime, config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) -> Result<(), DriverError> {
+    let driver = runtime.block_on(Driver::new(config.clone()))?;
     let driver = Arc::new(driver);
 
     let fuse_options: Vec<&OsStr> =
@@ -40,37 +40,29 @@ pub fn run(config: Arc<Config>, forced_view: Option<View>, mountpoint: &OsStr) -
                 options
             });
 
-    let mut mounted = false;
-    for _ in 0..RETRIES {
-        let _umount = UmountOnDrop::new(mountpoint);
+    let fs = Elmerfs {
+        runtime,
+        forced_view,
+        driver: driver.clone(),
+    };
+    let _umount = UmountOnDrop::new(mountpoint);
 
-        let fs = Elmerfs {
-            forced_view,
-            driver: driver.clone(),
-        };
-        match fuse::mount(fs, &mountpoint, &fuse_options) {
-            Ok(()) => {
-                mounted = true;
-                break
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotConnected => {
-                continue;
-            }
-            Err(error) => {
-                error!("{:?}", error);
-            }
+    match fuse::mount(fs, &mountpoint, &fuse_options) {
+        Ok(()) => {},
+        Err(error) => {
+            error!("{:?}", error);
+            return Err(EIO)
         }
     }
 
-    if mounted {
-        Ok(())
-    } else {
-        Err(EIO)
-    }
+    let summaries = driver.metrics_summary();
+    crate::metrics::fmt_timed_operations(&mut std::io::stderr(), summaries).unwrap();
+
+    Ok(())
 }
 
-pub fn bootstrap(config: Arc<Config>) -> Result<(), DriverError> {
-    task::block_on(
+pub fn bootstrap(runtime: Runtime, config: Arc<Config>) -> Result<(), DriverError> {
+    runtime.block_on(
         Driver::bootstrap(config)
     )
 }

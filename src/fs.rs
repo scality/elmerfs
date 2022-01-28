@@ -1,15 +1,19 @@
 use crate::driver::{Driver, DriverError};
+use crate::metrics::TimedOperation;
 use crate::model::inode::{Ino, Owner};
 use crate::view::View;
 use antidotec::Bytes;
-use async_std::{sync::Arc, task};
 use fuse::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::OsStr;
 use std::path::Path;
-use time::Timespec;
-use tracing_futures::Instrument;
+use std::sync::Arc;
 use std::time::Duration;
+use time::Timespec;
+use tokio::runtime::Runtime;
+use tokio::task;
+use tokio::time as tokiot;
+use tracing_futures::Instrument;
 
 const ATTEMPTS_ON_ABORTED: u16 = 160;
 const ATTEMPTS_WAIT_MS: u16 = 500;
@@ -52,11 +56,11 @@ macro_rules! check_name {
 }
 
 fn ttl() -> time::Timespec {
-    time::Timespec::new(0, 0)
+    time::Timespec::new(1, 0)
 }
 
 macro_rules! session {
-    ($req:expr, $reply:ident, $op:expr, $ok:ident => $resp:block) => {
+    ($runtime:expr, $req:expr, $reply:ident, $op:expr, $ok:ident => $resp:block) => {
         let unique = $req.unique();
         let (uid, gid) = ($req.uid(), $req.gid());
 
@@ -81,14 +85,15 @@ macro_rules! session {
 
                 // Exponential backoff would be way better in term of system
                 // stress. But this is good for now.
-                task::sleep(Duration::from_millis(ATTEMPTS_WAIT_MS as u64))
+                tokiot::sleep(Duration::from_millis(ATTEMPTS_WAIT_MS as u64))
                     .await;
             };
 
 
             match final_result {
                 Some(Ok($ok)) => {
-                    $resp
+                    tracing::debug!("ok");
+                    $resp;
                 }
                 Some(Err(error)) => {
                     match error {
@@ -120,15 +125,16 @@ macro_rules! session {
             tracing::trace_span!("session", op = function!(), id = unique, uid, gid)
         );
 
-        task::spawn(task);
+        $runtime.spawn(task);
     };
 
-    ($req:expr, $reply:ident, $op:expr, _ => $resp:block) => {
-        session!($req, $reply, $op, _r => $resp);
+    ($runtime:expr, $req:expr, $reply:ident, $op:expr, _ => $resp:block) => {
+        session!($runtime, $req, $reply, $op, _r => $resp);
     };
 }
 
 pub struct Elmerfs {
+    pub(crate) runtime: Runtime,
     pub(crate) forced_view: Option<View>,
     pub(crate) driver: Arc<Driver>,
 }
@@ -144,8 +150,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.getattr(view, Ino(ino)), attrs => {
-            reply.attr(&ttl(), &attrs);
+        session!(&mut self.runtime, req, reply, driver.getattr(view, Ino(ino)), attrs => {
+            task::spawn_blocking(move || reply.attr(&ttl(), &attrs));
         });
     }
 
@@ -153,7 +159,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.opendir(view, Ino(ino)), _ => {
+        session!(&mut self.runtime, req, reply, driver.opendir(view, Ino(ino)), _ => {
             let flags = 0;
             reply.opened(ino, flags);
         });
@@ -163,8 +169,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.opendir(view, Ino(ino)), _ => {
-            reply.ok()
+        session!(&mut self.runtime, req, reply, driver.opendir(view, Ino(ino)), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
@@ -179,17 +185,17 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.readdir(view, Ino(ino), offset), entries => {
-            for (i, entry) in entries.into_iter().enumerate() {
-                let offset = offset + i as i64 + 1;
-
-                let full = reply.add(u64::from(entry.ino), offset, entry.kind, entry.name);
-                if full {
-                    break;
+        session!(&mut self.runtime, req, reply, driver.readdir(view, Ino(ino), offset), entries => {
+            task::spawn_blocking(move || {
+                for (i, entry) in entries.into_iter().enumerate() {
+                    let offset = offset + i as i64 + 1;
+                    let full = reply.add(u64::from(entry.ino), offset, entry.kind, entry.name);
+                    if full {
+                        break;
+                    }
                 }
-            }
-
-            reply.ok();
+                reply.ok();
+            })
         });
     }
 
@@ -198,9 +204,10 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.lookup(view, Ino(parent_ino), &name), attrs => {
+        session!(&mut self.runtime, req, reply, driver.lookup(view, Ino(parent_ino), &name), attrs => {
             let generation = 0;
-            reply.entry(&ttl(), &attrs, generation);
+            task::spawn_blocking(move ||
+                reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -220,9 +227,9 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.mkdir(view, owner, mode, Ino(parent_ino), &name), attrs => {
+        session!(&mut self.runtime, req, reply, driver.mkdir(view, owner, mode, Ino(parent_ino), &name), attrs => {
             let generation = 0;
-            reply.entry(&ttl(), &attrs, generation);
+            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -231,8 +238,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.rmdir(view, Ino(parent_ino), &name), _ => {
-            reply.ok();
+        session!(&mut self.runtime, req, reply, driver.rmdir(view, Ino(parent_ino), &name), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
@@ -253,9 +260,10 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.mknod(view, owner, mode, Ino(parent_ino), &name, rdev), attrs => {
+        session!(&mut self.runtime, req, reply, driver.mknod(view, owner, mode, Ino(parent_ino), &name, rdev), attrs => {
             let generation = 0;
-            reply.entry(&ttl(), &attrs, generation);
+
+            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -264,8 +272,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.unlink(view, Ino(parent_ino), &name), _ => {
-            reply.ok();
+        session!(&mut self.runtime, req, reply, driver.unlink(view, Ino(parent_ino), &name), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
@@ -292,12 +300,12 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(
+        session!(&mut self.runtime,
             req,
             reply,
             driver.setattr(view, Ino(ino), mode, uid, gid, size, atime, mtime),
             attrs => {
-                reply.attr(&ttl(), &attrs);
+                task::spawn_blocking(move || reply.attr(&ttl(), &attrs));
             }
         );
     }
@@ -305,9 +313,9 @@ impl Filesystem for Elmerfs {
     fn open(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.open(Ino(ino)), fh => {
+        session!(&mut self.runtime, req, reply, driver.open(Ino(ino)), fh => {
             let flags = 0;
-            reply.opened(u64::from(fh), flags);
+            task::spawn_blocking(move || reply.opened(u64::from(fh), flags));
         });
     }
 
@@ -324,24 +332,24 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.release(view, Ino(fh)), _ => {
-            reply.ok();
+        session!(&mut self.runtime, req, reply, driver.release(view, Ino(fh)), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
     fn flush(&mut self, req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.flush(Ino(fh)), _ => {
-            reply.ok();
+        session!(&mut self.runtime, req, reply, driver.flush(Ino(fh)), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
     fn fsync(&mut self, req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.fsync(Ino(fh)), _ => {
-            reply.ok();
+        session!(&mut self.runtime, req, reply, driver.fsync(Ino(fh)), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
@@ -363,8 +371,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let data = Bytes::copy_from_slice(data);
 
-        session!(req, reply, driver.write(Ino(fh), data.clone(), offset), _ => {
-            reply.written(data.len() as u32);
+        session!(&mut self.runtime, req, reply, driver.write(Ino(fh), data.clone(), offset), _ => {
+            task::spawn_blocking(move || reply.written(data.len() as u32));
         });
     }
 
@@ -384,8 +392,8 @@ impl Filesystem for Elmerfs {
         let offset = offset as u64;
         let driver = self.driver.clone();
 
-        session!(req, reply, driver.read(Ino(fh), offset, size), data => {
-            reply.data(&data);
+        session!(&mut self.runtime, req, reply, driver.read(Ino(fh), offset, size), data => {
+            task::spawn_blocking(move || reply.data(&data));
         });
     }
 
@@ -403,8 +411,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.rename(view, Ino(parent_ino), &name, Ino(newparent_ino), &newname), _ => {
-            reply.ok();
+        session!(&mut self.runtime, req, reply, driver.rename(view, Ino(parent_ino), &name, Ino(newparent_ino), &newname), _ => {
+            task::spawn_blocking(move || reply.ok());
         });
     }
 
@@ -420,9 +428,9 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.link(view, Ino(ino), Ino(newparent_ino), &newname), attrs => {
+        session!(&mut self.runtime, req, reply, driver.link(view, Ino(ino), Ino(newparent_ino), &newname), attrs => {
             let generation = 0;
-            reply.entry(&ttl(), &attrs, generation);
+            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -444,9 +452,9 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.symlink(view, Ino(parent_ino), owner, &name, &link), attrs => {
+        session!(&mut self.runtime, req, reply, driver.symlink(view, Ino(parent_ino), owner, &name, &link), attrs => {
             let generation = 0;
-            reply.entry(&ttl(), &attrs, generation);
+            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -454,8 +462,8 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
         let view = self.view(req);
 
-        session!(req, reply, driver.read_link(view, Ino(ino)), path => {
-            reply.data(path.as_bytes());
+        session!(&mut self.runtime, req, reply, driver.read_link(view, Ino(ino)), path => {
+            task::spawn_blocking(move || reply.data(path.as_bytes()));
         });
     }
 }

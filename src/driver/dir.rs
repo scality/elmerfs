@@ -1,7 +1,7 @@
 use crate::driver::pool::ConnectionPool;
 use crate::driver::{Config, Result, ENOENT};
-use crate::model::inode::{self, Ino};
 use crate::model::dentries;
+use crate::model::inode::{self, Ino};
 use crate::time;
 use crate::view::View;
 use crate::view::{Name, NameRef};
@@ -35,6 +35,31 @@ impl DirDriver {
         self.view(view, tx, entries, ino).await
     }
 
+    pub(super) fn lookup(
+        &self,
+        view: View,
+        reply: &mut antidotec::ReadReply,
+        index: usize,
+        name: &NameRef,
+    ) -> Option<Ino> {
+        let entries = dentries::decode(reply, index).unwrap_or_default();
+        let (effective_view, prefix) = match name {
+            NameRef::Exact(name) => (name.view, &name.prefix),
+            NameRef::Partial(prefix) => (view, prefix),
+        };
+
+        for entry in entries {
+            // We may need to render this a bit more up to date. e.g check if
+            // the looked up entry is a directory, and if so, check its parent.
+            if prefix == &entry.name.prefix && effective_view == entry.name.view {
+                return Some(entry.ino);
+            }
+        }
+
+        None
+    }
+
+    #[tracing::instrument(skip(self, tx, entries))]
     async fn view(
         &self,
         view: View,
@@ -92,7 +117,6 @@ impl DirDriver {
     ) {
         let mut previous_ino = None; /* 0 is an ino number that cannot appear. */
 
-        tracing::debug!(?sorted_entries, "sorted");
         let directories = sorted_entries.iter().enumerate().filter(|(_, e)| {
             inode::kind(e.ino) == inode::Directory && !Self::is_dot(&e.name.prefix)
         });

@@ -16,19 +16,21 @@ use self::ino::InoGenerator;
 use self::openfile::{OpenfileHandle, Openfiles};
 use self::pool::ConnectionPool;
 use crate::config::Config;
+use crate::metrics::{TimedOperation, TimedOperationSummary};
 use crate::model::{
     dentries,
-    inode::{self, Owner, InodeKind, Ino},
+    inode::{self, Ino, InodeKind, Owner},
     symlink,
 };
 use crate::view::{Name, NameRef, View};
 use antidotec::{self, reads, updates, Bytes, Connection, Error, Transaction, TransactionLocks};
-use async_std::sync::{Arc, Mutex};
 use fuse::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 pub use self::dir::ListingFlavor;
 
@@ -95,12 +97,79 @@ impl DriverError {
 
 pub(crate) type Result<T> = std::result::Result<T, DriverError>;
 
+#[derive(Debug, Copy, Clone)]
+#[repr(u8)]
+enum TimedOpKind {
+    Mknod = 0,
+    Unlink = 1,
+    Lookup = 2,
+    Readdir = 3,
+    GetAttr = 4,
+    Mkdir = 5,
+    Link = 6,
+    Open = 7,
+    Read = 8,
+    Write = 9,
+    Close = 10,
+    FSync = 11,
+    Flush = 12,
+    SetAttr = 13,
+}
+
+impl TimedOpKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mknod => "mknod",
+            Self::Unlink => "unlink",
+            Self::Lookup => "lookup",
+            Self::Readdir => "readdir",
+            Self::GetAttr => "getattr",
+            Self::Mkdir => "mkdir",
+            Self::Link => "link",
+            Self::Open => "open",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Close => "close",
+            Self::FSync => "fsync",
+            Self::Flush => "flush",
+            Self::SetAttr => "setattr",
+        }
+    }
+
+    pub const fn count() -> usize {
+        14
+    }
+}
+
+impl From<u8> for TimedOpKind {
+    fn from(x: u8) -> Self {
+        match x {
+            0 => Self::Mknod,
+            1 => Self::Unlink,
+            2 => Self::Lookup,
+            3 => Self::Readdir,
+            4 => Self::GetAttr,
+            5 => Self::Mkdir,
+            6 => Self::Link,
+            7 => Self::Open,
+            8 => Self::Read,
+            9 => Self::Write,
+            10 => Self::Close,
+            11 => Self::FSync,
+            12 => Self::Flush,
+            13 => Self::SetAttr,
+            _ => panic!("invalid op kind"),
+        }
+    }
+}
+
 pub(crate) struct Driver {
     config: Arc<Config>,
     ino_counter: Arc<InoGenerator>,
     pool: Arc<ConnectionPool>,
     openfiles: Arc<Mutex<Openfiles>>,
     dirs: DirDriver,
+    metrics: Vec<TimedOperation>,
 }
 
 impl Driver {
@@ -119,12 +188,17 @@ impl Driver {
 
         let dirs = DirDriver::new(config.clone(), pool.clone());
 
+        let metrics = (0..TimedOpKind::count())
+            .map(|_| TimedOperation::new())
+            .collect();
+
         Ok(Self {
             config,
             ino_counter: Arc::new(ino_counter),
             pool,
             openfiles,
             dirs,
+            metrics,
         })
     }
 
@@ -183,6 +257,8 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn getattr(&self, view: View, ino: Ino) -> Result<FileAttr> {
+        let _timer = self.metrics[TimedOpKind::GetAttr as usize].start();
+
         let mut connection = self.pool.acquire().await?;
 
         let mut tx = transaction!(self.config, connection, { shared: [inode::key(ino)] }).await?;
@@ -208,6 +284,8 @@ impl Driver {
         atime: Option<Duration>,
         mtime: Option<Duration>,
     ) -> Result<FileAttr> {
+        let _timer = self.metrics[TimedOpKind::SetAttr as usize].start();
+
         macro_rules! update {
             ($target:expr, $v:ident) => {
                 $target = $v.unwrap_or($target);
@@ -272,6 +350,8 @@ impl Driver {
         parent_ino: Ino,
         name: &NameRef,
     ) -> Result<FileAttr> {
+        let _timer = self.metrics[TimedOpKind::Lookup as usize].start();
+
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.config, connection, {
             shared: [dentries::key(parent_ino)]
@@ -282,21 +362,16 @@ impl Driver {
             .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
-        let entries = self
-            .dirs
-            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
-            .await?;
-
-        let attr = match entries.get(&name) {
-            Some(entry) => {
+        let result = match self.dirs.lookup(view, &mut reply, 0, name) {
+            Some(ino) => {
                 let mut openfiles = self.openfiles.lock().await;
-                Self::attr_of(&self.config, &mut *openfiles, &mut tx, entry.ino).await
-            }
-            None => Err(ENOENT),
+                Self::attr_of(&self.config, &mut *openfiles, &mut tx, ino).await
+            },
+            None => Err(ENOENT)
         };
 
         tx.commit().await?;
-        attr
+        result
     }
 
     async fn attr_of(
@@ -338,6 +413,8 @@ impl Driver {
         offset: i64,
     ) -> Result<Vec<ReadDirEntry>> {
         assert!(offset >= 0);
+        let _timer = self.metrics[TimedOpKind::Readdir as usize].start();
+
         let mut connection = self.pool.acquire().await?;
         let mut tx =
             transaction!(self.config, connection, { shared: [dentries::key(ino)] }).await?;
@@ -398,6 +475,8 @@ impl Driver {
         parent_ino: Ino,
         name: &NameRef,
     ) -> Result<FileAttr> {
+        let _timer = self.metrics[TimedOpKind::Mkdir as usize].start();
+
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -419,11 +498,7 @@ impl Driver {
             .await?;
 
         /* 1. Check if the entry doesn't already exists. */
-        let entries = self
-            .dirs
-            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
-            .await?;
-        if entries.contains_key(&name) {
+        if self.dirs.lookup(view, &mut reply, 0, &name).is_some() {
             return Err(EEXIST);
         }
 
@@ -544,9 +619,13 @@ impl Driver {
         _rdev: u32,
     ) -> Result<FileAttr> {
         let ts = time::now();
+        let _timer = self.metrics[TimedOpKind::Mknod as usize].start();
 
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(inode::Regular, &mut connection).await?;
+        let ino = self
+            .ino_counter
+            .next(inode::Regular, &mut connection)
+            .await?;
 
         let mut tx = transaction!(self.config, connection, {
             exclusive: [
@@ -560,11 +639,7 @@ impl Driver {
             .read(self.config.bucket(), reads!(dentries::read(parent_ino)))
             .await?;
 
-        let entries = self
-            .dirs
-            .decode_view(view, &mut tx, parent_ino, &mut reply, 0)
-            .await?;
-        if entries.contains_key(&name) {
+        if self.dirs.lookup(view, &mut reply, 0, &name).is_some() {
             return Err(EEXIST);
         }
 
@@ -608,8 +683,10 @@ impl Driver {
         })
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn unlink(&self, view: View, parent_ino: Ino, name: &NameRef) -> Result<()> {
         let ts = time::now();
+        let _timer = self.metrics[TimedOpKind::Unlink as usize].start();
 
         let mut connection = self.pool.acquire().await?;
         let mut tx = transaction!(self.config, connection, {
@@ -678,6 +755,8 @@ impl Driver {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn open(&self, ino: Ino) -> Result<FileHandle> {
+        let _timer = self.metrics[TimedOpKind::Open as usize].start();
+
         let mut openfiles = self.openfiles.lock().await;
         let handle = openfiles.open(ino).await?;
 
@@ -685,27 +764,37 @@ impl Driver {
     }
 
     pub(crate) async fn flush(&self, fh: FileHandle) -> Result<()> {
+        let _timer = self.metrics[TimedOpKind::FSync as usize].start();
+
         self.fsync(fh).await
     }
 
     pub(crate) async fn fsync(&self, fh: FileHandle) -> Result<()> {
+        let _timer = self.metrics[TimedOpKind::Flush as usize].start();
+
         let openfile = self.openfile(fh).await?;
         openfile.sync().await
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn release(&self, view: View, fh: FileHandle) -> Result<()> {
+        let _timer = self.metrics[TimedOpKind::Close as usize].start();
+
         let mut openfiles = self.openfiles.lock().await;
         openfiles.close(fh).await
     }
 
     #[tracing::instrument(skip(self, buffer), fields(offset, len = buffer.len()))]
     pub(crate) async fn write(&self, fh: FileHandle, buffer: Bytes, offset: u64) -> Result<()> {
+        let _timer = self.metrics[TimedOpKind::Write as usize].start();
+
         let openfile = self.openfile(fh).await?;
         openfile.write(WriteSlice { buffer, offset }).await
     }
 
     pub(crate) async fn read(&self, fh: FileHandle, offset: u64, len: u32) -> Result<Bytes> {
+        let _timer = self.metrics[TimedOpKind::Read as usize].start();
+
         let openfile = self.openfile(fh).await?;
         openfile.read(offset, len as u64).await
     }
@@ -1034,6 +1123,8 @@ impl Driver {
         new_parent_ino: Ino,
         new_name: &NameRef,
     ) -> Result<FileAttr> {
+        let _timer = self.metrics[TimedOpKind::Link as usize].start();
+
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
@@ -1115,7 +1206,10 @@ impl Driver {
         let ts = time::now();
 
         let mut connection = self.pool.acquire().await?;
-        let ino = self.ino_counter.next(inode::Symlink, &mut connection).await?;
+        let ino = self
+            .ino_counter
+            .next(inode::Symlink, &mut connection)
+            .await?;
 
         let mut tx = transaction!(self.config, connection, {
             exclusive: [
@@ -1215,6 +1309,18 @@ impl Driver {
 
         tx.commit().await?;
         Ok(parents)
+    }
+
+    pub(crate) fn metrics_summary(&self) -> Vec<(&'static str, TimedOperationSummary)> {
+        let mut summary = Vec::with_capacity(TimedOpKind::count());
+        for (i, metric) in self.metrics.iter().enumerate() {
+            summary.push((
+                TimedOpKind::from(i as u8).name(),
+                metric.summary()
+            ));
+        }
+
+        summary
     }
 }
 

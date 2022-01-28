@@ -1,9 +1,7 @@
 use self::crdts::Crdt;
 use crate::protos::{antidote::*, ApbMessage, ApbMessageCode, MessageCodeError};
-use async_std::{
-    io::{self, prelude::*},
-    net::TcpStream,
-};
+use tokio::net::{TcpStream};
+use tokio::io::{Error as TokioError, AsyncWriteExt, AsyncReadExt};
 pub use prost::bytes::{Bytes, BytesMut, BufMut};
 use prost::{DecodeError, EncodeError, Message};
 use std::convert::TryInto;
@@ -37,7 +35,7 @@ impl From<u32> for AntidoteError {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("couldn't write or read from the connection")]
-    Io(#[from] io::Error),
+    Io(#[from] TokioError),
     #[error("failed to write protobuf message")]
     ProtobufEncode(#[from] EncodeError),
     #[error("failed to read protobuf message")]
@@ -75,6 +73,7 @@ pub struct Connection {
 impl Connection {
     pub async fn new(address: &str) -> Result<Self, Error> {
         let stream = TcpStream::connect(address).await?;
+
         let _ = stream.set_nodelay(true);
 
         Ok(Self {

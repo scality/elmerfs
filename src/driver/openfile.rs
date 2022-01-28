@@ -1,6 +1,5 @@
 use antidotec::{reads, updates, Bytes, BytesMut, Transaction, TxId};
-use async_std::channel::{self, Receiver, Sender};
-use async_std::task;
+use tokio::sync::{mpsc, oneshot};
 use fuse::FileAttr;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -127,21 +126,21 @@ enum Command {
     Read {
         offset: u64,
         len: u64,
-        response_sender: Sender<Result<Bytes, DriverError>>,
+        response_sender: oneshot::Sender<Result<Bytes, DriverError>>,
     },
     WriteAttrs {
         desc: Box<WriteAttrsDesc>,
-        response_sender: Sender<Result<FileAttr, DriverError>>,
+        response_sender: oneshot::Sender<Result<FileAttr, DriverError>>,
     },
     ReadAttrs {
-        response_sender: Sender<Result<FileAttr, DriverError>>,
+        response_sender: oneshot::Sender<Result<FileAttr, DriverError>>,
     },
     Sync {
-        response_sender: Sender<Result<(), DriverError>>,
+        response_sender: oneshot::Sender<Result<(), DriverError>>,
     },
     ClearOnExit,
     Exit {
-        response_sender: Sender<Result<(), DriverError>>,
+        response_sender: oneshot::Sender<Result<(), DriverError>>,
     },
 }
 
@@ -160,7 +159,7 @@ struct Openfile {
     cache_txid: Option<TxId>,
     cached_size: u64,
     driver: PageDriver<PageCache>,
-    commands: Receiver<Command>,
+    commands: mpsc::Receiver<Command>,
     write_error: Option<DriverError>,
     mode: Mode,
     clear_on_exit: bool,
@@ -174,7 +173,7 @@ impl Openfile {
         driver: PageDriver<PageCache>,
         pool: Arc<ConnectionPool>,
     ) -> Result<OpenfileHandle, DriverError> {
-        let (cmd_sender, cmd_receiver) = channel::bounded(128);
+        let (cmd_sender, cmd_receiver) = mpsc::channel(128);
 
         let openfile = Openfile {
             bucket,
@@ -190,7 +189,7 @@ impl Openfile {
             clear_on_exit: false,
         };
 
-        let _ = task::spawn(Self::run(openfile));
+        let _ = tokio::spawn(Self::run(openfile));
         Ok(OpenfileHandle {
             sender: cmd_sender,
             ino,
@@ -205,8 +204,8 @@ impl Openfile {
     async fn run(mut self) {
         loop {
             let command = match self.commands.recv().await {
-                Ok(command) => command,
-                Err(_) => {
+                Some(command) => command,
+                None => {
                     tracing::warn!("no more openfile clients. Exiting.");
                     break;
                 }
@@ -226,29 +225,29 @@ impl Openfile {
                     response_sender,
                 } => {
                     let result = self.handle_read(offset, len).await;
-                    let _ = response_sender.send(result).await;
+                    let _ = response_sender.send(result);
                 }
                 Command::Sync { response_sender } => {
                     let result = self.handle_sync().await;
-                    let _ = response_sender.send(result).await;
+                    let _ = response_sender.send(result);
                 }
                 Command::ReadAttrs { response_sender } => {
                     let result = self.handle_read_attrs().await;
-                    let _ = response_sender.send(result).await;
+                    let _ = response_sender.send(result);
                 }
                 Command::WriteAttrs {
                     desc,
                     response_sender,
                 } => {
                     let result = self.handle_write_attrs(desc).await;
-                    let _ = response_sender.send(result).await;
+                    let _ = response_sender.send(result);
                 }
                 Command::ClearOnExit => {
                     self.clear_on_exit = true;
                 }
                 Command::Exit { response_sender } => {
                     let result = self.handle_exit().await;
-                    let _ = response_sender.send(result).await;
+                    let _ = response_sender.send(result);
                     break;
                 }
             }
@@ -570,7 +569,7 @@ impl Openfile {
 #[derive(Debug, Clone)]
 pub(crate) struct OpenfileHandle {
     ino: Ino,
-    sender: Sender<Command>,
+    sender: mpsc::Sender<Command>,
 }
 
 impl OpenfileHandle {
@@ -586,7 +585,7 @@ impl OpenfileHandle {
     }
 
     pub(crate) async fn read(&self, offset: u64, len: u64) -> Result<Bytes, DriverError> {
-        let (response_sender, response_receiver) = channel::bounded(1);
+        let (response_sender, response_receiver) = oneshot::channel();
         self.send(Command::Read {
             offset,
             len,
@@ -600,7 +599,7 @@ impl OpenfileHandle {
         &self,
         desc: Box<WriteAttrsDesc>,
     ) -> Result<FileAttr, DriverError> {
-        let (response_sender, response_receiver) = channel::bounded(1);
+        let (response_sender, response_receiver) = oneshot::channel();
         self.send(Command::WriteAttrs {
             desc,
             response_sender,
@@ -610,13 +609,13 @@ impl OpenfileHandle {
     }
 
     pub(crate) async fn read_attrs(&self) -> Result<FileAttr, DriverError> {
-        let (response_sender, response_receiver) = channel::bounded(1);
+        let (response_sender, response_receiver) = oneshot::channel();
         self.send(Command::ReadAttrs { response_sender }).await;
         self.recv(response_receiver).await
     }
 
     pub(crate) async fn sync(&self) -> Result<(), DriverError> {
-        let (response_sender, response_receiver) = channel::bounded(1);
+        let (response_sender, response_receiver) = oneshot::channel();
         self.send(Command::Sync { response_sender }).await;
         self.recv(response_receiver).await
     }
@@ -626,13 +625,13 @@ impl OpenfileHandle {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), DriverError> {
-        let (response_sender, response_receiver) = channel::bounded(1);
+        let (response_sender, response_receiver) = oneshot::channel();
         self.send(Command::Exit { response_sender }).await;
         self.recv(response_receiver).await
     }
 
-    async fn recv<T>(&self, receiver: Receiver<Result<T, DriverError>>) -> Result<T, DriverError> {
-        match receiver.recv().await {
+    async fn recv<T>(&self, receiver: oneshot::Receiver<Result<T, DriverError>>) -> Result<T, DriverError> {
+        match receiver.await {
             Ok(result) => result,
             Err(_) => {
                 tracing::error!(

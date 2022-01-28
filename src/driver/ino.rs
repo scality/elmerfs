@@ -4,8 +4,8 @@ use crate::{
     model::inode::{Ino, InodeKind, InoDesc}
 };
 use antidotec::{lwwreg, Connection, Error, RawIdent};
-use async_std::sync::Mutex;
 use std::{ops::Range, sync::Arc};
+use tokio::sync::Mutex;
 
 const RANGE_SIZE: u64 = 1024;
 

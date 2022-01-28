@@ -8,7 +8,7 @@ build = "build.rs"
 
 [dependencies]
 prost = "0.7"
-async-std = { version = "1.6", features = ["unstable"] }
+tokio = { version = "1.15", features = ["full"] }
 thiserror = "1.0"
 tracing = "0.1"
 
