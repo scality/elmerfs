@@ -1,11 +1,11 @@
 use crate::key::{KeyWriter, Ty};
 use crate::view::{Name, View};
 use antidotec::{Bytes, RawIdent};
-use fuse::FileAttr;
+use fuser::FileAttr;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::mem;
-use std::time::Duration;
+use std::time::{SystemTime, Duration};
 use std::fmt;
 
 /* An ino number is defined as follow:
@@ -43,12 +43,12 @@ impl From<u8> for InodeKind {
     }
 }
 
-impl From<InodeKind> for fuse::FileType {
-    fn from(kind: InodeKind) -> fuse::FileType {
+impl From<InodeKind> for fuser::FileType {
+    fn from(kind: InodeKind) -> fuser::FileType {
         match kind {
-            InodeKind::Regular => fuse::FileType::RegularFile,
-            InodeKind::Directory => fuse::FileType::Directory,
-            InodeKind::Symlink => fuse::FileType::Symlink,
+            InodeKind::Regular => fuser::FileType::RegularFile,
+            InodeKind::Directory => fuser::FileType::Directory,
+            InodeKind::Symlink => fuser::FileType::Symlink,
         }
     }
 }
@@ -115,9 +115,9 @@ pub fn kind(ino: Ino) -> InodeKind {
     ino.decode().kind
 }
 
-pub fn file_type(ino: Ino) -> fuse::FileType {
+pub fn file_type(ino: Ino) -> fuser::FileType {
     if ino == Ino::root() {
-        return fuse::FileType::Directory;
+        return fuser::FileType::Directory;
     }
 
     ino.decode().kind.into()
@@ -222,23 +222,24 @@ pub struct Inode {
 
 impl Inode {
     pub fn attr(&self, ino: Ino) -> FileAttr {
-        let timespec_from_duration = |duration: Duration| {
-            time::Timespec::new(duration.as_secs() as i64, duration.subsec_nanos() as i32)
+        let syst = |duration: Duration| {
+            SystemTime::UNIX_EPOCH.checked_add(duration).unwrap()
         };
 
         FileAttr {
             ino: ino.into(),
             size: self.size,
             blocks: self.size / 4096,
-            atime: timespec_from_duration(self.atime),
-            mtime: timespec_from_duration(self.mtime),
-            ctime: timespec_from_duration(self.ctime),
-            crtime: timespec_from_duration(self.atime),
+            atime: syst(self.atime),
+            mtime: syst(self.mtime),
+            ctime: syst(self.ctime),
+            crtime: syst(self.atime),
             kind: file_type(ino),
             perm: self.mode as u16,
             nlink: self.links.nlink(),
             uid: self.owner.uid,
             gid: self.owner.gid,
+            blksize: 4096,
             rdev: 0,
             flags: 0,
         }
@@ -300,7 +301,8 @@ pub use ops::*;
 mod ops {
     use super::{Field, Ino, Inode, Key, Link, Links, Owner, key};
     use antidotec::{lwwreg, rrmap, rwset, ReadQuery, ReadReply, UpdateQuery};
-    use std::time::Duration;
+    use std::time::SystemTime;
+    use crate::time;
 
     pub fn read(ino: Ino) -> ReadQuery {
         rrmap::get(key(ino))
@@ -315,16 +317,16 @@ mod ops {
         pub dotdot: Option<Ino>,
     }
 
-    pub fn create<T>(ts: Duration, desc: CreateDesc<T>) -> UpdateQuery
+    pub fn create<T>(now: SystemTime, desc: CreateDesc<T>) -> UpdateQuery
     where
         T: IntoIterator<Item = Link>,
     {
         let key = key(desc.ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
-            .push(lwwreg::set_duration(key.field(Field::Ctime), ts))
-            .push(lwwreg::set_duration(key.field(Field::Mtime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Atime), time::ts(now)))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), time::ts(now)))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), time::ts(now)))
             .push(lwwreg::set_u64(key.field(Field::Owner), desc.owner.into()))
             .push(lwwreg::set_u32(key.field(Field::Mode), desc.mode))
             .push(lwwreg::set_u64(key.field(Field::Size), desc.size))
@@ -341,8 +343,8 @@ mod ops {
         pub mode: Option<u32>,
         pub owner: Option<Owner>,
         pub size: Option<u64>,
-        pub atime: Option<Duration>,
-        pub mtime: Option<Duration>,
+        pub atime: Option<SystemTime>,
+        pub mtime: Option<SystemTime>,
     }
 
     pub fn update_attrs(ino: Ino, desc: UpdateAttrsDesc) -> UpdateQuery {
@@ -363,69 +365,69 @@ mod ops {
         }
 
         if let Some(new_atime) = desc.atime {
-            update = update.push(lwwreg::set_duration(key.field(Field::Atime), new_atime));
+            update = update.push(lwwreg::set_duration(key.field(Field::Atime), time::ts(new_atime)));
         }
 
         if let Some(new_mtime) = desc.mtime {
-            update = update.push(lwwreg::set_duration(key.field(Field::Mtime), new_mtime));
+            update = update.push(lwwreg::set_duration(key.field(Field::Mtime), time::ts(new_mtime)));
         }
 
         update.build()
     }
 
-    pub fn add_link(ts: Duration, ino: Ino, link: Link) -> UpdateQuery {
+    pub fn add_link(now: SystemTime, ino: Ino, link: Link) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Atime), time::ts(now)))
             .push(links_add(key, std::iter::once(link)))
             .build()
     }
 
-    pub fn remove_link(ts: Duration, ino: Ino, link: Link) -> UpdateQuery {
+    pub fn remove_link(now: SystemTime, ino: Ino, link: Link) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Atime), time::ts(now)))
             .push(links_remove(key, std::iter::once(link)))
             .build()
     }
 
-    pub fn link_to_parent(ts: Duration, ino: Ino, parent_ino: Ino, link: Link) -> UpdateQuery {
+    pub fn link_to_parent(now: SystemTime, ino: Ino, parent_ino: Ino, link: Link) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Atime), time::ts(now)))
             .push(lwwreg::set_u64(key.field(Field::DotDot), parent_ino.into()))
             .push(links_add(key, std::iter::once(link)))
             .build()
     }
 
-    pub fn unlink_from_parent(ts: Duration, ino: Ino, link: Link) -> UpdateQuery {
+    pub fn unlink_from_parent(now: SystemTime, ino: Ino, link: Link) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Atime), time::ts(now)))
             .push(lwwreg::set_u64(key.field(Field::DotDot), 0))
             .push(links_remove(key, std::iter::once(link)))
             .build()
     }
 
-    pub fn touch(ts: Duration, ino: Ino) -> UpdateQuery {
+    pub fn touch(now: SystemTime, ino: Ino) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Atime), ts))
-            .push(lwwreg::set_duration(key.field(Field::Ctime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Atime), time::ts(now)))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), time::ts(now)))
             .build()
     }
 
-    pub fn update_size(ts: Duration, ino: Ino, new_size: u64) -> UpdateQuery {
+    pub fn update_size(now: SystemTime, ino: Ino, new_size: u64) -> UpdateQuery {
         let key = key(ino);
 
         rrmap::update(key)
-            .push(lwwreg::set_duration(key.field(Field::Ctime), ts))
-            .push(lwwreg::set_duration(key.field(Field::Mtime), ts))
+            .push(lwwreg::set_duration(key.field(Field::Ctime), time::ts(now)))
+            .push(lwwreg::set_duration(key.field(Field::Mtime), time::ts(now)))
             .push(lwwreg::set_u64(key.field(Field::Size), new_size))
             .build()
     }

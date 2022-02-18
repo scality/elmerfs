@@ -1,15 +1,13 @@
 use crate::driver::{Driver, DriverError};
-use crate::metrics::TimedOperation;
 use crate::model::inode::{Ino, Owner};
 use crate::view::View;
 use antidotec::Bytes;
-use fuse::{Filesystem, *};
+use fuser::{Filesystem, *};
 use nix::{errno::Errno, libc};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-use time::Timespec;
+use std::time::{Duration, SystemTime};
 use tokio::runtime::Runtime;
 use tokio::task;
 use tokio::time as tokiot;
@@ -55,8 +53,8 @@ macro_rules! check_name {
     }};
 }
 
-fn ttl() -> time::Timespec {
-    time::Timespec::new(1, 0)
+fn ttl() -> std::time::Duration {
+    Duration::from_secs(15)
 }
 
 macro_rules! session {
@@ -155,7 +153,7 @@ impl Filesystem for Elmerfs {
         });
     }
 
-    fn opendir(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+    fn opendir(&mut self, req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         let driver = self.driver.clone();
         let view = self.view(req);
 
@@ -165,7 +163,7 @@ impl Filesystem for Elmerfs {
         });
     }
 
-    fn releasedir(&mut self, req: &Request, ino: u64, _fh: u64, _flags: u32, reply: ReplyEmpty) {
+    fn releasedir(&mut self, req: &Request, ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
         let driver = self.driver.clone();
         let view = self.view(req);
 
@@ -217,6 +215,7 @@ impl Filesystem for Elmerfs {
         parent_ino: u64,
         name: &OsStr,
         mode: u32,
+        _umask: u32,
         reply: ReplyEntry,
     ) {
         let owner = Owner {
@@ -249,6 +248,7 @@ impl Filesystem for Elmerfs {
         parent_ino: u64,
         name: &OsStr,
         mode: u32,
+        _umask: u32,
         rdev: u32,
         reply: ReplyEntry,
     ) {
@@ -285,16 +285,21 @@ impl Filesystem for Elmerfs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<Timespec>,
-        mtime: Option<Timespec>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
         _fh: Option<u64>,
-        _crtime: Option<Timespec>,
-        _chgtime: Option<Timespec>,
-        _bkuptime: Option<Timespec>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let t2d = |t: time::Timespec| std::time::Duration::new(t.sec as u64, t.nsec as u32);
+        let now = SystemTime::now();
+        let t2d = |t: TimeOrNow| match t {
+            TimeOrNow::SpecificTime(t) => t,
+            TimeOrNow::Now => now,
+        };
         let atime = atime.map(t2d);
         let mtime = mtime.map(t2d);
         let driver = self.driver.clone();
@@ -310,7 +315,7 @@ impl Filesystem for Elmerfs {
         );
     }
 
-    fn open(&mut self, req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+    fn open(&mut self, req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         let driver = self.driver.clone();
 
         session!(&mut self.runtime, req, reply, driver.open(Ino(ino)), fh => {
@@ -324,8 +329,8 @@ impl Filesystem for Elmerfs {
         req: &Request,
         _ino: u64,
         fh: u64,
-        _flags: u32,
-        _lock_owner: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
@@ -360,7 +365,9 @@ impl Filesystem for Elmerfs {
         fh: u64,
         offset: i64,
         data: &[u8],
-        _flags: u32,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         if offset < 0 {
@@ -383,6 +390,8 @@ impl Filesystem for Elmerfs {
         fh: u64,
         offset: i64,
         size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         if offset < 0 {
@@ -404,6 +413,7 @@ impl Filesystem for Elmerfs {
         name: &OsStr,
         newparent_ino: u64,
         newname: &OsStr,
+        _flags: u32,
         reply: ReplyEmpty,
     ) {
         let name = check_name!(reply, name);

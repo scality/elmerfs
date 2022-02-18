@@ -11,6 +11,7 @@ mod metrics;
 use crate::driver::Driver;
 use crate::fs::Elmerfs;
 use std::sync::Arc;
+use fuser::MountOption;
 use tokio::runtime::{Runtime};
 use driver::{DriverError, EIO};
 use std::ffi::{OsStr, OsString};
@@ -28,17 +29,12 @@ pub fn run(runtime: Runtime, config: Arc<Config>, forced_view: Option<View>, mou
     let driver = runtime.block_on(Driver::new(config.clone()))?;
     let driver = Arc::new(driver);
 
-    let fuse_options: Vec<&OsStr> =
-        config
-            .fuse
-            .options
-            .iter()
-            .fold(Vec::new(), |mut options, (name, value)| {
-                options.push("-o".as_ref());
-                options.push(name.as_ref());
-                options.push(value.as_ref());
-                options
-            });
+    let options = [
+        MountOption::AllowOther,
+        MountOption::DefaultPermissions,
+        MountOption::AutoUnmount,
+        MountOption::RW
+    ];
 
     let fs = Elmerfs {
         runtime,
@@ -47,7 +43,9 @@ pub fn run(runtime: Runtime, config: Arc<Config>, forced_view: Option<View>, mou
     };
     let _umount = UmountOnDrop::new(mountpoint);
 
-    match fuse::mount(fs, &mountpoint, &fuse_options) {
+
+
+    match fuser::mount2(fs, &mountpoint, &options) {
         Ok(()) => {},
         Err(error) => {
             error!("{:?}", error);

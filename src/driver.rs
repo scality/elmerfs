@@ -24,11 +24,11 @@ use crate::model::{
 };
 use crate::view::{Name, NameRef, View};
 use antidotec::{self, reads, updates, Bytes, Connection, Error, Transaction, TransactionLocks};
-use fuse::*;
+use fuser::*;
 use nix::errno::Errno;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::SystemTime;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -186,7 +186,7 @@ impl Driver {
             ino_counter
         };
 
-        let dirs = DirDriver::new(config.clone(), pool.clone());
+        let dirs = DirDriver::new(config.clone());
 
         let metrics = (0..TimedOpKind::count())
             .map(|_| TimedOperation::new())
@@ -281,8 +281,8 @@ impl Driver {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<Duration>,
-        mtime: Option<Duration>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
     ) -> Result<FileAttr> {
         let _timer = self.metrics[TimedOpKind::SetAttr as usize].start();
 
@@ -324,8 +324,9 @@ impl Driver {
             update!(inode.mode, mode);
             update!(inode.owner.uid, uid);
             update!(inode.owner.gid, gid);
-            update!(inode.atime, atime);
-            update!(inode.mtime, mtime);
+
+            let atime = Some(atime.unwrap_or(time::from_ts(inode.atime)));
+            let mtime = Some(mtime.unwrap_or(time::from_ts(inode.mtime)));
 
             let updates = inode::UpdateAttrsDesc {
                 mode,
@@ -535,11 +536,12 @@ impl Driver {
         tx.commit().await?;
 
         Ok(FileAttr {
-            atime: time::timespec(ts),
-            ctime: time::timespec(ts),
-            mtime: time::timespec(ts),
-            crtime: time::timespec(ts),
+            atime: ts,
+            ctime: ts,
+            mtime: ts,
+            crtime: ts,
             blocks: 1,
+            blksize: 4096,
             rdev: 0,
             size: self.config.driver.page_size_b,
             ino: u64::from(ino),
@@ -666,11 +668,12 @@ impl Driver {
         tx.commit().await?;
 
         Ok(FileAttr {
-            atime: time::timespec(ts),
-            ctime: time::timespec(ts),
-            mtime: time::timespec(ts),
-            crtime: time::timespec(ts),
+            atime: ts,
+            ctime: ts,
+            mtime: ts,
+            crtime: ts,
             blocks: 1,
+            blksize: 4096,
             rdev: 0,
             size: 0,
             ino: u64::from(ino),
@@ -1174,7 +1177,7 @@ impl Driver {
         let old_attr = inode.attr(ino);
         Ok(FileAttr {
             nlink: old_attr.nlink + 1, /* The link that we just created */
-            atime: time::timespec(ts),
+            atime: ts,
             ..old_attr
         })
     }
@@ -1261,10 +1264,11 @@ impl Driver {
         tx.commit().await?;
 
         Ok(FileAttr {
-            atime: time::timespec(ts),
-            ctime: time::timespec(ts),
-            mtime: time::timespec(ts),
-            crtime: time::timespec(ts),
+            atime: ts,
+            ctime: ts,
+            mtime: ts,
+            crtime: ts,
+            blksize: 4096,
             blocks: ((symlink_size - 1) / 4096 + 1) as u64,
             rdev: 0,
             size: symlink_size,

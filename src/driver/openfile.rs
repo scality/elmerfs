@@ -1,11 +1,11 @@
 use antidotec::{reads, updates, Bytes, BytesMut, Transaction, TxId};
 use tokio::sync::{mpsc, oneshot};
-use fuse::FileAttr;
+use fuser::FileAttr;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::SystemTime;
 
 use super::buffer::{Flush, WriteBuffer, WriteSlice};
 use super::page::{PageCache, PageDriver};
@@ -114,8 +114,8 @@ pub struct WriteAttrsDesc {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub size: Option<u64>,
-    pub atime: Option<Duration>,
-    pub mtime: Option<Duration>,
+    pub atime: Option<SystemTime>,
+    pub mtime: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -394,13 +394,16 @@ impl Openfile {
                 size: Some(self.cached_size),
             };
 
+
             tx.update(self.bucket, updates!(inode::update_attrs(self.ino, update)))
                 .await?;
             update!(inode.mode, attrs.mode);
             update!(inode.owner.uid, attrs.uid);
             update!(inode.owner.gid, attrs.gid);
-            update!(inode.atime, attrs.atime);
-            update!(inode.mtime, attrs.mtime);
+
+            inode.atime = attrs.atime.map(time::ts).unwrap_or(inode.atime);
+            inode.mtime = attrs.mtime.map(time::ts).unwrap_or(inode.mtime);
+
             inode.size = self.cached_size;
 
             inode

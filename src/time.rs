@@ -1,9 +1,13 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
-pub fn now() -> Duration {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+pub fn now() -> SystemTime {
+    SystemTime::now()
 }
 
-pub fn timespec(d: Duration) -> time::Timespec {
-    time::Timespec::new(d.as_secs() as i64, d.subsec_nanos() as i32)
+pub fn ts(st: SystemTime) -> Duration {
+    st.duration_since(SystemTime::UNIX_EPOCH).unwrap()
+}
+
+pub fn from_ts(duration: Duration) -> SystemTime {
+    SystemTime::UNIX_EPOCH.checked_add(duration).unwrap()
 }

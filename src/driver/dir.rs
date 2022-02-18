@@ -1,4 +1,3 @@
-use crate::driver::pool::ConnectionPool;
 use crate::driver::{Config, Result, ENOENT};
 use crate::model::dentries;
 use crate::model::inode::{self, Ino};
@@ -15,12 +14,11 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(super) struct DirDriver {
     config: Arc<Config>,
-    pool: Arc<ConnectionPool>,
 }
 
 impl DirDriver {
-    pub(super) fn new(config: Arc<Config>, pool: Arc<ConnectionPool>) -> Self {
-        Self { config, pool }
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
     }
 
     pub(super) async fn decode_view(
@@ -48,15 +46,30 @@ impl DirDriver {
             NameRef::Partial(prefix) => (view, prefix),
         };
 
+        let mut candidate = None;
+        let mut must_match_exact = false;
         for entry in entries {
             // We may need to render this a bit more up to date. e.g check if
             // the looked up entry is a directory, and if so, check its parent.
-            if prefix == &entry.name.prefix && effective_view == entry.name.view {
-                return Some(entry.ino);
+            if prefix == &entry.name.prefix {
+                if effective_view == entry.name.view {
+                    return Some(entry.ino);
+                }
+
+                // If it already has a candidate, the entry is in conflict,
+                // and the lookup must only succeed if the view match. 
+                if candidate.is_some() {
+                    must_match_exact = true;
+                    candidate = None;
+                }
+
+                if candidate.is_none() && !must_match_exact {
+                    candidate = Some(entry.ino);
+                }
             }
         }
 
-        None
+        candidate
     }
 
     #[tracing::instrument(skip(self, tx, entries))]
