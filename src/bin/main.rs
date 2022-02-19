@@ -39,9 +39,7 @@ fn main() -> Result<(), anyhow::Error> {
         .get_matches();
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_default()
-        .add_directive("async_io::reactor=error".parse().unwrap())
-        .add_directive("polling=error".parse().unwrap());
+        .unwrap_or_default();
 
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(std::io::stdout());
     let fmt_layer = fmt::Layer::new()

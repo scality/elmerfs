@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Runtime;
-use tokio::task;
 use tokio::time as tokiot;
 use tracing_futures::Instrument;
 
@@ -131,8 +130,9 @@ macro_rules! session {
     };
 }
 
+#[derive(Clone)]
 pub struct Elmerfs {
-    pub(crate) runtime: Runtime,
+    pub(crate) runtime: Arc<Runtime>,
     pub(crate) forced_view: Option<View>,
     pub(crate) driver: Arc<Driver>,
 }
@@ -149,7 +149,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.getattr(view, Ino(ino)), attrs => {
-            task::spawn_blocking(move || reply.attr(&ttl(), &attrs));
+            rayon::spawn_fifo(move || reply.attr(&ttl(), &attrs));
         });
     }
 
@@ -168,7 +168,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.opendir(view, Ino(ino)), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -184,7 +184,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.readdir(view, Ino(ino), offset), entries => {
-            task::spawn_blocking(move || {
+            rayon::spawn_fifo(move || {
                 for (i, entry) in entries.into_iter().enumerate() {
                     let offset = offset + i as i64 + 1;
                     let full = reply.add(u64::from(entry.ino), offset, entry.kind, entry.name);
@@ -204,7 +204,7 @@ impl Filesystem for Elmerfs {
 
         session!(&mut self.runtime, req, reply, driver.lookup(view, Ino(parent_ino), &name), attrs => {
             let generation = 0;
-            task::spawn_blocking(move ||
+            rayon::spawn_fifo(move ||
                 reply.entry(&ttl(), &attrs, generation));
         });
     }
@@ -228,7 +228,7 @@ impl Filesystem for Elmerfs {
 
         session!(&mut self.runtime, req, reply, driver.mkdir(view, owner, mode, Ino(parent_ino), &name), attrs => {
             let generation = 0;
-            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
+            rayon::spawn_fifo(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -238,7 +238,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.rmdir(view, Ino(parent_ino), &name), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -263,7 +263,7 @@ impl Filesystem for Elmerfs {
         session!(&mut self.runtime, req, reply, driver.mknod(view, owner, mode, Ino(parent_ino), &name, rdev), attrs => {
             let generation = 0;
 
-            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
+            rayon::spawn_fifo(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -273,7 +273,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.unlink(view, Ino(parent_ino), &name), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -310,7 +310,7 @@ impl Filesystem for Elmerfs {
             reply,
             driver.setattr(view, Ino(ino), mode, uid, gid, size, atime, mtime),
             attrs => {
-                task::spawn_blocking(move || reply.attr(&ttl(), &attrs));
+                rayon::spawn_fifo(move || reply.attr(&ttl(), &attrs));
             }
         );
     }
@@ -320,7 +320,7 @@ impl Filesystem for Elmerfs {
 
         session!(&mut self.runtime, req, reply, driver.open(Ino(ino)), fh => {
             let flags = 0;
-            task::spawn_blocking(move || reply.opened(u64::from(fh), flags));
+            rayon::spawn_fifo(move || reply.opened(u64::from(fh), flags));
         });
     }
 
@@ -338,7 +338,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.release(view, Ino(fh)), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -346,7 +346,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
 
         session!(&mut self.runtime, req, reply, driver.flush(Ino(fh)), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -354,7 +354,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
 
         session!(&mut self.runtime, req, reply, driver.fsync(Ino(fh)), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -379,7 +379,7 @@ impl Filesystem for Elmerfs {
         let data = Bytes::copy_from_slice(data);
 
         session!(&mut self.runtime, req, reply, driver.write(Ino(fh), data.clone(), offset), _ => {
-            task::spawn_blocking(move || reply.written(data.len() as u32));
+            rayon::spawn_fifo(move || reply.written(data.len() as u32));
         });
     }
 
@@ -402,7 +402,7 @@ impl Filesystem for Elmerfs {
         let driver = self.driver.clone();
 
         session!(&mut self.runtime, req, reply, driver.read(Ino(fh), offset, size), data => {
-            task::spawn_blocking(move || reply.data(&data));
+            rayon::spawn_fifo(move || reply.data(&data));
         });
     }
 
@@ -422,7 +422,7 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.rename(view, Ino(parent_ino), &name, Ino(newparent_ino), &newname), _ => {
-            task::spawn_blocking(move || reply.ok());
+            rayon::spawn_fifo(move || reply.ok());
         });
     }
 
@@ -440,7 +440,7 @@ impl Filesystem for Elmerfs {
 
         session!(&mut self.runtime, req, reply, driver.link(view, Ino(ino), Ino(newparent_ino), &newname), attrs => {
             let generation = 0;
-            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
+            rayon::spawn_fifo(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -464,7 +464,7 @@ impl Filesystem for Elmerfs {
 
         session!(&mut self.runtime, req, reply, driver.symlink(view, Ino(parent_ino), owner, &name, &link), attrs => {
             let generation = 0;
-            task::spawn_blocking(move || reply.entry(&ttl(), &attrs, generation));
+            rayon::spawn_fifo(move || reply.entry(&ttl(), &attrs, generation));
         });
     }
 
@@ -473,7 +473,12 @@ impl Filesystem for Elmerfs {
         let view = self.view(req);
 
         session!(&mut self.runtime, req, reply, driver.read_link(view, Ino(ino)), path => {
-            task::spawn_blocking(move || reply.data(path.as_bytes()));
+            rayon::spawn_fifo(move || reply.data(path.as_bytes()));
         });
+    }
+
+    fn destroy(&mut self) {
+        let summaries = self.driver.metrics_summary();
+        crate::metrics::fmt_timed_operations(&mut std::io::stderr(), summaries).unwrap();
     }
 }

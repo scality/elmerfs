@@ -53,6 +53,8 @@ mod raw {
     pub struct Fuse {
         #[serde(flatten)]
         pub options: HashMap<String, String>,
+
+        pub poll_threads: u32,
     }
 }
 
@@ -89,6 +91,7 @@ pub struct Driver {
 #[derive(Debug)]
 pub struct Fuse {
     pub options: HashMap<String, String>,
+    pub poll_threads: u32,
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<Config, Error> {
@@ -117,6 +120,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Config, Error> {
         antidote: Antidote { addresses },
         fuse: Fuse {
             options: raw_config.fuse.options,
+            poll_threads: raw_config.fuse.poll_threads,
         },
         driver: Driver {
             bucket,
