@@ -16,3 +16,4 @@ listing_flavor = "partial"
 [fuse]
 
 fsname = "elmerfs"
+poll_threads = 150
